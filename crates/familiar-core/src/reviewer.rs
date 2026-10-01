@@ -43,6 +43,7 @@ pub async fn review(ctx: &Ctx, run: &Run, tool: &str, input: &Value, rules: &[Ru
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
+    crate::claude::subscription_only(&mut cmd);
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
     let mut child = cmd.spawn().context("spawning reviewer")?;

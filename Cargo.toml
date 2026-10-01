@@ -7,3 +7,9 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+
+# Password hashing is deliberately slow; optimise it even in debug builds so tests stay fast.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

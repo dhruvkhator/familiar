@@ -587,7 +587,7 @@ pub async fn decide_tool(
         // Neither owner rules nor the reviewer can unlock these.
         let reason = format!("Always needs you: this {why}.");
         human(&ctx, &run, tool_use_id, &tool, &input, &reason, &events, &cancel).await
-    } else if permissions::safe_navigation(&tool, &input) {
+    } else if permissions::safe_navigation(&tool, &input).await {
         ("approved".to_owned(), "rule", String::new())
     } else if let Some(rule) = permissions::owner_allows(&rules, &tool, &input) {
         ("approved".to_owned(), "rule", format!("allowed by rule `{}`", rule.pattern))

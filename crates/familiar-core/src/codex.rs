@@ -148,6 +148,10 @@ struct Process {
 fn spawn(bin: &str, cwd: &Path) -> Result<Process> {
     let exe = resolve_bin(bin);
     let mut cmd = Command::new(&exe);
+    // Same rule as Claude: the owner's ChatGPT sign-in, never an API key that happens to be in the environment.
+    if std::env::var("FAMILIAR_ALLOW_API_KEY").as_deref() != Ok("1") {
+        cmd.env_remove("OPENAI_API_KEY").env_remove("CODEX_API_KEY");
+    }
     cmd.arg("app-server")
         .current_dir(cwd)
         .stdin(Stdio::piped())

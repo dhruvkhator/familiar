@@ -64,6 +64,7 @@ pub fn spawn(spec: &Spec) -> Result<Process> {
     }
     // ask_user and handoff(wait) block for up to 30 / 15 minutes.
     cmd.env("MCP_TOOL_TIMEOUT", "1900000");
+    subscription_only(&mut cmd);
     // First use of an npx/uvx connector downloads it; the 30 s default startup wait is too short.
     cmd.env("MCP_TIMEOUT", "120000");
     cmd.current_dir(spec.cwd)
@@ -151,4 +152,12 @@ pub fn permission_reply(request_id: &str, allow: bool, input: &Value, message: &
         "type": "control_response",
         "response": { "subtype": "success", "request_id": request_id, "response": response },
     })
+}
+
+/// Familiar runs on the owner's Claude subscription. An API key or auth token in the environment would silently
+/// switch the CLI to pay-per-use billing, so they are removed unless FAMILIAR_ALLOW_API_KEY=1 opts in.
+pub fn subscription_only(cmd: &mut Command) {
+    if std::env::var("FAMILIAR_ALLOW_API_KEY").as_deref() != Ok("1") {
+        cmd.env_remove("ANTHROPIC_API_KEY").env_remove("ANTHROPIC_AUTH_TOKEN");
+    }
 }

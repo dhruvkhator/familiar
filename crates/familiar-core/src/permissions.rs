@@ -72,28 +72,104 @@ const FAMILIAR_ALLOWED: &[&str] = &[
 ];
 
 /// Browser navigation to a public http(s) page is allowed without asking; anything else (file://, loopback,
-/// private networks, odd schemes) goes to the owner.
-pub fn safe_navigation(tool: &str, input: &Value) -> bool {
+/// private networks, odd schemes) goes to the owner. Async because a public-looking name can still resolve to a
+/// local address (`localtest.me` → 127.0.0.1, `*.nip.io`), so every resolved address must be public too.
+pub async fn safe_navigation(tool: &str, input: &Value) -> bool {
+    let Some(host) = navigation_host(tool, input) else { return false };
+    if parse_ipv4(&host).is_some() || host.starts_with('[') {
+        return true; // a literal address already checked by navigation_host
+    }
+    let lookup = tokio::net::lookup_host((host.as_str(), 443));
+    match tokio::time::timeout(std::time::Duration::from_secs(3), lookup).await {
+        Ok(Ok(addrs)) => {
+            let addrs: Vec<_> = addrs.collect();
+            !addrs.is_empty() && addrs.iter().all(|a| is_public(a.ip()))
+        }
+        _ => false,
+    }
+}
+
+/// The host of an http(s) navigation that passes the syntactic checks, or None. IPv4 is parsed the way browsers
+/// do (WHATWG: `127.1`, `0x7f.0.0.1`, `2130706433`, `0177.0.0.1` all mean 127.0.0.1).
+fn navigation_host(tool: &str, input: &Value) -> Option<String> {
     if tool != "mcp__browser__browser_navigate" {
-        return false;
+        return None;
     }
-    let Some(url) = input["url"].as_str() else { return false };
-    let lower = url.trim().to_ascii_lowercase();
-    let Some(rest) = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")) else { return false };
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let lower = input["url"].as_str()?.trim().to_ascii_lowercase();
+    let rest = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
     let host_port = authority.rsplit('@').next().unwrap_or_default();
-    let host = if host_port.starts_with('[') {
-        host_port.split(']').next().unwrap_or_default().trim_start_matches('[')
-    } else {
-        host_port.split(':').next().unwrap_or_default()
-    };
-    if host.is_empty() || host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") || !host.contains('.') && host.parse::<std::net::IpAddr>().is_err() {
-        return false;
+    // Browsers percent-decode hosts (`%31%32%37.0.0.1`); there is no legitimate reason for one here.
+    if host_port.contains('%') {
+        return None;
     }
-    match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => !(ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()),
-        Ok(std::net::IpAddr::V6(_)) => false,
-        Err(_) => true,
+    if let Some(v6) = host_port.strip_prefix('[') {
+        let ip: std::net::Ipv6Addr = v6.split(']').next()?.parse().ok()?;
+        return is_public(std::net::IpAddr::V6(ip)).then(|| format!("[{ip}]"));
+    }
+    let host = host_port.split(':').next().unwrap_or_default().trim_end_matches('.');
+    if host.is_empty() || host == "localhost" || host.ends_with(".localhost") || host.ends_with(".local") || host.ends_with(".internal") {
+        return None;
+    }
+    let numeric = host.split('.').all(|p| !p.is_empty() && (p.starts_with("0x") || p.bytes().all(|b| b.is_ascii_digit())));
+    if numeric {
+        // Looks like an address in some notation: it must parse, and be public.
+        let ip = parse_ipv4(host)?;
+        return is_public(std::net::IpAddr::V4(ip)).then(|| host.to_owned());
+    }
+    // A bare single-label name ("intranet") is a LAN host.
+    host.contains('.').then(|| host.to_owned())
+}
+
+/// WHATWG IPv4 parsing: 1–4 parts, each decimal, `0x` hex or leading-zero octal; the last part fills the rest.
+fn parse_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let mut nums = Vec::with_capacity(parts.len());
+    for p in &parts {
+        let n = if let Some(hex) = p.strip_prefix("0x") {
+            if hex.is_empty() { 0 } else { u64::from_str_radix(hex, 16).ok()? }
+        } else if p.len() > 1 && p.starts_with('0') {
+            u64::from_str_radix(&p[1..], 8).ok()?
+        } else {
+            p.parse::<u64>().ok()?
+        };
+        nums.push(n);
+    }
+    let (last, init) = nums.split_last()?;
+    if init.iter().any(|&n| n > 255) || *last >= 256u64.pow(5 - nums.len() as u32) {
+        return None;
+    }
+    let mut value = *last;
+    for (i, n) in init.iter().enumerate() {
+        value += n << (8 * (3 - i));
+    }
+    Some(std::net::Ipv4Addr::from(u32::try_from(value).ok()?))
+}
+
+fn is_public(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || a == 0
+                || (a == 100 && (64..128).contains(&b)) // carrier-grade NAT
+                || a >= 224) // multicast + reserved
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public(std::net::IpAddr::V4(v4));
+            }
+            let seg0 = v6.segments()[0];
+            !(v6.is_loopback() || v6.is_unspecified() || (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80 || v6.is_multicast())
+        }
     }
 }
 
@@ -295,11 +371,36 @@ mod guard_tests {
 
     #[test]
     fn navigation() {
-        let nav = |u: &str| safe_navigation("mcp__browser__browser_navigate", &json!({ "url": u }));
+        // Syntactic pass only (no DNS): public-looking names and public literals get through, everything local doesn't.
+        let nav = |u: &str| navigation_host("mcp__browser__browser_navigate", &json!({ "url": u })).is_some();
         assert!(nav("https://example.com/a?b=c"));
+        assert!(nav("http://93.184.215.14/"));
         for u in ["file:///C:/Users/x/.ssh/id_rsa", "http://localhost:8080", "http://127.0.0.1", "http://192.168.1.1",
-                  "http://10.0.0.5:3000", "chrome://settings", "http://[::1]/", "http://intranet/", "https://user@localhost/"] {
+                  "http://10.0.0.5:3000", "chrome://settings", "http://[::1]/", "http://intranet/", "https://user@localhost/",
+                  // Browser IPv4 spellings of loopback / private (WHATWG parsing):
+                  "http://127.1/", "http://0x7f.0.0.1/", "http://0x7f000001/", "http://2130706433/", "http://0177.0.0.1/",
+                  "http://017700000001/", "http://10.1/", "http://0xa000005/", "http://localhost./", "http://%31%32%37.0.0.1/",
+                  "http://[::ffff:127.0.0.1]/", "http://[fd00::1]/", "http://169.254.169.254/latest/meta-data", "http://0.0.0.0/",
+                  "http://100.64.0.1/", "http://127.0.0.1\\@example.com/", "http://example.com@127.0.0.1/"] {
             assert!(!nav(u), "{u}");
         }
+    }
+
+    #[test]
+    fn ipv4_like_browsers() {
+        let ip = |h: &str| parse_ipv4(h).map(|a| a.to_string());
+        assert_eq!(ip("127.1").as_deref(), Some("127.0.0.1"));
+        assert_eq!(ip("0x7f.1").as_deref(), Some("127.0.0.1"));
+        assert_eq!(ip("2130706433").as_deref(), Some("127.0.0.1"));
+        assert_eq!(ip("0177.0.0.01").as_deref(), Some("127.0.0.1"));
+        assert_eq!(ip("1.2.3.4").as_deref(), Some("1.2.3.4"));
+        assert_eq!(ip("256.1.1.1"), None);
+        assert_eq!(ip("1.2.3.4.5"), None);
+    }
+
+    #[tokio::test]
+    async fn dns_names_must_resolve_public() {
+        // `localhost` never resolves to a public address, whatever the name looks like.
+        assert!(!safe_navigation("mcp__browser__browser_navigate", &json!({ "url": "http://localhost.example.invalid/" })).await);
     }
 }
