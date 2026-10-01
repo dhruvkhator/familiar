@@ -187,8 +187,19 @@ pub async fn serve(
     cfg: Config,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    let addr = SocketAddr::from((cfg.host, cfg.port));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("familiar-server listening on {addr}");
+    serve_listener(listener, cfg, shutdown).await
+}
+
+/// Like [`serve`] but on a listener the caller already bound (tests bind `127.0.0.1:0`); `cfg.host`/`cfg.port` are ignored.
+pub async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    cfg: Config,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let database_url = cfg.database_url;
-    let port = cfg.port;
 
     let pool = PgPoolOptions::new()
         .max_connections(8)
@@ -225,9 +236,6 @@ pub async fn serve(
             .filter(|u| !u.is_empty()),
     });
 
-    let addr = SocketAddr::from((cfg.host, port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("familiar-server listening on {addr}");
     axum::serve(listener, router(state, &cfg.web_origins))
         .with_graceful_shutdown(shutdown)
         .await?;
