@@ -1,0 +1,6 @@
+# Keep LF everywhere: sqlx checksums migrations byte-for-byte, so CRLF checkouts would break existing databases.
+* text=auto eol=lf
+*.ps1 text eol=crlf
+*.png binary
+*.ico binary
+*.icns binary
