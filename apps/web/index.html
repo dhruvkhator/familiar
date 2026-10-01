@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%235269bb'/%3E%3Cpath d='M11 24V9h11M11 16.5h8' stroke-linecap='round' stroke-linejoin='round' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E" />
+    <title>Familiar</title>
+    <script>
+      try { ["theme", "token", "engine-hint"].forEach(function (k) { var o = localStorage.getItem("zed-" + k); if (o !== null && localStorage.getItem("familiar-" + k) === null) localStorage.setItem("familiar-" + k, o); localStorage.removeItem("zed-" + k); }); } catch (e) {}
+      try { var t = localStorage.getItem("familiar-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

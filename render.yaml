@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: familiar-server
+    runtime: docker
+    dockerfilePath: ./crates/familiar-server/Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: FAMILIAR_WEB_ORIGINS
+        sync: false

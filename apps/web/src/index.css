@@ -1,0 +1,97 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #f7f6f4;
+  --surface: #ffffff;
+  --sunken: #f0efed;
+  --line: #e9e8e6;
+  --ink: #333641;
+  --muted: #777885;
+  --accent: #5269bb;
+  --accent-ink: #ffffff;
+  --accent-soft: #eeeffa;
+  --ok: #2f7d4a;
+  --warn: #9a5b00;
+  --warn-soft: #fbeed3;
+  --bad: #b8352b;
+  --bad-soft: #fbe3e0;
+  --shadow: 0 1px 2px rgb(51 54 65 / 0.05), 0 4px 16px rgb(51 54 65 / 0.05);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { color-scheme: dark; --bg: #15161c; --surface: #1d1f27; --sunken: #111218; --line: #2b2d38; --ink: #e8e9ef; --muted: #9a9cab; --accent: #8fa0ee; --accent-ink: #10132b; --accent-soft: #262a47; --ok: #6fcf8e; --warn: #f0b23d; --warn-soft: #3a2b0c; --bad: #ff8b82; --bad-soft: #3d1613; --shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 4px 16px rgb(0 0 0 / 0.25); }
+}
+:root[data-theme="dark"] { color-scheme: dark; --bg: #15161c; --surface: #1d1f27; --sunken: #111218; --line: #2b2d38; --ink: #e8e9ef; --muted: #9a9cab; --accent: #8fa0ee; --accent-ink: #10132b; --accent-soft: #262a47; --ok: #6fcf8e; --warn: #f0b23d; --warn-soft: #3a2b0c; --bad: #ff8b82; --bad-soft: #3d1613; --shadow: 0 1px 2px rgb(0 0 0 / 0.3), 0 4px 16px rgb(0 0 0 / 0.25); }
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-sunken: var(--sunken);
+  --color-line: var(--line);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-soft: var(--accent-soft);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-bad: var(--bad);
+  --color-bad-soft: var(--bad-soft);
+  --font-sans: "Segoe UI Variable Display", "Segoe UI Variable Text", "Segoe UI", ui-rounded, system-ui, -apple-system, "Helvetica Neue", sans-serif;
+  --font-mono: "Cascadia Mono", "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+html, body, #root { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  letter-spacing: -0.005em;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+::selection { background: var(--accent-soft); }
+textarea, input, select { font: inherit; }
+.mono { font-family: var(--font-mono); font-size: 0.86em; letter-spacing: 0; }
+.tnum { font-variant-numeric: tabular-nums; }
+.safe-b { padding-bottom: env(safe-area-inset-bottom); }
+
+@keyframes pulse-led { 0%,100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); } 50% { box-shadow: 0 0 0 5px transparent; } }
+.led-run { animation: pulse-led 1.8s ease-out infinite; }
+@keyframes settle { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+.settle { animation: settle 160ms ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .led-run, .settle { animation: none; }
+}
+
+.no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
+.no-scrollbar::-webkit-scrollbar { display: none; }
+
+/* ---- mascot states (original; motion pattern after OpenDots) ---- */
+.mascot { display: inline-block; flex-shrink: 0; transform-origin: 50% 90%; }
+.mascot-working { animation: mascot-bob 2s ease-in-out infinite; }
+.mascot-needs { transform: rotate(6deg); }
+.mascot-done { transform: rotate(-3deg); }
+.mascot-paused { filter: saturate(0.5); opacity: 0.85; }
+@keyframes mascot-bob { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-5px); } }
+.mascot-eyes { animation: mascot-blink 6s infinite; transform-origin: 50% 45%; transform-box: fill-box; }
+@keyframes mascot-blink { 0%,94%,100% { transform: scaleY(1); } 96% { transform: scaleY(0.1); } }
+/* skip layout/paint for off-screen rows of long lists; the browser remembers measured sizes */
+.cv-auto { content-visibility: auto; contain-intrinsic-size: auto 44px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); }
+@keyframes skeleton { 0%,100% { opacity: 0.55; } 50% { opacity: 1; } }
+.skeleton { background: var(--sunken); border-radius: 8px; animation: skeleton 1.4s ease-in-out infinite; }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: none; } }
+.toast { animation: toast-in 180ms ease-out; }
+@keyframes caret { 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .mascot-working, .mascot-eyes, .skeleton, .toast { animation: none; }
+}
+
+/* slim, quiet scrollbars everywhere (standard properties only; no arrows) */
+* { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--muted) 35%, transparent) transparent; }
+*:hover { scrollbar-color: color-mix(in srgb, var(--muted) 60%, transparent) transparent; }
+.no-scrollbar, .no-scrollbar:hover { scrollbar-width: none; }
