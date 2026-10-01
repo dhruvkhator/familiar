@@ -41,6 +41,9 @@ pub struct Config {
     /// S3-compatible artifact store (Cloudflare R2, MinIO, AWS). Without it, files ≤ 5 MB go to Postgres.
     #[serde(default)]
     pub s3: Option<S3>,
+    /// How long a spawned `claude` may stay silent before the run fails as stuck (default 150 s; tests lower it).
+    #[serde(default)]
+    pub startup_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -70,7 +73,11 @@ fn default_codex_bin() -> String {
 }
 
 impl Config {
+    /// `~/.familiar`, or `FAMILIAR_HOME` when set (tests, portable installs).
     pub fn home_dir() -> PathBuf {
+        if let Some(home) = std::env::var_os("FAMILIAR_HOME").filter(|h| !h.is_empty()) {
+            return PathBuf::from(home);
+        }
         let Some(base) = directories::BaseDirs::new() else {
             return PathBuf::from(".familiar");
         };
@@ -98,10 +105,10 @@ impl Config {
             Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?,
             Err(_) => toml::Table::new(),
         };
-        for key in ["database_url", "owner_id", "max_parallel", "claude_bin", "codex_bin", "bots_dir", "device_name", "server_url", "secret_key"] {
+        for key in ["database_url", "owner_id", "max_parallel", "claude_bin", "codex_bin", "bots_dir", "device_name", "server_url", "secret_key", "startup_timeout_secs"] {
             if let Some(v) = Self::env_var(&key.to_uppercase()) {
                 let value = match v.parse::<i64>() {
-                    Ok(n) if key == "max_parallel" => toml::Value::Integer(n),
+                    Ok(n) if matches!(key, "max_parallel" | "startup_timeout_secs") => toml::Value::Integer(n),
                     _ => toml::Value::String(v),
                 };
                 table.insert(key.into(), value);
@@ -140,6 +147,12 @@ impl Config {
         use std::io::Write;
         opts.open(&path)?.write_all(text.as_bytes())?;
         Ok(())
+    }
+
+    /// Silence allowed from a freshly spawned `claude` before the run fails as stuck. MCP startup may take up to
+    /// MCP_TIMEOUT (120 s), so the default leaves headroom beyond that.
+    pub fn startup_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.startup_timeout_secs.unwrap_or(150))
     }
 
     pub fn bots_dir(&self) -> PathBuf {

@@ -24,8 +24,6 @@ const DELTA_FLUSH: Duration = Duration::from_millis(150);
 /// Characters per NOTIFY: worst case (4-byte chars, JSON escaping) stays under Postgres' 8000-byte payload limit.
 const DELTA_MAX: usize = 1500;
 const GATE_TIMEOUT: Duration = Duration::from_secs(60);
-/// MCP startup may take up to MCP_TIMEOUT (120 s); beyond that something is stuck.
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(150);
 /// Pinned so a surprise upstream release can't change what the bot can do.
 const PLAYWRIGHT_MCP: &str = "@playwright/mcp@0.0.83"; // keep in sync with tools::PLAYWRIGHT_MCP_VERSION
 
@@ -372,7 +370,8 @@ async fn drive(
     let mut result: Option<Value> = None;
     let mut kill_at: Option<tokio::time::Instant> = None;
     // Claude prints its first line once its MCP servers are up; if that never comes, fail clearly instead of hanging.
-    let startup_deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+    let startup_timeout = ctx.cfg.startup_timeout();
+    let startup_deadline = tokio::time::Instant::now() + startup_timeout;
     let mut started = false;
     loop {
         let line = tokio::select! {
@@ -381,7 +380,7 @@ async fn drive(
                 proc.kill().await;
                 return Err(anyhow!(
                     "Claude did not start within {} s (an MCP server or connector is probably stuck starting)",
-                    STARTUP_TIMEOUT.as_secs()
+                    startup_timeout.as_secs()
                 ));
             }
             _ = cancel.cancelled(), if kill_at.is_none() => {

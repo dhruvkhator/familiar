@@ -1484,6 +1484,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "familiar-testkit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "familiar-core",
+ "reqwest",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tokio-util",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "familiard"
 version = "0.1.0"
 dependencies = [
@@ -3924,6 +3939,7 @@ checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
  "base64 0.23.1",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

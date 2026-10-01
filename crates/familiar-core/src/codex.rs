@@ -317,10 +317,13 @@ impl Job<'_> {
         let (thread_id, turn_id) = match setup {
             Ok(Setup::Started { thread, turn }) => (thread, turn),
             Ok(Setup::MissingThread) => {
+                // Our clone of the sender would keep stdin open, so finish() would always wait out the grace period.
+                drop(rpc);
                 proc.finish(Duration::from_secs(5)).await;
                 return Ok(Outcome { missing_session: true, ..Outcome::failed("codex thread not found".into()) });
             }
             Err(e) => {
+                drop(rpc);
                 let stderr = proc.finish(Duration::from_secs(5)).await;
                 let stderr = stderr.lines().filter(|l| !l.contains("unrecognized configuration") && !l.contains("is ignored")).collect::<Vec<_>>().join("\n");
                 return Err(if stderr.trim().is_empty() { e } else { e.context(stderr.trim().to_owned()) });

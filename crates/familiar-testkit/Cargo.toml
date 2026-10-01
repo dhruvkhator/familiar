@@ -1,0 +1,30 @@
+[package]
+name = "familiar-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Test harness for the Familiar daemon: a scripted fake `claude -p` and end-to-end daemon tests"
+
+[[bin]]
+name = "fake-claude"
+path = "src/bin/fake-claude.rs"
+
+[[bin]]
+name = "fake-codex"
+path = "src/bin/fake-codex.rs"
+
+[dependencies]
+serde_json = "1.0.151"
+# Plain-HTTP MCP calls to the daemon's 127.0.0.1 server (no TLS needed).
+reqwest = { version = "0.13.5", default-features = false, features = ["blocking"] }
+
+[dev-dependencies]
+anyhow = "1.0.104"
+familiar-core = { path = "../familiar-core" }
+serde_json = "1.0.151"
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "uuid", "chrono", "json", "macros", "migrate"] }
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-util = "0.7.19"
+uuid = { version = "1.26.1", features = ["v4"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

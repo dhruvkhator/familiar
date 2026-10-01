@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/familiar-crypto", "crates/familiar-core", "crates/familiar-server", "crates/familiard", "apps/desktop/src-tauri"]
+    "crates/familiar-crypto", "crates/familiar-core", "crates/familiar-server", "crates/familiard", "crates/familiar-testkit", "apps/desktop/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
