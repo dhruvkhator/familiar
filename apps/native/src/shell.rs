@@ -2,10 +2,9 @@
 //! teammate's page — with route crossfades. Everything comes from the live [`AppData`] entity.
 
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::time::Duration;
 
-use familiar_client::{Approval, Run, RunKind};
+use familiar_client::{Run, RunKind};
 use familiar_ui::anim::{self, Crossfade, Expand};
 use familiar_ui::appearance::{self, AppearanceMode};
 use familiar_ui::components::{
@@ -23,13 +22,11 @@ use gpui::{
     ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
-use gpui_base::input::{InputEvent, TextareaState};
 use uuid::Uuid;
 
-use crate::approval::{self, Decide};
+use crate::approval::ApprovalCards;
 use crate::chat::BotPage;
 use crate::data::{AppData, Status, Teammate, ago, excerpt, run_status, tail, until};
-use crate::text_input;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Route {
@@ -45,8 +42,7 @@ pub struct Shell {
     scroll: ScrollHandle,
     side_scroll: ScrollHandle,
     expanded: HashMap<Uuid, Expand>,
-    /// Answer boxes of pending `ask_user` questions.
-    answers: HashMap<Uuid, Entity<TextareaState>>,
+    approvals: ApprovalCards,
     /// Teammate pages, kept so switching back is instant and keeps the scroll.
     pages: HashMap<Uuid, Entity<BotPage>>,
 }
@@ -95,7 +91,7 @@ impl Shell {
             scroll: ScrollHandle::new(),
             side_scroll: ScrollHandle::new(),
             expanded: HashMap::new(),
-            answers: HashMap::new(),
+            approvals: ApprovalCards::default(),
             pages: HashMap::new(),
         }
     }
@@ -112,53 +108,6 @@ impl Shell {
         d.overview.is_none() && d.status == Status::Connecting
     }
 
-    /// The decide handler of an approval card: reads the answer box, calls the API, toasts the outcome.
-    fn decider(&self, a: &Approval) -> Decide {
-        let data = self.data.clone();
-        let toasts = self.toasts.clone();
-        let answer = self.answers.get(&a.id).cloned();
-        let ask = approval::is_ask(a);
-        let id = a.id;
-        Rc::new(move |approve, _window, cx| {
-            let response = if ask && approve { answer.as_ref().map(|s| s.read(cx).value().to_string()) } else { None };
-            let task = data.update(cx, |d, cx| d.decide(id, approve, response, cx));
-            let toasts = toasts.clone();
-            cx.spawn(async move |cx| {
-                let r = task.await;
-                let _ = toasts.update(cx, |t, cx| match r {
-                    Ok(()) => {
-                        let title = match (ask, approve) {
-                            (true, true) => "Answer sent",
-                            (true, false) => "Skipped",
-                            (false, true) => "Approved",
-                            (false, false) => "Declined",
-                        };
-                        t.push(if approve { Tone::Ok } else { Tone::Muted }, title, None, cx)
-                    }
-                    Err(e) => t.push(Tone::Bad, "Couldn't send that", Some(e.into()), cx),
-                });
-            })
-            .detach();
-        })
-    }
-
-    /// Approval cards for `list`, creating answer boxes for questions as needed.
-    fn approval_cards(&mut self, list: &[Approval], window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let teammates = self.data.read(cx).teammates();
-        let mut out = Vec::new();
-        for (i, a) in list.iter().enumerate() {
-            if approval::is_ask(a) && !self.answers.contains_key(&a.id) {
-                let state = text_input::new_field("Your answer", false, 4, window, cx);
-                cx.subscribe(&state, |_, _, _: &InputEvent, cx| cx.notify()).detach();
-                self.answers.insert(a.id, state);
-            }
-            let bot = teammates.iter().find(|t| t.uuid == a.bot_id);
-            let decide = self.decider(a);
-            let card = approval::approval_card(a, bot, self.answers.get(&a.id), decide, window, cx);
-            out.push(anim::stagger(SharedString::from(format!("approval-in-{}", a.id)), i, div().child(card)).into_any_element());
-        }
-        out
-    }
 
     fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
@@ -335,7 +284,7 @@ impl Shell {
                 let page = self.needs_you(window, cx).into_any_element();
                 self.scrolled(page)
             }
-            Route::Teammate(id) => self.bot_page(id, cx),
+            Route::Teammate(id) => self.bot_page(id, window, cx),
         }
     }
 
@@ -428,7 +377,9 @@ impl Shell {
 
         // Needs you: every pending approval / question.
         if !pending.is_empty() {
-            let cards = self.approval_cards(&pending, window, cx);
+            let data = self.data.clone();
+            let toasts = self.toasts.clone();
+            let cards = self.approvals.render(&pending, &data, &toasts, window, cx);
             page = page.child(
                 div()
                     .flex()
@@ -748,19 +699,21 @@ impl Shell {
                 ),
             ));
         } else {
-            let cards = self.approval_cards(&pending, window, cx);
+            let data = self.data.clone();
+            let toasts = self.toasts.clone();
+            let cards = self.approvals.render(&pending, &data, &toasts, window, cx);
             page = page.child(div().flex().flex_col().gap(px(12.0)).children(cards));
         }
         page
     }
 
-    fn bot_page(&mut self, id: &SharedString, cx: &mut Context<Self>) -> AnyElement {
+    fn bot_page(&mut self, id: &SharedString, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Ok(bot) = id.parse::<Uuid>() else {
             return empty("Teammate not found", None, cx).into_any_element();
         };
         let data = self.data.clone();
         let toasts = self.toasts.clone();
-        self.pages.entry(bot).or_insert_with(|| cx.new(|cx| BotPage::new(data, toasts, bot, cx))).clone().into_any_element()
+        self.pages.entry(bot).or_insert_with(|| cx.new(|cx| BotPage::new(data, toasts, bot, window, cx))).clone().into_any_element()
     }
 
     /// A scrolling, centred column for the overview pages.

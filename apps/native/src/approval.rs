@@ -1,20 +1,24 @@
 //! The approval card (the web's `components/ApprovalCard.tsx`): a tool call waiting for a decision, or an `ask_user`
 //! question waiting for an answer. Shared by Today and the chat's run card.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use familiar_client::Approval;
+use familiar_ui::anim;
 use familiar_ui::components::{Button, card, chip};
+use familiar_ui::toast::ToastStack;
 use familiar_ui::mascot::{Mascot, MascotState};
 use familiar_ui::theme::{RADIUS_CHIP, Theme, Tone, text};
 use gpui::{
-    AnyElement, App, Entity, FontWeight, IntoElement, ParentElement as _, SharedString, Styled as _, Window, div,
+    AnyElement, App, Context, Entity, FontWeight, IntoElement, ParentElement as _, SharedString, Styled as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
-use gpui_base::input::TextareaState;
+use gpui_base::input::{InputEvent, TextareaState};
+use uuid::Uuid;
 use serde_json::Value;
 
-use crate::data::{Teammate, ago};
+use crate::data::{AppData, Teammate, ago};
 use crate::text_input;
 
 pub type Decide = Rc<dyn Fn(bool, &mut Window, &mut App)>;
@@ -163,4 +167,68 @@ pub fn approval_card(
         })
         .child(body)
         .into_any_element()
+}
+
+/// Approval cards with their answer boxes, for any view that lists approvals.
+#[derive(Default)]
+pub struct ApprovalCards {
+    answers: HashMap<Uuid, Entity<TextareaState>>,
+}
+
+impl ApprovalCards {
+    pub fn render<V: 'static>(
+        &mut self,
+        list: &[Approval],
+        data: &Entity<AppData>,
+        toasts: &Entity<ToastStack>,
+        window: &mut Window,
+        cx: &mut Context<V>,
+    ) -> Vec<AnyElement> {
+        let teammates = data.read(cx).teammates();
+        let mut out = Vec::new();
+        for (i, a) in list.iter().enumerate() {
+            if is_ask(a) && !self.answers.contains_key(&a.id) {
+                let state = text_input::new_field("Your answer", false, 4, window, cx);
+                cx.subscribe(&state, |_, _, _: &InputEvent, cx| cx.notify()).detach();
+                self.answers.insert(a.id, state);
+            }
+            let bot = teammates.iter().find(|t| t.uuid == a.bot_id);
+            let decide = decider(data.clone(), toasts.clone(), a, self.answers.get(&a.id).cloned());
+            let card = approval_card(a, bot, self.answers.get(&a.id), decide, window, cx);
+            out.push(anim::stagger(SharedString::from(format!("approval-in-{}", a.id)), i, div().child(card)).into_any_element());
+        }
+        out
+    }
+}
+
+/// The decide handler of a card: reads the answer box, calls the API, toasts the outcome.
+pub fn decider(
+    data: Entity<AppData>,
+    toasts: Entity<ToastStack>,
+    a: &Approval,
+    answer: Option<Entity<TextareaState>>,
+) -> Decide {
+    let ask = is_ask(a);
+    let id = a.id;
+    Rc::new(move |approve, _window, cx| {
+        let response = if ask && approve { answer.as_ref().map(|s| s.read(cx).value().to_string()) } else { None };
+        let task = data.update(cx, |d, cx| d.decide(id, approve, response, cx));
+        let toasts = toasts.clone();
+        cx.spawn(async move |cx| {
+            let r = task.await;
+            let _ = toasts.update(cx, |t, cx| match r {
+                Ok(()) => {
+                    let title = match (ask, approve) {
+                        (true, true) => "Answer sent",
+                        (true, false) => "Skipped",
+                        (false, true) => "Approved",
+                        (false, false) => "Declined",
+                    };
+                    t.push(if approve { Tone::Ok } else { Tone::Muted }, title, None, cx)
+                }
+                Err(e) => t.push(Tone::Bad, "Couldn't send that", Some(e.into()), cx),
+            });
+        })
+        .detach();
+    })
 }

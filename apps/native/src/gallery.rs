@@ -19,7 +19,7 @@ use familiar_ui::toast::ToastStack;
 use gpui::{
     AnyElement, AppContext as _, Context, Div, Entity, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
-    prelude::FluentBuilder as _, px,
+    px,
 };
 
 use crate::data::{self, Teammate};
