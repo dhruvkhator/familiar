@@ -1,7 +1,7 @@
 //! Familiar native desktop (GPUI).
 //!
 //! `familiar-native` opens the app shell: a sidebar of teammates with their live status (signed in to the local
-//! Familiar API) and a "Today" mock. `familiar-native --gallery` opens the design-system gallery used to review the
+//! Familiar API), Today (needs you, happening now, recently done, coming up) and each teammate's chat. `familiar-native --gallery` opens the design-system gallery used to review the
 //! look: every component, both themes, the mascot in every state, and the motion primitives.
 //!
 //! Flags (both windows): `--theme light|dark|system`, `--reduce-motion`; gallery only: `--section <name>`; shell only:

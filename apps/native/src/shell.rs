@@ -528,12 +528,13 @@ impl Shell {
                                         )),
                                 )
                                 .child(StatusChip::new(run_status(r.status)))
-                                .child(div().relative().top(px(-2.0 * openness)).child(
+                                .child(
                                     icon(icons::ALT_ARROW_DOWN)
                                         .size(px(14.0))
                                         .text_color(theme.muted)
-                                        .opacity(0.5 + 0.5 * openness),
-                                )),
+                                        .opacity(0.5 + 0.5 * openness)
+                                        .with_transformation(gpui::Transformation::rotate(gpui::radians(openness * std::f32::consts::PI))),
+                                ),
                         )
                         .child(exp.render(
                             SharedString::from(format!("done-detail-{}", r.id)),

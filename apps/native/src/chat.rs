@@ -956,6 +956,7 @@ impl BotPage {
                 .size_full()
                 .overflow_y_scroll()
                 .track_scroll(&self.scroll)
+                .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
                 .child(
                     div()
                         .w_full()
@@ -1015,6 +1016,7 @@ impl Render for BotPage {
         let header = self.header(cx);
         let threads = self.thread_list(cx);
         let transcript = self.transcript(window, cx);
+        let jump = self.jump_button(cx);
         let composer = self.composer(window, cx);
         div().size_full().flex().flex_col().child(header).child(
             div().flex().flex_1().min_h_0().child(threads).child(
@@ -1024,9 +1026,45 @@ impl Render for BotPage {
                     .h_full()
                     .flex()
                     .flex_col()
-                    .child(div().flex_1().min_h_0().child(transcript))
+                    .child(div().relative().flex_1().min_h_0().child(transcript).when_some(jump, |el, j| el.child(j)))
                     .child(composer),
             ),
+        )
+    }
+}
+
+impl BotPage {
+    /// "Latest" pill, shown while the reader is scrolled well above the bottom.
+    fn jump_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let max = f32::from(self.scroll.max_offset().y);
+        let at = -f32::from(self.scroll.offset().y);
+        if max - at <= 240.0 {
+            return None;
+        }
+        let this = cx.entity();
+        Some(
+            div()
+                .absolute()
+                .bottom(px(14.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(anim::appear(
+                    "jump-latest",
+                    div().rounded_full().shadow(Theme::of(cx).float_shadow()).child(
+                        Button::new("jump", "Latest")
+                            .size(ButtonSize::Small)
+                            .icon(icons::ALT_ARROW_DOWN)
+                            .on_click(move |_, _, cx| {
+                                this.update(cx, |p, cx| {
+                                    p.force_bottom = true;
+                                    cx.notify();
+                                })
+                            }),
+                    ),
+                ))
+                .into_any_element(),
         )
     }
 }
