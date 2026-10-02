@@ -486,3 +486,32 @@ mod tests {
         assert_eq!(tail("hello", 3), "llo");
     }
 }
+
+/// Stale-while-revalidate for any view: apply the cached value of `path` now (if any), the fresh one when it lands
+/// (then notify). Errors are logged and leave the current value.
+pub fn swr<V: 'static, T>(
+    this: &mut V,
+    client: &Client,
+    path: String,
+    cx: &mut Context<V>,
+    apply: impl Fn(&mut V, T, &mut Context<V>) + 'static,
+) where
+    T: DeserializeOwned + Send + 'static,
+{
+    if let Some(v) = client.peek::<T>(&path) {
+        apply(this, v, cx);
+    }
+    let client = client.clone();
+    let task = Tokio::spawn(cx, async move { client.get::<T>(&path).await });
+    cx.spawn(async move |this, cx| match task.await {
+        Ok(Ok(v)) => {
+            let _ = this.update(cx, |this, cx| {
+                apply(this, v, cx);
+                cx.notify();
+            });
+        }
+        Ok(Err(e)) => tracing::warn!("fetch failed: {e}"),
+        Err(_) => {}
+    })
+    .detach();
+}

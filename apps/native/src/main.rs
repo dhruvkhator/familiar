@@ -4,14 +4,17 @@
 //! Familiar API) and a "Today" mock. `familiar-native --gallery` opens the design-system gallery used to review the
 //! look: every component, both themes, the mascot in every state, and the motion primitives.
 //!
-//! Flags (both windows): `--theme light|dark|system`, `--reduce-motion`; gallery only: `--section <name>`.
+//! Flags (both windows): `--theme light|dark|system`, `--reduce-motion`; gallery only: `--section <name>`; shell only:
+//! `--open needs|<teammate name>|first` (opens that page once the data is in).
 
 // Release builds are GUI-subsystem binaries (no console window); debug builds keep the console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod approval;
+mod chat;
 mod data;
 mod gallery;
+mod markdown;
 mod shell;
 mod text_input;
 
@@ -25,10 +28,11 @@ struct Args {
     theme: AppearanceMode,
     reduce_motion: bool,
     section: Option<String>,
+    open: Option<String>,
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { gallery: false, theme: AppearanceMode::System, reduce_motion: false, section: None };
+    let mut args = Args { gallery: false, theme: AppearanceMode::System, reduce_motion: false, section: None, open: None };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -42,6 +46,7 @@ fn parse_args() -> Args {
                 }
             }
             "--section" => args.section = it.next(),
+            "--open" => args.open = it.next(),
             "--version" => {
                 println!("familiar-native {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -83,8 +88,9 @@ fn main() {
             })
             .map(|_| ())
         } else {
-            cx.open_window(window_options(cx, "Familiar", 1180.0, 780.0), |window, cx| {
-                cx.new(|cx| shell::Shell::new(window, cx))
+            let open = args.open.clone();
+            cx.open_window(window_options(cx, "Familiar", 1180.0, 780.0), move |window, cx| {
+                cx.new(|cx| shell::Shell::new(open, window, cx))
             })
             .map(|_| ())
         };

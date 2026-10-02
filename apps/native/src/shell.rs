@@ -27,6 +27,7 @@ use gpui_base::input::{InputEvent, TextareaState};
 use uuid::Uuid;
 
 use crate::approval::{self, Decide};
+use crate::chat::BotPage;
 use crate::data::{AppData, Status, Teammate, ago, excerpt, run_status, tail, until};
 use crate::text_input;
 
@@ -46,13 +47,37 @@ pub struct Shell {
     expanded: HashMap<Uuid, Expand>,
     /// Answer boxes of pending `ask_user` questions.
     answers: HashMap<Uuid, Entity<TextareaState>>,
+    /// Teammate pages, kept so switching back is instant and keeps the scroll.
+    pages: HashMap<Uuid, Entity<BotPage>>,
 }
 
 impl Shell {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(open: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         familiar_ui::observe_window(window, cx);
         let data = cx.new(AppData::new);
-        cx.observe(&data, |_, _, cx| cx.notify()).detach();
+        let mut open = open;
+        cx.observe(&data, move |this: &mut Self, data, cx| {
+            if let Some(want) = open.as_deref() {
+                let d = data.read(cx);
+                if d.overview.is_some() {
+                    let want = want.to_lowercase();
+                    let route = if want == "needs" {
+                        Some(Route::NeedsYou)
+                    } else {
+                        let list = d.teammates();
+                        list.iter()
+                            .find(|t| want == "first" || t.name.to_lowercase() == want)
+                            .map(|t| Route::Teammate(t.id.clone()))
+                    };
+                    open = None;
+                    if let Some(r) = route {
+                        this.navigate(r, cx);
+                    }
+                }
+            }
+            cx.notify()
+        })
+        .detach();
         // Relative times ("5m ago", "in 2h") move on their own: re-render every 30 s like the web's clock.
         cx.spawn(async move |this, cx| {
             loop {
@@ -71,6 +96,7 @@ impl Shell {
             side_scroll: ScrollHandle::new(),
             expanded: HashMap::new(),
             answers: HashMap::new(),
+            pages: HashMap::new(),
         }
     }
 
@@ -301,9 +327,15 @@ impl Shell {
 
     fn page(&mut self, route: &Route, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match route {
-            Route::Today => self.today(window, cx).into_any_element(),
-            Route::NeedsYou => self.needs_you(window, cx).into_any_element(),
-            Route::Teammate(id) => self.teammate_page(id, cx).into_any_element(),
+            Route::Today => {
+                let page = self.today(window, cx).into_any_element();
+                self.scrolled(page)
+            }
+            Route::NeedsYou => {
+                let page = self.needs_you(window, cx).into_any_element();
+                self.scrolled(page)
+            }
+            Route::Teammate(id) => self.bot_page(id, cx),
         }
     }
 
@@ -722,47 +754,38 @@ impl Shell {
         page
     }
 
-    fn teammate_page(&mut self, id: &SharedString, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx).clone();
-        let Some(t) = self.data.read(cx).teammates().into_iter().find(|t| &t.id == id) else {
-            return div().child(empty("Teammate not found", None, cx));
+    fn bot_page(&mut self, id: &SharedString, cx: &mut Context<Self>) -> AnyElement {
+        let Ok(bot) = id.parse::<Uuid>() else {
+            return empty("Teammate not found", None, cx).into_any_element();
         };
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(24.0))
-            .child(anim::appear(
-                SharedString::from(format!("mate-head-{id}")),
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(18.0))
-                    .child(Mascot::new(format!("page-{}", t.id), t.avatar, t.state, 88.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .text_size(px(text::HEADLINE))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme.ink)
-                                    .child(t.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(6.0))
-                                    .child(chip(state_tone(t.state), t.state.label(), cx))
-                                    .when_some(t.model.clone(), |el, m| el.child(chip(Tone::Muted, m, cx))),
-                            ),
-                    ),
-            ))
-            .child(anim::appear(
-                SharedString::from(format!("mate-body-{id}")),
-                empty("Chat comes next", Some("This page is a placeholder while the chat screen is ported.".into()), cx),
-            ))
+        let data = self.data.clone();
+        let toasts = self.toasts.clone();
+        self.pages.entry(bot).or_insert_with(|| cx.new(|cx| BotPage::new(data, toasts, bot, cx))).clone().into_any_element()
+    }
+
+    /// A scrolling, centred column for the overview pages.
+    fn scrolled(&self, page: AnyElement) -> AnyElement {
+        edge_faded(
+            24.0,
+            true,
+            true,
+            div()
+                .id("main-scroll")
+                .size_full()
+                .overflow_y_scroll()
+                .track_scroll(&self.scroll)
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .px(px(40.0))
+                        .py(px(36.0))
+                        .child(div().w_full().max_w(px(760.0)).child(page)),
+                ),
+        )
+        .fade_overflow_y(&self.scroll)
+        .into_any_element()
     }
 }
 
@@ -829,22 +852,7 @@ impl Render for Shell {
             .font_family(theme.font_sans.clone())
             .child(sidebar)
             .child(
-                div().flex_1().min_w_0().h_full().child(
-                    edge_faded(
-                        24.0,
-                        true,
-                        true,
-                        div()
-                            .id("main-scroll")
-                            .size_full()
-                            .overflow_y_scroll()
-                            .track_scroll(&self.scroll)
-                            .child(div().w_full().flex().justify_center().px(px(40.0)).py(px(36.0)).child(
-                                div().w_full().max_w(px(760.0)).child(page),
-                            )),
-                    )
-                    .fade_overflow_y(&self.scroll),
-                ),
+                div().flex_1().min_w_0().h_full().child(page),
             )
             .child(self.toasts.clone())
     }
