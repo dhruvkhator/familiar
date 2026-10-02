@@ -9,9 +9,11 @@
 // Release builds are GUI-subsystem binaries (no console window); debug builds keep the console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod approval;
 mod data;
 mod gallery;
 mod shell;
+mod text_input;
 
 use familiar_ui::AppearanceMode;
 use gpui::{

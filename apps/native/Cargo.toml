@@ -13,6 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 familiar-ui = { path = "crates/familiar-ui" }
+familiar-client = { path = "../../crates/familiar-client" }
+futures = "0.3"
+chrono = "0.4"
+uuid = "1"
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true

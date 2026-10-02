@@ -1,13 +1,16 @@
-//! The default launch: the spike's teammate list, restyled with the kit — a sidebar of teammates (mascots + live
-//! status from the local API) and a "Today" mock in the main area, with route crossfades between pages.
+//! The default launch: a sidebar of teammates (mascots + live status) and the main area — Today, Needs you, or a
+//! teammate's page — with route crossfades. Everything comes from the live [`AppData`] entity.
 
 use std::collections::HashMap;
+use std::rc::Rc;
+use std::time::Duration;
 
+use familiar_client::{Approval, Run, RunKind};
 use familiar_ui::anim::{self, Crossfade, Expand};
 use familiar_ui::appearance::{self, AppearanceMode};
 use familiar_ui::components::{
-    Button, ButtonSize, HoverCard, Led, LedStatus, RunStatus, SectionHeader, SidebarItem, Skeleton, StatusChip, card,
-    chip, divider, empty, group_label,
+    Button, ButtonSize, HoverCard, Led, LedStatus, SectionHeader, SidebarItem, Skeleton, StatusChip, card, chip,
+    divider, empty, group_label,
 };
 use familiar_ui::edge_fade::edge_faded;
 use familiar_ui::icons::{self, icon};
@@ -20,8 +23,12 @@ use gpui::{
     ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
+use gpui_base::input::{InputEvent, TextareaState};
+use uuid::Uuid;
 
-use crate::data::{self, Live, Teammate};
+use crate::approval::{self, Decide};
+use crate::data::{AppData, Status, Teammate, ago, excerpt, run_status, tail, until};
+use crate::text_input;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Route {
@@ -30,63 +37,40 @@ pub enum Route {
     Teammate(SharedString),
 }
 
-enum Load {
-    Loading,
-    Ready(Live),
-    /// The API was unreachable; the shell falls back to sample teammates and says so.
-    Failed(String),
-}
-
 pub struct Shell {
-    load: Load,
+    data: Entity<AppData>,
     route: Crossfade<Route>,
     toasts: Entity<ToastStack>,
     scroll: ScrollHandle,
     side_scroll: ScrollHandle,
-    expanded: HashMap<usize, Expand>,
-    approved: bool,
+    expanded: HashMap<Uuid, Expand>,
+    /// Answer boxes of pending `ask_user` questions.
+    answers: HashMap<Uuid, Entity<TextareaState>>,
 }
 
 impl Shell {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         familiar_ui::observe_window(window, cx);
-        let task = gpui_tokio::Tokio::spawn(cx, data::fetch_live());
+        let data = cx.new(AppData::new);
+        cx.observe(&data, |_, _, cx| cx.notify()).detach();
+        // Relative times ("5m ago", "in 2h") move on their own: re-render every 30 s like the web's clock.
         cx.spawn(async move |this, cx| {
-            let load = match task.await {
-                Ok(Ok(live)) => Load::Ready(live),
-                Ok(Err(e)) => Load::Failed(format!("{e:#}")),
-                Err(e) => Load::Failed(format!("{e:#}")),
-            };
-            let _ = this.update(cx, |this, cx| {
-                this.load = load;
-                cx.notify();
-            });
+            loop {
+                cx.background_executor().timer(Duration::from_secs(30)).await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
         })
         .detach();
         Self {
-            load: Load::Loading,
+            data,
             route: Crossfade::new(Route::Today),
             toasts: cx.new(|_| ToastStack::new()),
             scroll: ScrollHandle::new(),
             side_scroll: ScrollHandle::new(),
-            expanded: (0..4).map(|i| (i, Expand::new(false))).collect(),
-            approved: false,
-        }
-    }
-
-    fn teammates(&self) -> Vec<Teammate> {
-        match &self.load {
-            Load::Ready(live) => live.teammates.clone(),
-            Load::Failed(_) => data::sample_teammates(),
-            Load::Loading => Vec::new(),
-        }
-    }
-
-    fn pending(&self) -> usize {
-        match &self.load {
-            Load::Ready(live) => live.pending,
-            Load::Failed(_) => usize::from(!self.approved),
-            Load::Loading => 0,
+            expanded: HashMap::new(),
+            answers: HashMap::new(),
         }
     }
 
@@ -97,11 +81,65 @@ impl Shell {
         }
     }
 
+    fn loading(&self, cx: &App) -> bool {
+        let d = self.data.read(cx);
+        d.overview.is_none() && d.status == Status::Connecting
+    }
+
+    /// The decide handler of an approval card: reads the answer box, calls the API, toasts the outcome.
+    fn decider(&self, a: &Approval) -> Decide {
+        let data = self.data.clone();
+        let toasts = self.toasts.clone();
+        let answer = self.answers.get(&a.id).cloned();
+        let ask = approval::is_ask(a);
+        let id = a.id;
+        Rc::new(move |approve, _window, cx| {
+            let response = if ask && approve { answer.as_ref().map(|s| s.read(cx).value().to_string()) } else { None };
+            let task = data.update(cx, |d, cx| d.decide(id, approve, response, cx));
+            let toasts = toasts.clone();
+            cx.spawn(async move |cx| {
+                let r = task.await;
+                let _ = toasts.update(cx, |t, cx| match r {
+                    Ok(()) => {
+                        let title = match (ask, approve) {
+                            (true, true) => "Answer sent",
+                            (true, false) => "Skipped",
+                            (false, true) => "Approved",
+                            (false, false) => "Declined",
+                        };
+                        t.push(if approve { Tone::Ok } else { Tone::Muted }, title, None, cx)
+                    }
+                    Err(e) => t.push(Tone::Bad, "Couldn't send that", Some(e.into()), cx),
+                });
+            })
+            .detach();
+        })
+    }
+
+    /// Approval cards for `list`, creating answer boxes for questions as needed.
+    fn approval_cards(&mut self, list: &[Approval], window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let teammates = self.data.read(cx).teammates();
+        let mut out = Vec::new();
+        for (i, a) in list.iter().enumerate() {
+            if approval::is_ask(a) && !self.answers.contains_key(&a.id) {
+                let state = text_input::new_field("Your answer", false, 4, window, cx);
+                cx.subscribe(&state, |_, _, _: &InputEvent, cx| cx.notify()).detach();
+                self.answers.insert(a.id, state);
+            }
+            let bot = teammates.iter().find(|t| t.uuid == a.bot_id);
+            let decide = self.decider(a);
+            let card = approval::approval_card(a, bot, self.answers.get(&a.id), decide, window, cx);
+            out.push(anim::stagger(SharedString::from(format!("approval-in-{}", a.id)), i, div().child(card)).into_any_element());
+        }
+        out
+    }
+
     fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let this = cx.entity();
         let current = self.route.current().clone();
         let dark = theme.is_dark();
+        let pending = self.data.read(cx).pending.len();
         let nav = |id: &'static str, label: &'static str, glyph: &'static str, route: Route, badge: usize| {
             let this = this.clone();
             let selected = current == route;
@@ -110,54 +148,51 @@ impl Shell {
             })
         };
         let mut teammates = div().flex().flex_col().gap(px(2.0));
-        match &self.load {
-            Load::Loading => {
-                for i in 0..4 {
-                    teammates = teammates.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(10.0))
-                            .h(px(48.0))
-                            .px(px(8.0))
-                            .child(Skeleton::new(30.0).width(30.0).radius(15.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(6.0))
-                                    .child(Skeleton::new(10.0).width(90.0 - i as f32 * 8.0))
-                                    .child(Skeleton::new(8.0).width(56.0)),
-                            ),
-                    );
-                }
-            }
-            _ => {
-                let list = self.teammates();
-                if list.is_empty() {
-                    teammates = teammates.child(
-                        div().px(px(12.0)).text_size(px(text::SMALL)).text_color(theme.muted).child("No teammates yet."),
-                    );
-                }
-                for (i, t) in list.into_iter().enumerate() {
-                    let this = this.clone();
-                    let route = Route::Teammate(t.id.clone());
-                    let color = (t.state == MascotState::NeedsYou).then_some(theme.warn);
-                    teammates = teammates.child(anim::stagger(
-                        SharedString::from(format!("side-in-{}", t.id)),
-                        i,
-                        div().child(
-                            SidebarItem::new(SharedString::from(format!("side-{}", t.id)), t.name.clone())
-                                .leading(Mascot::new(format!("side-{}", t.id), t.avatar, t.state, 30.0))
-                                .sublabel(t.state.label(), color)
-                                .selected(current == route)
-                                .on_click(move |_, _, cx| this.update(cx, |s, cx| s.navigate(route.clone(), cx))),
+        if self.loading(cx) {
+            for i in 0..4 {
+                teammates = teammates.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .h(px(48.0))
+                        .px(px(8.0))
+                        .child(Skeleton::new(30.0).width(30.0).radius(15.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.0))
+                                .child(Skeleton::new(10.0).width(90.0 - i as f32 * 8.0))
+                                .child(Skeleton::new(8.0).width(56.0)),
                         ),
-                    ));
-                }
+                );
+            }
+        } else {
+            let list = self.data.read(cx).teammates();
+            if list.is_empty() {
+                teammates = teammates.child(
+                    div().px(px(12.0)).text_size(px(text::SMALL)).text_color(theme.muted).child("No teammates yet."),
+                );
+            }
+            for (i, t) in list.into_iter().enumerate() {
+                let this = this.clone();
+                let route = Route::Teammate(t.id.clone());
+                let color = (t.state == MascotState::NeedsYou).then_some(theme.warn);
+                teammates = teammates.child(anim::stagger(
+                    SharedString::from(format!("side-in-{}", t.id)),
+                    i,
+                    div().child(
+                        SidebarItem::new(SharedString::from(format!("side-{}", t.id)), t.name.clone())
+                            .leading(Mascot::new(format!("side-{}", t.id), t.avatar, t.state, 30.0))
+                            .sublabel(t.state.label(), color)
+                            .selected(current == route)
+                            .on_click(move |_, _, cx| this.update(cx, |s, cx| s.navigate(route.clone(), cx))),
+                    ),
+                ));
             }
         }
-        let pc_online = matches!(&self.load, Load::Ready(live) if live.pc_online);
+        let pc_online = self.data.read(cx).pc_online();
         let this_toggle = cx.entity();
         div()
             .flex()
@@ -214,7 +249,7 @@ impl Shell {
                                 .flex_col()
                                 .gap(px(2.0))
                                 .child(nav("nav-today", "Today", icons::HOME, Route::Today, 0))
-                                .child(nav("nav-needs", "Needs you", icons::BELL, Route::NeedsYou, self.pending())),
+                                .child(nav("nav-needs", "Needs you", icons::BELL, Route::NeedsYou, pending)),
                         )
                         .child(
                             div()
@@ -267,14 +302,14 @@ impl Shell {
     fn page(&mut self, route: &Route, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match route {
             Route::Today => self.today(window, cx).into_any_element(),
-            Route::NeedsYou => self.needs_you(cx).into_any_element(),
+            Route::NeedsYou => self.needs_you(window, cx).into_any_element(),
             Route::Teammate(id) => self.teammate_page(id, cx).into_any_element(),
         }
     }
 
     fn today(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        if matches!(self.load, Load::Loading) {
+        if self.loading(cx) {
             return div()
                 .flex()
                 .flex_col()
@@ -283,19 +318,322 @@ impl Shell {
                 .child(Skeleton::new(96.0).radius(RADIUS_CARD))
                 .child(Skeleton::new(160.0).radius(RADIUS_CARD));
         }
-        let teammates = self.teammates();
-        let pending = self.pending();
-        let working = teammates.iter().filter(|t| t.state == MascotState::Working).count();
-        let subtitle = if pending > 0 {
-            format!("{pending} thing{} waiting on you.", if pending == 1 { "" } else { "s" })
-        } else if working > 0 {
-            format!("{working} task{} in progress.", if working == 1 { "" } else { "s" })
+        let (teammates, pending, runs, schedules, failed, runs_loaded) = {
+            let d = self.data.read(cx);
+            let failed = match &d.status {
+                Status::Failed(e) if d.overview.is_none() => Some(e.clone()),
+                _ => None,
+            };
+            (d.teammates(), d.pending.clone(), d.runs.clone(), d.schedules.clone(), failed, d.runs_loaded)
+        };
+        let this = cx.entity();
+        let active: Vec<&Run> = runs.iter().filter(|r| r.status.is_active()).collect();
+        let subtitle = if !pending.is_empty() {
+            let n = pending.len();
+            format!("{n} thing{} waiting on you.", if n == 1 { "" } else { "s" })
+        } else if !active.is_empty() {
+            let n = active.len();
+            format!("{n} task{} in progress.", if n == 1 { "" } else { "s" })
         } else {
             "Everything is quiet.".to_owned()
         };
-        let this = cx.entity();
+        let who = |id: Uuid| teammates.iter().find(|t| t.uuid == id).cloned();
 
-        // Teammate strip.
+        let mut page = div()
+            .flex()
+            .flex_col()
+            .gap(px(32.0))
+            .child(anim::appear(
+                "today-head",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(text::DISPLAY))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme.ink)
+                            .child(greeting()),
+                    )
+                    .child(div().text_size(px(text::LEAD)).text_color(theme.muted).child(subtitle)),
+            ));
+
+        if let Some(e) = failed {
+            return page
+                .child(anim::appear(
+                    "today-offline",
+                    div().child(notice_chip(&theme, true, "Couldn't reach Familiar", e, NoticeChipIcon::Tile)),
+                ))
+                .child(empty(
+                    "Familiar isn't running",
+                    Some("Start the Familiar desktop app; this window connects to it on its own.".into()),
+                    cx,
+                ));
+        }
+
+        if teammates.is_empty() {
+            return page.child(anim::appear(
+                "today-first",
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.0))
+                    .py(px(40.0))
+                    .child(Mascot::new("today-first", familiar_ui::mascot::default_avatar("first"), MascotState::Idle, 96.0))
+                    .child(div().text_size(px(text::TITLE)).font_weight(FontWeight::SEMIBOLD).child("Meet your first teammate"))
+                    .child(
+                        div()
+                            .text_color(theme.muted)
+                            .child("Name it, give it a look and a job, and it starts working beside you."),
+                    )
+                    .child(Button::new("create-first", "Create a teammate").primary().icon(icons::PLUS)),
+            ));
+        }
+
+        page = page.child(self.strip(&teammates, cx));
+
+        // Needs you: every pending approval / question.
+        if !pending.is_empty() {
+            let cards = self.approval_cards(&pending, window, cx);
+            page = page.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .child(SectionHeader::new("Needs you").count(pending.len()))
+                    .children(cards),
+            );
+        }
+
+        // Happening now: every active run, with the live text tail.
+        if !active.is_empty() {
+            let mut list = div().flex().flex_col().gap(px(10.0));
+            for (i, r) in active.iter().enumerate() {
+                let Some(t) = who(r.bot_id) else { continue };
+                let live = self.data.read(cx).live.get(&r.id).map(|b| tail(&b.text, 220)).unwrap_or_default();
+                let route = Route::Teammate(t.id.clone());
+                let this = this.clone();
+                list = list.child(anim::stagger(
+                    SharedString::from(format!("now-in-{}", r.id)),
+                    i,
+                    div().child(
+                        HoverCard::new(SharedString::from(format!("now-{}", r.id)))
+                            .on_click(move |_, _, cx| this.update(cx, |s, cx| s.navigate(route.clone(), cx)))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(14.0))
+                                    .items_start()
+                                    .child(Mascot::new(format!("now-{}", r.id), t.avatar, MascotState::Working, 40.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .gap(px(3.0))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap(px(8.0))
+                                                    .child(div().font_weight(FontWeight::MEDIUM).child(t.name.clone()))
+                                                    .child(StatusChip::new(run_status(r.status))),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(text::SMALL))
+                                                    .text_color(theme.muted)
+                                                    .truncate()
+                                                    .child(excerpt(r.prompt.as_deref().unwrap_or(""), 100)),
+                                            )
+                                            .when(!live.trim().is_empty(), |el| {
+                                                el.child(
+                                                    div()
+                                                        .pt(px(4.0))
+                                                        .text_size(px(text::SMALL))
+                                                        .text_color(theme.ink)
+                                                        .line_clamp(2)
+                                                        .child(live.trim().to_owned()),
+                                                )
+                                            }),
+                                    ),
+                            ),
+                    ),
+                ));
+            }
+            page = page.child(
+                div().flex().flex_col().gap(px(12.0)).child(SectionHeader::new("Happening now")).child(list),
+            );
+        }
+
+        // Recently done: the newest finished runs across bots, expandable.
+        let done: Vec<Run> = runs.iter().filter(|r| !r.status.is_active()).take(6).cloned().collect();
+        let recent = if !runs_loaded {
+            div().flex().flex_col().gap(px(8.0)).children((0..3).map(|_| Skeleton::new(52.0).radius(RADIUS_CARD)))
+        } else if done.is_empty() {
+            div().child(anim::appear(
+                "done-empty",
+                empty(
+                    "Nothing finished yet",
+                    Some("Finished work will appear here. Say hello to a teammate to get started.".into()),
+                    cx,
+                ),
+            ))
+        } else {
+            let mut list = card(cx).flex().flex_col().overflow_hidden();
+            for (i, r) in done.iter().enumerate() {
+                let t = who(r.bot_id);
+                let exp = self.expanded.entry(r.id).or_insert_with(|| Expand::new(false));
+                let openness = exp.openness();
+                let this = this.clone();
+                let rid = r.id;
+                if i > 0 {
+                    list = list.child(divider(cx));
+                }
+                let title = match excerpt(r.prompt.as_deref().unwrap_or(""), 90) {
+                    s if s.is_empty() => "(no prompt)".to_owned(),
+                    s => s,
+                };
+                let when = ago(r.finished_at.or(Some(r.created_at)));
+                let detail = run_detail(r);
+                let open_route = t.as_ref().map(|t| Route::Teammate(t.id.clone()));
+                let this_open = cx.entity();
+                list = list.child(anim::stagger(
+                    SharedString::from(format!("done-in-{}", r.id)),
+                    i,
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("done-{}", r.id)))
+                                .flex()
+                                .items_center()
+                                .gap(px(12.0))
+                                .px(px(16.0))
+                                .py(px(11.0))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(theme.hover))
+                                .on_click(move |_, _, cx| {
+                                    this.update(cx, |s, cx| {
+                                        if let Some(e) = s.expanded.get_mut(&rid) {
+                                            e.toggle();
+                                        }
+                                        cx.notify();
+                                    })
+                                })
+                                .when_some(t.clone(), |el, t| {
+                                    let state =
+                                        if r.status == familiar_client::RunStatus::Succeeded { MascotState::Done } else { MascotState::Idle };
+                                    el.child(Mascot::new(format!("done-{}", r.id), t.avatar, state, 30.0))
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .child(div().truncate().child(title))
+                                        .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(
+                                            SharedString::from(format!(
+                                                "{} · {when}",
+                                                t.as_ref().map(|t| t.name.clone()).unwrap_or_default()
+                                            )),
+                                        )),
+                                )
+                                .child(StatusChip::new(run_status(r.status)))
+                                .child(div().relative().top(px(-2.0 * openness)).child(
+                                    icon(icons::ALT_ARROW_DOWN)
+                                        .size(px(14.0))
+                                        .text_color(theme.muted)
+                                        .opacity(0.5 + 0.5 * openness),
+                                )),
+                        )
+                        .child(exp.render(
+                            SharedString::from(format!("done-detail-{}", r.id)),
+                            window,
+                            cx,
+                            div()
+                                .pl(px(58.0))
+                                .pr(px(16.0))
+                                .pb(px(12.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_size(px(text::SMALL))
+                                        .text_color(if r.error.is_some() { theme.bad } else { theme.muted })
+                                        .child(detail),
+                                )
+                                .when_some(open_route, |el, route| {
+                                    el.child(
+                                        Button::new(SharedString::from(format!("done-open-{}", r.id)), "Open chat")
+                                            .size(ButtonSize::Small)
+                                            .icon(icons::ARROW_RIGHT)
+                                            .on_click(move |_, _, cx| {
+                                                this_open.update(cx, |s, cx| s.navigate(route.clone(), cx))
+                                            }),
+                                    )
+                                }),
+                        )),
+                ));
+            }
+            div().child(list)
+        };
+        page = page.child(div().flex().flex_col().gap(px(12.0)).child(SectionHeader::new("Recently done")).child(recent));
+
+        // Coming up: enabled schedules by next run.
+        let mut upcoming: Vec<_> = schedules.iter().filter(|s| s.enabled && s.next_run_at.is_some()).collect();
+        upcoming.sort_by_key(|s| s.next_run_at);
+        if !upcoming.is_empty() {
+            let mut coming = card(cx).flex().flex_col();
+            for (i, s) in upcoming.into_iter().take(5).enumerate() {
+                let t = who(s.bot_id);
+                if i > 0 {
+                    coming = coming.child(divider(cx));
+                }
+                let tone = if s.kind == RunKind::Proactive { Tone::Accent } else { Tone::Muted };
+                coming = coming.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.0))
+                        .px(px(16.0))
+                        .py(px(11.0))
+                        .when_some(t.clone(), |el, t| {
+                            el.child(Mascot::new(format!("up-{}", s.id), t.avatar, MascotState::Idle, 30.0))
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().truncate().child(excerpt(&s.prompt, 80)))
+                                .child(
+                                    div()
+                                        .text_size(px(text::CAPTION))
+                                        .text_color(theme.muted)
+                                        .child(t.map(|t| t.name).unwrap_or_default()),
+                                ),
+                        )
+                        .child(chip(tone, until(s.next_run_at), cx)),
+                );
+            }
+            page = page.child(div().flex().flex_col().gap(px(12.0)).child(SectionHeader::new("Coming up")).child(coming));
+        }
+        page
+    }
+
+    fn strip(&self, teammates: &[Teammate], cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx).clone();
+        let this = cx.entity();
         let mut strip = div().flex().gap(px(12.0)).flex_wrap();
         for (i, t) in teammates.iter().enumerate() {
             let route = Route::Teammate(t.id.clone());
@@ -330,7 +668,7 @@ impl Shell {
                 ),
             ));
         }
-        strip = strip.child(anim::stagger(
+        strip.child(anim::stagger(
             "strip-in-new",
             teammates.len(),
             div().child(
@@ -356,285 +694,37 @@ impl Shell {
                         .child(div().text_size(px(text::SMALL)).text_color(theme.muted).child("New")),
                 ),
             ),
-        ));
-
-        let find = |state: MascotState| teammates.iter().find(|t| t.state == state).cloned();
-        let mut page = div()
-            .flex()
-            .flex_col()
-            .gap(px(32.0))
-            .child(anim::appear(
-                "today-head",
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .text_size(px(text::DISPLAY))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.ink)
-                            .child(greeting()),
-                    )
-                    .child(div().text_size(px(text::LEAD)).text_color(theme.muted).child(subtitle)),
-            ))
-            .when_some(
-                match &self.load {
-                    Load::Failed(e) => Some(e.clone()),
-                    _ => None,
-                },
-                |el, e| {
-                    el.child(anim::appear(
-                        "today-offline",
-                        div().child(notice_chip(
-                            &theme,
-                            true,
-                            "Couldn't reach Familiar — showing sample teammates",
-                            e,
-                            NoticeChipIcon::Tile,
-                        )),
-                    ))
-                },
-            )
-            .child(strip);
-
-        // Needs you: an approval mock.
-        if let Some(t) = find(MascotState::NeedsYou).filter(|_| !self.approved) {
-            let approve = this.clone();
-            let deny = this.clone();
-            let toasts = self.toasts.clone();
-            let toasts2 = self.toasts.clone();
-            let name = t.name.clone();
-            page = page.child(
-                div().flex().flex_col().gap(px(12.0)).child(SectionHeader::new("Needs you")).child(anim::appear(
-                    "approval",
-                    card(cx).p(px(16.0)).flex().gap(px(14.0)).items_start().children([
-                        Mascot::new(format!("approval-{}", t.id), t.avatar, t.state, 40.0).into_any_element(),
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .gap(px(10.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.0))
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(8.0))
-                                            .child(div().font_weight(FontWeight::MEDIUM).child(t.name.clone()))
-                                            .child(chip(Tone::Warn, "wants to send an email", cx)),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(text::SMALL))
-                                            .text_color(theme.muted)
-                                            .child("To design@ — \"Here's the weekly summary of the onboarding study…\""),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(8.0))
-                                    .child(Button::new("approve", "Approve").primary().icon(icons::CHECK).on_click(
-                                        move |_, _, cx| {
-                                            let name = name.clone();
-                                            approve.update(cx, |s, cx| {
-                                                s.approved = true;
-                                                cx.notify();
-                                            });
-                                            toasts.update(cx, |t, cx| {
-                                                t.push(Tone::Ok, "Approved", Some(format!("{name} will send it now.").into()), cx)
-                                            });
-                                        },
-                                    ))
-                                    .child(Button::new("deny", "Not now").on_click(move |_, _, cx| {
-                                        deny.update(cx, |s, cx| {
-                                            s.approved = true;
-                                            cx.notify();
-                                        });
-                                        toasts2.update(cx, |t, cx| t.push(Tone::Muted, "Declined", None, cx));
-                                    })),
-                            )
-                            .into_any_element(),
-                    ]),
-                )),
-            );
-        }
-
-        // Happening now.
-        if let Some(t) = find(MascotState::Working) {
-            page = page.child(
-                div().flex().flex_col().gap(px(12.0)).child(SectionHeader::new("Happening now")).child(anim::appear(
-                    "now",
-                    div().child(
-                        HoverCard::new("now-card").child(
-                            div()
-                                .flex()
-                                .gap(px(14.0))
-                                .items_start()
-                                .child(Mascot::new(format!("now-{}", t.id), t.avatar, t.state, 40.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .gap(px(3.0))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .gap(px(8.0))
-                                                .child(div().font_weight(FontWeight::MEDIUM).child(t.name.clone()))
-                                                .child(StatusChip::new(RunStatus::Running)),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(text::SMALL))
-                                                .text_color(theme.muted)
-                                                .truncate()
-                                                .child("Triage new GitHub issues and draft replies"),
-                                        )
-                                        .child(
-                                            div()
-                                                .pt(px(4.0))
-                                                .text_size(px(text::SMALL))
-                                                .text_color(theme.ink)
-                                                .child("Reading #482 \"Sidebar flickers on resize\" — looks like a duplicate of #455…"),
-                                        ),
-                                ),
-                        ),
-                    ),
-                )),
-            );
-        }
-
-        // Recently done — expandable rows.
-        let done: [(&str, &str, RunStatus, &str); 4] = [
-            ("Summarised yesterday's support inbox", "12 min ago", RunStatus::Succeeded, "18 threads read · 3 need a human · drafted 6 replies"),
-            ("Updated the onboarding checklist in Notion", "1 h ago", RunStatus::Succeeded, "Added the SSO step and linked the new video"),
-            ("Tried to deploy the docs site", "2 h ago", RunStatus::Failed, "Build failed: missing env var DOCS_TOKEN"),
-            ("Weekly metrics digest", "Yesterday", RunStatus::Succeeded, "Signups +8% · churn flat · NPS 54"),
-        ];
-        let mut list = card(cx).flex().flex_col().overflow_hidden();
-        for (i, (what, when, status, detail)) in done.into_iter().enumerate() {
-            let who = teammates.get(i % teammates.len().max(1)).cloned();
-            let exp = self.expanded.entry(i).or_insert_with(|| Expand::new(false));
-            let openness = exp.openness();
-            let this = this.clone();
-            if i > 0 {
-                list = list.child(divider(cx));
-            }
-            list = list.child(anim::stagger(
-                ("done-in", i),
-                i,
-                div().flex().flex_col().child(
-                    div()
-                        .id(("done", i))
-                        .flex()
-                        .items_center()
-                        .gap(px(12.0))
-                        .px(px(16.0))
-                        .py(px(11.0))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.hover))
-                        .on_click(move |_, _, cx| {
-                            this.update(cx, |s, cx| {
-                                if let Some(e) = s.expanded.get_mut(&i) {
-                                    e.toggle();
-                                }
-                                cx.notify();
-                            })
-                        })
-                        .when_some(who.clone(), |el, t| {
-                            let state = if status == RunStatus::Succeeded { MascotState::Done } else { MascotState::Idle };
-                            el.child(Mascot::new(format!("done-{i}"), t.avatar, state, 30.0))
-                        })
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_w_0()
-                                .child(div().truncate().child(what))
-                                .child(
-                                    div().text_size(px(text::CAPTION)).text_color(theme.muted).child(SharedString::from(
-                                        format!("{} · {when}", who.map(|t| t.name).unwrap_or_default()),
-                                    )),
-                                ),
-                        )
-                        .child(StatusChip::new(status))
-                        .child(
-                            div()
-                                .relative()
-                                .top(px(-2.0 * openness))
-                                .child(icon(icons::ALT_ARROW_DOWN).size(px(14.0)).text_color(theme.muted).opacity(0.5 + 0.5 * openness)),
-                        ),
-                ).child(exp.render(("done-detail", i), window, cx, div().pl(px(58.0)).pr(px(16.0)).pb(px(12.0)).text_size(px(text::SMALL)).text_color(theme.muted).child(detail))),
-            ));
-        }
-        page = page.child(div().flex().flex_col().gap(px(12.0)).child(SectionHeader::new("Recently done")).child(list));
-
-        // Coming up.
-        let upcoming = [("Morning briefing", "in 2h", Tone::Accent), ("Tidy the shared drive", "tomorrow", Tone::Muted)];
-        let mut coming = card(cx).flex().flex_col();
-        for (i, (what, when, tone)) in upcoming.into_iter().enumerate() {
-            let who = teammates.get((i + 3) % teammates.len().max(1)).cloned();
-            if i > 0 {
-                coming = coming.child(divider(cx));
-            }
-            coming = coming.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.0))
-                    .px(px(16.0))
-                    .py(px(11.0))
-                    .when_some(who.clone(), |el, t| el.child(Mascot::new(format!("up-{i}"), t.avatar, MascotState::Idle, 30.0)))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .child(div().child(what))
-                            .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(who.map(|t| t.name).unwrap_or_default())),
-                    )
-                    .child(chip(tone, when, cx)),
-            );
-        }
-        page.child(div().flex().flex_col().gap(px(12.0)).child(SectionHeader::new("Coming up")).child(coming))
+        ))
     }
 
-    fn needs_you(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn needs_you(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(20.0))
-            .child(
-                div()
-                    .text_size(px(text::HEADLINE))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.ink)
-                    .child("Needs you"),
-            )
-            .child(anim::appear(
+        let pending = self.data.read(cx).pending.clone();
+        let head = div()
+            .text_size(px(text::HEADLINE))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme.ink)
+            .child("Needs you");
+        let mut page = div().flex().flex_col().gap(px(20.0)).child(head);
+        if pending.is_empty() {
+            page = page.child(anim::appear(
                 "needs-empty",
                 empty(
-                    if self.pending() == 0 { "You're all caught up" } else { "Approvals live on Today for now" },
+                    "You're all caught up",
                     Some("When a teammate needs a decision, it shows up here.".into()),
                     cx,
                 ),
-            ))
+            ));
+        } else {
+            let cards = self.approval_cards(&pending, window, cx);
+            page = page.child(div().flex().flex_col().gap(px(12.0)).children(cards));
+        }
+        page
     }
 
     fn teammate_page(&mut self, id: &SharedString, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let Some(t) = self.teammates().into_iter().find(|t| &t.id == id) else {
+        let Some(t) = self.data.read(cx).teammates().into_iter().find(|t| &t.id == id) else {
             return div().child(empty("Teammate not found", None, cx));
         };
         div()
@@ -664,16 +754,7 @@ impl Shell {
                                 div()
                                     .flex()
                                     .gap(px(6.0))
-                                    .child(chip(
-                                        match t.state {
-                                            MascotState::Working => Tone::Accent,
-                                            MascotState::NeedsYou => Tone::Warn,
-                                            MascotState::Done => Tone::Ok,
-                                            _ => Tone::Muted,
-                                        },
-                                        t.state.label(),
-                                        cx,
-                                    ))
+                                    .child(chip(state_tone(t.state), t.state.label(), cx))
                                     .when_some(t.model.clone(), |el, m| el.child(chip(Tone::Muted, m, cx))),
                             ),
                     ),
@@ -683,6 +764,35 @@ impl Shell {
                 empty("Chat comes next", Some("This page is a placeholder while the chat screen is ported.".into()), cx),
             ))
     }
+}
+
+pub fn state_tone(state: MascotState) -> Tone {
+    match state {
+        MascotState::Working => Tone::Accent,
+        MascotState::NeedsYou => Tone::Warn,
+        MascotState::Done => Tone::Ok,
+        _ => Tone::Muted,
+    }
+}
+
+/// The expanded line of a finished run: its error, or how it went.
+fn run_detail(r: &Run) -> String {
+    if let Some(e) = r.error.as_deref().filter(|e| !e.trim().is_empty()) {
+        return excerpt(e, 240);
+    }
+    let kind = match r.kind {
+        RunKind::Unknown => "run".to_owned(),
+        k => format!("{} run", k.as_str()),
+    };
+    let mut parts = vec![kind, format!("finished {}", ago(r.finished_at))];
+    if let (Some(s), Some(f)) = (r.started_at, r.finished_at) {
+        let secs = (f - s).num_seconds().max(0);
+        parts.push(if secs < 60 { format!("took {secs}s") } else { format!("took {}m", secs / 60) });
+    }
+    if let Some(c) = r.cost_usd.filter(|c| *c > 0.0) {
+        parts.push(format!("${c:.2}"));
+    }
+    parts.join(" · ")
 }
 
 /// The web's `greeting()`, by local hour.
@@ -699,34 +809,9 @@ fn greeting() -> &'static str {
     }
 }
 
-#[cfg(windows)]
-fn local_hour() -> u16 {
-    #[repr(C)]
-    #[derive(Default)]
-    struct SystemTime {
-        year: u16,
-        month: u16,
-        day_of_week: u16,
-        day: u16,
-        hour: u16,
-        minute: u16,
-        second: u16,
-        milliseconds: u16,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetLocalTime(time: *mut SystemTime);
-    }
-    let mut t = SystemTime::default();
-    // SAFETY: GetLocalTime fills the caller-provided SYSTEMTIME and cannot fail.
-    unsafe { GetLocalTime(&raw mut t) };
-    t.hour
-}
-
-#[cfg(not(windows))]
-fn local_hour() -> u16 {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    ((secs / 3600) % 24) as u16
+fn local_hour() -> u32 {
+    use chrono::Timelike as _;
+    chrono::Local::now().hour()
 }
 
 impl Render for Shell {
@@ -776,3 +861,4 @@ impl Shell {
         element
     }
 }
+
