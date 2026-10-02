@@ -1,0 +1,587 @@
+//! Row types mirroring `apps/web/src/lib/types.ts`. Tolerant by construction: every struct is
+//! `#[serde(default)]`, unknown fields are ignored and unknown enum values map to `Unknown`.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use uuid::Uuid;
+
+macro_rules! tolerant_enum {
+    ($(#[$m:meta])* $name:ident { $($var:ident = $s:literal),+ $(,)? }) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+        pub enum $name {
+            $(#[serde(rename = $s)] $var,)+
+            #[default]
+            #[serde(other)]
+            Unknown,
+        }
+        impl $name {
+            pub fn as_str(&self) -> &'static str {
+                match self { $(Self::$var => $s,)+ Self::Unknown => "unknown" }
+            }
+        }
+    };
+}
+
+tolerant_enum!(BotEngine { Claude = "claude", Codex = "codex" });
+tolerant_enum!(BotStatus { Idle = "idle", Running = "running", Paused = "paused" });
+tolerant_enum!(RunKind { Chat = "chat", Scheduled = "scheduled", Proactive = "proactive", Handoff = "handoff" });
+tolerant_enum!(RunStatus {
+    Queued = "queued", Running = "running", WaitingApproval = "waiting_approval",
+    Succeeded = "succeeded", Failed = "failed", Cancelled = "cancelled",
+});
+tolerant_enum!(EventKind {
+    Status = "status", Text = "text", Thinking = "thinking", ToolCall = "tool_call",
+    ToolResult = "tool_result", Approval = "approval", Artifact = "artifact", Error = "error",
+    Result = "result", RateLimit = "rate_limit",
+});
+tolerant_enum!(ApprovalStatus {
+    Pending = "pending", Approved = "approved", Denied = "denied", Expired = "expired",
+});
+tolerant_enum!(RuleDecision { Allow = "allow", Deny = "deny", Ask = "ask", Review = "review" });
+tolerant_enum!(Role { User = "user", Assistant = "assistant", System = "system" });
+
+impl RunStatus {
+    pub fn is_active(&self) -> bool {
+        matches!(self, Self::Queued | Self::Running | Self::WaitingApproval)
+    }
+}
+
+/// `bots.avatar` jsonb; every field optional (missing ones fall back to an id-derived default in the UI).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Avatar {
+    pub shape: Option<u32>,
+    pub color: Option<String>,
+    pub eyes: Option<u32>,
+    pub mouth: Option<u32>,
+    pub accessory: Option<String>,
+}
+
+/// A bot. `status` / `last_run_at` are only present on rows from `/api/overview`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Bot {
+    pub id: Uuid,
+    pub slug: String,
+    pub name: String,
+    pub persona: Option<String>,
+    pub model: String,
+    pub paused: bool,
+    pub engine: BotEngine,
+    pub avatar: Option<Avatar>,
+    pub status: Option<BotStatus>,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub last_dreamed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Bot {
+    /// Status with `paused` winning, as the web UI shows it.
+    pub fn effective_status(&self) -> BotStatus {
+        if self.paused { BotStatus::Paused } else { self.status.unwrap_or(BotStatus::Idle) }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Thread {
+    pub id: Uuid,
+    pub bot_id: Uuid,
+    pub title: Option<String>,
+    pub claude_session_id: Option<Uuid>,
+    pub schedule_id: Option<Uuid>,
+    /// telegram | trigger | schedule | handoff | web | ...
+    pub source: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Message {
+    pub id: Uuid,
+    pub thread_id: Uuid,
+    pub role: Role,
+    pub content: String,
+    pub run_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Run {
+    pub id: Uuid,
+    pub bot_id: Uuid,
+    pub thread_id: Uuid,
+    pub kind: RunKind,
+    pub prompt: Option<String>,
+    pub status: RunStatus,
+    pub error: Option<String>,
+    pub cost_usd: Option<f64>,
+    pub usage: Option<Value>,
+    pub parent_run_id: Option<Uuid>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Event {
+    pub id: i64,
+    pub run_id: Uuid,
+    pub seq: i32,
+    pub kind: EventKind,
+    pub payload: Option<Value>,
+    pub created_at: DateTime<Utc>,
+}
+
+// ---- typed event payloads ---------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolCall {
+    pub id: Option<String>,
+    pub name: String,
+    pub input: Value,
+}
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolResult {
+    pub tool_use_id: Option<String>,
+    /// Flattened to text (string content, or the text blocks of an array).
+    pub content: String,
+    pub is_error: bool,
+}
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ApprovalEvent {
+    pub approval_id: Option<Uuid>,
+    pub tool_name: Option<String>,
+    pub input: Option<Value>,
+    pub status: Option<String>,
+    pub decided_by: Option<String>,
+    pub reason: Option<String>,
+}
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ArtifactEvent {
+    pub artifact_id: Uuid,
+    pub name: String,
+    pub mime: String,
+    pub bytes: u64,
+}
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ResultEvent {
+    pub text: String,
+    pub subtype: Option<String>,
+    pub num_turns: Option<u32>,
+    pub cost_usd: Option<f64>,
+    pub duration_ms: Option<u64>,
+}
+
+/// An [`Event`] payload decoded by kind (see [`Event::typed`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedEvent {
+    Text(String),
+    Thinking(String),
+    ToolCall(ToolCall),
+    ToolResult(ToolResult),
+    Approval(ApprovalEvent),
+    Artifact(ArtifactEvent),
+    Error(String),
+    Result(ResultEvent),
+    /// status / rate_limit / unknown kinds: the raw payload.
+    Other(EventKind, Value),
+}
+
+fn s(p: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| p.get(*k).and_then(Value::as_str)).map(str::to_string)
+}
+
+fn flatten_content(v: &Value) -> String {
+    match v {
+        Value::String(t) => t.clone(),
+        Value::Array(a) => a
+            .iter()
+            .map(|b| b.get("text").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| flatten_content(b)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Null => String::new(),
+        o => serde_json::to_string_pretty(o).unwrap_or_default(),
+    }
+}
+
+impl Event {
+    /// Decode the payload by kind, with the same fallbacks as the web `EventList`.
+    pub fn typed(&self) -> TypedEvent {
+        let null = Value::Null;
+        let p = self.payload.as_ref().unwrap_or(&null);
+        match self.kind {
+            EventKind::Text => TypedEvent::Text(s(p, &["text", "content", "result"]).unwrap_or_else(|| flatten_content(p))),
+            EventKind::Thinking => TypedEvent::Thinking(s(p, &["text", "thinking", "content"]).unwrap_or_else(|| flatten_content(p))),
+            EventKind::ToolCall => TypedEvent::ToolCall(ToolCall {
+                id: s(p, &["id"]),
+                name: s(p, &["name", "tool_name"]).unwrap_or_else(|| "tool".into()),
+                input: p.get("input").cloned().unwrap_or_else(|| p.clone()),
+            }),
+            EventKind::ToolResult => TypedEvent::ToolResult(ToolResult {
+                tool_use_id: s(p, &["tool_use_id"]),
+                content: flatten_content(p.get("content").or_else(|| p.get("output")).unwrap_or(p)),
+                is_error: p.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+            }),
+            EventKind::Approval => TypedEvent::Approval(ApprovalEvent {
+                approval_id: s(p, &["approval_id"]).and_then(|x| x.parse().ok()),
+                tool_name: s(p, &["tool_name", "name"]),
+                input: p.get("input").cloned(),
+                status: s(p, &["status", "decision"]),
+                decided_by: s(p, &["decided_by"]),
+                reason: s(p, &["reason"]),
+            }),
+            EventKind::Artifact => match s(p, &["artifact_id", "id"]).and_then(|x| x.parse().ok()) {
+                Some(artifact_id) => TypedEvent::Artifact(ArtifactEvent {
+                    artifact_id,
+                    name: s(p, &["name"]).unwrap_or_else(|| "file".into()),
+                    mime: s(p, &["mime"]).unwrap_or_default(),
+                    bytes: p.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+                }),
+                None => TypedEvent::Other(self.kind, p.clone()),
+            },
+            EventKind::Error => TypedEvent::Error(s(p, &["message", "error", "text"]).unwrap_or_else(|| flatten_content(p))),
+            EventKind::Result => TypedEvent::Result(ResultEvent {
+                text: s(p, &["text", "content", "result"]).unwrap_or_default(),
+                subtype: s(p, &["subtype"]),
+                num_turns: p.get("num_turns").and_then(Value::as_u64).map(|n| n as u32),
+                cost_usd: p.get("cost_usd").and_then(Value::as_f64),
+                duration_ms: p.get("duration_ms").and_then(Value::as_u64),
+            }),
+            k => TypedEvent::Other(k, p.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Approval {
+    pub id: Uuid,
+    pub run_id: Uuid,
+    pub bot_id: Uuid,
+    pub tool_use_id: Option<String>,
+    pub tool_name: String,
+    pub input: Option<Value>,
+    pub reason: Option<String>,
+    pub status: ApprovalStatus,
+    /// user | rule | reviewer
+    pub decided_by: Option<String>,
+    pub response: Option<String>,
+    pub decided_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub bot_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rule {
+    pub id: Uuid,
+    pub bot_id: Option<Uuid>,
+    pub pattern: String,
+    pub decision: RuleDecision,
+    pub note: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Schedule {
+    pub id: Uuid,
+    pub bot_id: Uuid,
+    pub thread_id: Option<Uuid>,
+    pub cron: String,
+    pub prompt: String,
+    pub kind: RunKind,
+    pub enabled: bool,
+    pub gate_command: Option<String>,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub next_run_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Memory {
+    pub id: Uuid,
+    pub bot_id: Uuid,
+    pub content: String,
+    /// user | bot
+    pub source: String,
+    /// active | proposed | rejected
+    pub status: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Skill {
+    pub id: Uuid,
+    pub bot_id: Uuid,
+    pub name: String,
+    pub description: Option<String>,
+    pub body: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Artifact {
+    pub id: Uuid,
+    pub run_id: Uuid,
+    pub bot_id: Uuid,
+    pub name: String,
+    pub mime: String,
+    pub bytes: u64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecretField {
+    pub key: String,
+    pub label: String,
+    pub help: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConnectorPreset {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// stdio | http
+    pub transport: String,
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub url: Option<String>,
+    pub secret_fields: Vec<SecretField>,
+    pub docs_url: Option<String>,
+    pub verify: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Connector {
+    pub id: Uuid,
+    pub name: String,
+    pub preset: Option<String>,
+    pub transport: String,
+    pub command: Option<String>,
+    pub args: Option<Vec<String>>,
+    pub url: Option<String>,
+    pub env_names: Vec<String>,
+    pub header_names: Vec<String>,
+    pub has_secrets: bool,
+    pub enabled: bool,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Channel {
+    pub id: Uuid,
+    pub kind: String,
+    pub bound: bool,
+    pub pair_code: Option<String>,
+    pub default_bot_id: Option<Uuid>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Trigger {
+    pub id: Uuid,
+    pub bot_id: Uuid,
+    pub name: String,
+    pub prompt: String,
+    pub kind: String,
+    pub enabled: bool,
+    pub last_fired_at: Option<DateTime<Utc>>,
+    pub created_at: Option<DateTime<Utc>>,
+    /// Webhook URL (only on create / rotate).
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeviceInfo {
+    pub utilization: Option<f64>,
+    /// Unix seconds, unix millis or an RFC 3339 string; see [`DeviceInfo::resets_at_utc`].
+    pub resets_at: Option<Value>,
+    pub throttled: bool,
+    pub active_runs: Option<u32>,
+    pub claude_version: Option<String>,
+}
+
+impl DeviceInfo {
+    pub fn resets_at_utc(&self) -> Option<DateTime<Utc>> {
+        match self.resets_at.as_ref()? {
+            Value::Number(n) => {
+                let v = n.as_f64()?;
+                let ms = if v < 1e12 { v * 1000.0 } else { v };
+                DateTime::from_timestamp_millis(ms as i64)
+            }
+            Value::String(t) => DateTime::parse_from_rfc3339(t).ok().map(|d| d.with_timezone(&Utc)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Device {
+    pub id: Uuid,
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub online: Option<bool>,
+    pub info: Option<DeviceInfo>,
+}
+
+impl Device {
+    /// Server-provided `online`, else seen within 3 minutes.
+    pub fn is_online(&self, now: DateTime<Utc>) -> bool {
+        self.online.unwrap_or_else(|| self.last_seen_at.is_some_and(|t| now - t < chrono::Duration::minutes(3)))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Overview {
+    pub bots: Vec<Bot>,
+    /// A count or a list depending on server version; see [`Overview::pending_count`].
+    pub pending_approvals: Value,
+    pub devices: Vec<Device>,
+}
+
+impl Overview {
+    pub fn pending_count(&self) -> usize {
+        match &self.pending_approvals {
+            Value::Array(a) => a.len(),
+            Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+            _ => 0,
+        }
+    }
+    pub fn pc_online(&self, now: DateTime<Utc>) -> bool {
+        self.devices.iter().any(|d| d.is_online(now))
+    }
+    pub fn last_seen(&self) -> Option<DateTime<Utc>> {
+        self.devices.iter().filter_map(|d| d.last_seen_at).max()
+    }
+    /// First device info that is throttled or reports utilisation.
+    pub fn device_info(&self) -> Option<&DeviceInfo> {
+        self.devices.iter().filter_map(|d| d.info.as_ref()).find(|i| i.throttled || i.utilization.is_some())
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LiveInfo {
+    pub url: String,
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuthState {
+    pub setup_needed: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct User {
+    pub id: Uuid,
+    pub email: String,
+}
+
+/// Response of setup / login.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Session {
+    pub token: String,
+    pub user: User,
+}
+
+// ---- request bodies ----------------------------------------------------
+
+macro_rules! body {
+    ($(#[$m:meta])* $name:ident { $($f:ident : $t:ty),* $(,)? }) => {
+        $(#[$m])*
+        #[derive(Debug, Clone, Default, Serialize)]
+        pub struct $name { $(#[serde(skip_serializing_if = "Option::is_none")] pub $f: Option<$t>,)* }
+    };
+}
+
+body!(NewBot { name: String, slug: String, persona: String, model: String, engine: String, avatar: Avatar });
+body!(
+    /// `avatar: Some(Value::Null)` clears the avatar.
+    BotPatch { name: String, persona: String, model: String, paused: bool, engine: String, avatar: Value }
+);
+body!(NewSchedule { cron: String, prompt: String, kind: String, enabled: bool, gate_command: String });
+body!(SchedulePatch { cron: String, prompt: String, kind: String, enabled: bool, gate_command: String });
+body!(NewRule { bot_id: Uuid, pattern: String, decision: String, note: String });
+body!(MemoryPatch { content: String, status: String });
+body!(NewTrigger { name: String, prompt: String, kind: String });
+body!(TriggerPatch { name: String, prompt: String, kind: String, enabled: bool });
+body!(NewChannel { kind: String, token: String, default_bot_id: Uuid });
+body!(ChannelPatch { token: String, default_bot_id: Uuid, enabled: bool });
+body!(AccountUpdate { current_password: String, email: String, new_password: String });
+
+/// Secrets for a connector: env vars (stdio) and/or headers (http). Write-only.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ConnectorSecrets {
+    pub env: std::collections::BTreeMap<String, String>,
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+body!(NewConnector {
+    name: String, preset: String, transport: String, command: String, args: Vec<String>,
+    url: String, secrets: ConnectorSecrets, enabled: bool,
+});
+body!(ConnectorPatch {
+    name: String, preset: String, transport: String, command: String, args: Vec<String>,
+    url: String, secrets: ConnectorSecrets, enabled: bool,
+});
+
+/// Input to the live browser view (`type` is click | type | key | scroll | navigate).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LiveInput {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub y: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dy: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+impl LiveInput {
+    pub fn click(x: i64, y: i64) -> Self {
+        Self { kind: "click".into(), x: Some(x), y: Some(y), ..Default::default() }
+    }
+    pub fn type_text(t: impl Into<String>) -> Self {
+        Self { kind: "type".into(), text: Some(t.into()), ..Default::default() }
+    }
+    pub fn key(k: impl Into<String>) -> Self {
+        Self { kind: "key".into(), key: Some(k.into()), ..Default::default() }
+    }
+    pub fn scroll(dy: i64) -> Self {
+        Self { kind: "scroll".into(), dy: Some(dy), ..Default::default() }
+    }
+    pub fn navigate(u: impl Into<String>) -> Self {
+        Self { kind: "navigate".into(), url: Some(u.into()), ..Default::default() }
+    }
+}
