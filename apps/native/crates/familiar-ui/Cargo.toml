@@ -1,0 +1,30 @@
+[package]
+name = "familiar-ui"
+version = "0.1.0"
+edition = "2024"
+# Our code is MIT; several modules are vendored from zeron (MIT, see LICENSE-zeron). Bundled assets carry their own
+# licences: Geist fonts (SIL OFL 1.1, assets/fonts/licenses), Solar Icons (CC BY 4.0). See ../../THIRD_PARTY_NOTICES.md.
+license = "MIT"
+publish = false
+description = "Familiar's native design system: theme, typography, motion, mascot and components over GPUI."
+
+[dependencies]
+gpui.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+futures = "0.3"
+smallvec = "1"
+image = { version = "0.25.10", default-features = false }
+# Same version gpui links (no second copy in the graph); used to rasterise the multi-colour mascot.
+resvg = { version = "0.46", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+raw-window-handle = "0.6"

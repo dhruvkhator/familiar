@@ -1585,6 +1585,8 @@ name = "familiar-native"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "embed-resource",
+ "familiar-ui",
  "gpui",
  "gpui-base",
  "gpui_platform",
@@ -1595,6 +1597,23 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "familiar-ui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "gpui",
+ "image",
+ "raw-window-handle",
+ "resvg",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
