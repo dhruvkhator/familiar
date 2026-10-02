@@ -1025,3 +1025,31 @@ async fn second_user_sees_nothing() {
     assert_eq!(app.get(ta, &format!("/api/bots/{bot}/live")).await.0, 200);
     assert_eq!(len(&app.get(ta, &format!("/api/bots/{bot}/triggers")).await.1), 1);
 }
+
+// ------------------------------------------------------------------ local owner session (native app)
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mint_owner_session_only_for_a_single_owner() {
+    use familiar_server::mint_owner_session;
+    let app = app!();
+    assert_eq!(mint_owner_session(&app.pool).await.unwrap(), None, "no user yet");
+
+    let a = app.owner().await;
+    let tok = mint_owner_session(&app.pool).await.unwrap().expect("one owner");
+    assert_ne!(tok, a.tok);
+    let (s, me) = app.get(&tok, "/api/me").await;
+    assert_eq!((s, me["id"].as_str()), (200, Some(a.id.to_string().as_str())));
+    // same 30-day lifetime as a login session
+    let days: f64 = sqlx::query_scalar(
+        "select extract(epoch from expires_at - now())::float8 / 86400 from sessions where token_hash = encode(digest($1,'sha256'),'hex')",
+    )
+    .bind(&tok)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    assert!((29.9..=30.0).contains(&days), "expires in {days} days");
+
+    app.second().await;
+    assert_eq!(mint_owner_session(&app.pool).await.unwrap(), None, "two users: no unambiguous owner");
+    assert_eq!(app.get(&tok, "/api/me").await.0, 200, "existing sessions are untouched");
+}

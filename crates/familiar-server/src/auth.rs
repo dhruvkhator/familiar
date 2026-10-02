@@ -102,7 +102,7 @@ async fn verify_password(pw: String, phc: String) -> bool {
 }
 
 /// Insert a new session (and sweep expired ones); returns the raw token.
-async fn new_session(conn: &mut sqlx::PgConnection, user: Uuid) -> R<String> {
+async fn new_session(conn: &mut sqlx::PgConnection, user: Uuid) -> Result<String, sqlx::Error> {
     let mut raw = [0u8; 32];
     rand::fill(&mut raw);
     let token = URL_SAFE_NO_PAD.encode(raw);
@@ -118,6 +118,20 @@ async fn new_session(conn: &mut sqlx::PgConnection, user: Uuid) -> R<String> {
         .execute(&mut *conn)
         .await?;
     Ok(token)
+}
+
+/// A session for the single owner without a password, for a UI hosted in the same process as the server (the native
+/// app). `None` while no user exists, or when there is more than one (no unambiguous owner). Same token format and
+/// 30-day expiry as `login`; the raw token is returned to the caller only, never logged.
+pub async fn mint_owner_session(pool: &sqlx::PgPool) -> anyhow::Result<Option<String>> {
+    let ids: Vec<Uuid> = sqlx::query_scalar("select id from users limit 2")
+        .fetch_all(pool)
+        .await?;
+    let [id] = ids[..] else {
+        return Ok(None);
+    };
+    let mut conn = pool.acquire().await?;
+    Ok(Some(new_session(&mut conn, id).await?))
 }
 
 #[derive(Deserialize)]

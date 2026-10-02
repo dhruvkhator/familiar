@@ -9,18 +9,11 @@ description = "Familiar desktop app: tray shell hosting familiar-core"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-familiar-core = { path = "../../../crates/familiar-core" }
+familiar-host = { path = "../../../crates/familiar-host" }
 # custom-protocol: always serve the bundled UI (apps/web/dist), never a dev server.
 tauri = { version = "2", features = ["tray-icon", "custom-protocol"] }
 tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
-tokio = { version = "1", features = ["process", "sync", "time"] }
-tokio-util = "0.7"
-serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["sync"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-familiar-server = { version = "0.1.0", path = "../../../crates/familiar-server" }
-postgresql_embedded = "0.21.0"
-serde_json = "1.0.151"
-anyhow = "1.0.104"

@@ -1,0 +1,23 @@
+[package]
+name = "familiar-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Hosts a whole local Familiar install in-process (database, API, daemon); shared by the Tauri and native apps"
+
+[dependencies]
+familiar-core = { path = "../familiar-core" }
+familiar-server = { path = "../familiar-server" }
+anyhow = "1.0.104"
+postgresql_embedded = "0.21.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0.151"
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls"] }
+tokio = { version = "1", features = ["process", "rt", "sync", "time"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

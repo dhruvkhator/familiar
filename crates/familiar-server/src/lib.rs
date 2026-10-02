@@ -5,6 +5,8 @@ mod auth;
 mod error;
 mod routes;
 
+pub use auth::mint_owner_session;
+
 use axum::{
     Router,
     extract::DefaultBodyLimit,

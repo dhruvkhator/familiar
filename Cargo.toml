@@ -2,7 +2,7 @@
 resolver = "3"
 exclude = ["apps/native"]  # own workspace: GPUI and Tauri pin conflicting build deps
 members = [
-    "crates/familiar-crypto", "crates/familiar-core", "crates/familiar-server", "crates/familiard", "crates/familiar-testkit", "apps/desktop/src-tauri"]
+    "crates/familiar-crypto", "crates/familiar-core", "crates/familiar-server", "crates/familiard", "crates/familiar-testkit", "crates/familiar-client", "crates/familiar-host", "apps/desktop/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
