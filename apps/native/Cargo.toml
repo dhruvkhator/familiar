@@ -1,0 +1,39 @@
+[package]
+name = "familiar-native"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+description = "Familiar's native desktop app (GPUI), side by side with the Tauri app until it reaches parity."
+
+[[bin]]
+name = "familiar-native"
+path = "src/main.rs"
+
+[dependencies]
+# GPUI (Apache-2.0) via zeronsh/zui, the fork zeron (MIT) ships: Zed's GPL crates removed. Pinned like zeron.
+gpui = { git = "https://github.com/zeronsh/zui", rev = "667d0aaf9531d2d1b2d0674a5e55f977df1b09f6" }
+gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "667d0aaf9531d2d1b2d0674a5e55f977df1b09f6", features = ["font-kit", "runtime_shaders"] }
+gpui_tokio = { git = "https://github.com/zeronsh/zui", rev = "667d0aaf9531d2d1b2d0674a5e55f977df1b09f6" }
+gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "2f73e5c2bc03d6768cb5fcc92442c4cf4b963b70" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Separate workspace (own Cargo.lock): GPUI and the Tauri app pin conflicting versions of shared build deps.
+[workspace]
+
+[profile.dev]
+opt-level = 0
+
+# GPUI is slow unoptimised: like Zed and zeron, optimise dependencies even in debug builds.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

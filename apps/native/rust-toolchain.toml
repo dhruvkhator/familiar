@@ -1,0 +1,5 @@
+# GPUI (zeronsh/zui) needs a recent stable Rust (std::hint::cold_path). Pinned here only, so the rest of the
+# repo keeps its toolchain; rustup installs this one side by side on first build.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]
