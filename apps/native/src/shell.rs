@@ -48,9 +48,8 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn new(open: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(data: Entity<AppData>, open: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         familiar_ui::observe_window(window, cx);
-        let data = cx.new(AppData::new);
         let mut open = open;
         cx.observe(&data, move |this: &mut Self, data, cx| {
             if let Some(want) = open.as_deref() {
@@ -347,8 +346,8 @@ impl Shell {
                     div().child(notice_chip(&theme, true, "Couldn't reach Familiar", e, NoticeChipIcon::Tile)),
                 ))
                 .child(empty(
-                    "Familiar isn't running",
-                    Some("Start the Familiar desktop app; this window connects to it on its own.".into()),
+                    "Familiar's engine isn't answering",
+                    Some("This page retries on its own as soon as the engine is back.".into()),
                     cx,
                 ));
         }

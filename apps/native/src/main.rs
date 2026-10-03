@@ -1,7 +1,8 @@
 //! Familiar native desktop (GPUI).
 //!
-//! `familiar-native` opens the app shell: a sidebar of teammates with their live status (signed in to the local
-//! Familiar API), Today (needs you, happening now, recently done, coming up) and each teammate's chat. `familiar-native --gallery` opens the design-system gallery used to review the
+//! `familiar-native` runs the whole local install in-process (familiar-host: built-in database, API, daemon; see
+//! `engine.rs`), or attaches to the Familiar desktop app when that already runs it, and opens the app shell: a
+//! sidebar of teammates with their live status, Today (needs you, happening now, recently done, coming up) and each teammate's chat. `familiar-native --gallery` opens the design-system gallery used to review the
 //! look: every component, both themes, the mascot in every state, and the motion primitives.
 //!
 //! Flags (both windows): `--theme light|dark|system`, `--reduce-motion`; gallery only: `--section <name>`; shell only:
@@ -13,8 +14,10 @@
 mod approval;
 mod chat;
 mod data;
+mod engine;
 mod gallery;
 mod markdown;
+mod root;
 mod shell;
 mod text_input;
 
@@ -72,10 +75,24 @@ fn window_options(cx: &App, title: &str, width: f32, height: f32) -> WindowOptio
 }
 
 fn main() {
-    tracing_subscriber::fmt().with_env_filter("warn").init();
     let args = parse_args();
+    // Debug builds log to the console; release builds have none and log to ~/.familiar/logs/native.log.
+    if cfg!(debug_assertions) {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    } else {
+        familiar_host::init_logging("native");
+    }
+    // One runtime for the client, the stream and the hosted engine (database, API, daemon): more than
+    // gpui_tokio's default two workers.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("familiar-rt")
+        .build()
+        .expect("start the tokio runtime");
+    let handle = runtime.handle().clone();
     gpui_platform::application().with_assets(familiar_ui::icons::Assets).run(move |cx: &mut App| {
-        gpui_tokio::init(cx);
+        gpui_tokio::init_from_handle(cx, handle);
         gpui_base::init(cx);
         familiar_ui::init(args.theme, cx);
         if args.reduce_motion {
@@ -90,11 +107,16 @@ fn main() {
         } else {
             let open = args.open.clone();
             cx.open_window(window_options(cx, "Familiar", 1180.0, 780.0), move |window, cx| {
-                cx.new(|cx| shell::Shell::new(open, window, cx))
+                cx.new(|cx| root::Root::new(open, window, cx))
             })
             .map(|_| ())
         };
         opened.expect("open window");
         cx.activate(true);
     });
+    // Normally the window drained the engine before quitting; if the app ended another way, drain it now.
+    let host = engine::HOSTED.lock().unwrap().take();
+    if let Some(host) = host {
+        runtime.block_on(host.shutdown());
+    }
 }

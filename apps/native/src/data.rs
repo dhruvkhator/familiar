@@ -1,4 +1,4 @@
-//! App-wide live data: one [`AppData`] entity signed in to the local Familiar API through `familiar-client`.
+//! App-wide live data: one [`AppData`] entity on the local Familiar API through a signed-in `familiar-client`.
 //!
 //! It holds what the shell shows everywhere (bots with their status, the overview, pending approvals, recent runs
 //! across bots, schedules) plus the live text deltas of running runs. Reads go through the client's SWR cache (the
@@ -22,7 +22,7 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-pub const API_BASE: &str = "http://127.0.0.1:47080";
+pub use crate::engine::Mode;
 
 /// How many bots Home reads runs and schedules for (the web's `slice(0, 10)`).
 const HOME_BOTS: usize = 10;
@@ -57,6 +57,9 @@ enum LiveMsg {
 
 pub struct AppData {
     pub client: Client,
+    /// Who runs the engine. Attached: Settings notes "Using the Familiar app's engine" (Settings is next).
+    #[allow(dead_code)]
+    pub mode: Mode,
     pub status: Status,
     pub overview: Option<Overview>,
     pub pending: Vec<Approval>,
@@ -72,10 +75,11 @@ pub struct AppData {
 impl EventEmitter<DataEvent> for AppData {}
 
 impl AppData {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let client = Client::new(API_BASE, None);
-        let this = Self {
-            client: client.clone(),
+    /// `client` is already signed in (the [`crate::engine::Engine`] did that).
+    pub fn new(client: Client, mode: Mode, cx: &mut Context<Self>) -> Self {
+        let mut this = Self {
+            client,
+            mode,
             status: Status::Connecting,
             overview: None,
             pending: Vec::new(),
@@ -86,32 +90,8 @@ impl AppData {
             _stream: None,
             _pump: None,
         };
-        // Temporary sign-in (the spike's path): the owner password from `~/.familiar/owner_password.txt` or
-        // `FAMILIAR_PASSWORD`. Later the app hosts the engine and mints its own token.
-        let task = Tokio::spawn(cx, async move {
-            let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).unwrap_or_default();
-            let password = std::env::var("FAMILIAR_PASSWORD")
-                .or_else(|_| {
-                    std::fs::read_to_string(std::path::Path::new(&home).join(".familiar").join("owner_password.txt"))
-                })
-                .map_err(|e| format!("No owner password: {e}"))?;
-            let email = std::env::var("FAMILIAR_EMAIL").unwrap_or_else(|_| "owner@familiar.local".into());
-            client.login(&email, password.trim()).await.map(|_| ()).map_err(|e| e.message())
-        });
-        cx.spawn(async move |this, cx| {
-            let result = task.await.map_err(|e| e.to_string()).and_then(|r| r);
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(()) => {
-                    this.reload_all(cx);
-                    this.start_stream(cx);
-                }
-                Err(e) => {
-                    this.status = Status::Failed(e);
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        this.reload_all(cx);
+        this.start_stream(cx);
         this
     }
 
