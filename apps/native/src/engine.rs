@@ -5,9 +5,10 @@
 //! with a token the host mints for the owner, no password. On quit the host drains in-flight runs and stops the
 //! database before the process exits.
 //!
-//! **Attached mode**: another Familiar (the Tauri app) already holds this machine's host lock and must keep running,
-//! so this window uses that engine's API (`127.0.0.1:47080`, or `FAMILIAR_API_URL`) and signs in with the owner
-//! password (`FAMILIAR_PASSWORD`, else `owner_password.txt` in the Familiar folder).
+//! **Attached mode**: another Familiar (the Tauri app) already holds this machine's host lock, or (an older build)
+//! already serves the API port, and must keep running. This window then uses that engine's API
+//! (`127.0.0.1:<local_api_port>`, default 47080, or `FAMILIAR_API_URL`) and signs in with the owner password
+//! (`FAMILIAR_PASSWORD`, else `owner_password.txt` in the Familiar folder).
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -20,7 +21,6 @@ use gpui_tokio::Tokio;
 
 /// The host's boot message when another host holds the machine's lock (see `familiar_host::Host::start`).
 const ANOTHER_HOST: &str = "another Familiar is already running";
-const ATTACHED_API: &str = "http://127.0.0.1:47080";
 
 /// The running host, for the last-chance drain in `main` after the event loop ends.
 pub static HOSTED: Mutex<Option<Host>> = Mutex::new(None);
@@ -76,6 +76,16 @@ impl Engine {
             if let Some(old) = previous {
                 let _ = Tokio::spawn(cx, async move { old.shutdown().await }).await;
             }
+            // A Familiar from before the host lock (an older desktop app) runs without taking it: if something already
+            // serves our API port, attach instead of starting a second daemon on the same database.
+            let served = Tokio::spawn(cx, async {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], api_port()));
+                tokio::time::timeout(Duration::from_millis(500), tokio::net::TcpStream::connect(addr)).await.is_ok_and(|c| c.is_ok())
+            });
+            if served.await.unwrap_or(false) {
+                let _ = this.update(cx, |e, cx| e.attach(cx));
+                return;
+            }
             let handle = cx.update(|cx| Tokio::handle(cx));
             let host = Host::start(handle);
             let mut boot = host.boot_watch();
@@ -110,7 +120,7 @@ impl Engine {
                 }
             }
             let _ = this.update(cx, |e, cx| e.set(Phase::Booting("Opening your workspace…".into()), cx));
-            let client = Client::new(host.api_url().unwrap_or_else(|| ATTACHED_API.into()), None);
+            let client = Client::new(host.api_url().unwrap_or_else(local_api), None);
             let signing = Tokio::spawn(cx, hosted_sign_in(host, client.clone()));
             let phase = match signing.await {
                 Ok(Ok(Some(token))) => {
@@ -129,7 +139,7 @@ impl Engine {
     fn attach(&mut self, cx: &mut Context<Self>) {
         self.mode = Mode::Attached;
         self.set(Phase::Booting("Connecting to the Familiar app…".into()), cx);
-        let base = std::env::var("FAMILIAR_API_URL").unwrap_or_else(|_| ATTACHED_API.into());
+        let base = std::env::var("FAMILIAR_API_URL").unwrap_or_else(|_| local_api());
         let client = Client::new(base, None);
         let task = Tokio::spawn(cx, attached_sign_in(client.clone()));
         self._attach = Some(cx.spawn(async move |this, cx| {
@@ -204,6 +214,20 @@ async fn attached_sign_in(client: Client) -> Result<(), String> {
     })?;
     let email = std::env::var("FAMILIAR_EMAIL").unwrap_or_else(|_| "owner@familiar.local".into());
     client.login(&email, password.trim()).await.map(|_| ()).map_err(|e| e.message())
+}
+
+/// `local_api_port` from the Familiar config (default 47080), where a running Familiar serves its API.
+fn api_port() -> u16 {
+    let text = std::fs::read_to_string(familiar_home().join("config.toml")).unwrap_or_default();
+    text.lines()
+        .filter_map(|l| l.split_once('='))
+        .find(|(k, _)| k.trim() == "local_api_port")
+        .and_then(|(_, v)| v.trim().parse().ok())
+        .unwrap_or(47080)
+}
+
+fn local_api() -> String {
+    format!("http://127.0.0.1:{}", api_port())
 }
 
 /// `~/.familiar`, or `FAMILIAR_HOME` (the same rule as familiar-core's `Config::home_dir`).
