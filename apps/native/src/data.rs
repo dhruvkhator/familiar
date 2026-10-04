@@ -7,7 +7,7 @@
 //! refresh only the affected pieces. Views observe the entity, and subscribe to [`DataEvent`] for their own data
 //! (a thread's messages, a run's events).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -57,8 +57,8 @@ enum LiveMsg {
 
 pub struct AppData {
     pub client: Client,
-    /// Who runs the engine. Attached: Settings notes "Using the Familiar app's engine" (Settings is next).
-    #[allow(dead_code)]
+    /// Who runs the engine. Attached: Settings notes "Using the Familiar app's engine", and notifications come from
+    /// this data (host mode has the daemon's signals).
     pub mode: Mode,
     pub status: Status,
     pub overview: Option<Overview>,
@@ -68,6 +68,10 @@ pub struct AppData {
     pub runs_loaded: bool,
     pub schedules: Vec<Schedule>,
     pub live: HashMap<Uuid, LiveBuf>,
+    /// Approvals already seen (`None` before the first load): a new one is a notification in attached mode.
+    seen_approvals: Option<HashSet<Uuid>>,
+    /// Runs active at the last load: one that has finished since is a notification in attached mode.
+    active_runs: Option<HashSet<Uuid>>,
     _stream: Option<Task<Result<(), gpui_tokio::JoinError>>>,
     _pump: Option<Task<()>>,
 }
@@ -87,6 +91,8 @@ impl AppData {
             runs_loaded: false,
             schedules: Vec::new(),
             live: HashMap::new(),
+            seen_approvals: None,
+            active_runs: None,
             _stream: None,
             _pump: None,
         };
@@ -191,8 +197,9 @@ impl AppData {
     }
 
     pub fn reload_pending(&mut self, cx: &mut Context<Self>) {
-        self.fetch("/api/approvals?status=pending".into(), cx, |this, list: Vec<Approval>, _| {
+        self.fetch("/api/approvals?status=pending".into(), cx, |this, list: Vec<Approval>, cx| {
             this.pending = list.into_iter().filter(|a| a.status == ApprovalStatus::Pending).collect();
+            this.alert_approvals(cx);
         });
     }
 
@@ -216,12 +223,38 @@ impl AppData {
         cx.spawn(async move |this, cx| {
             if let Ok(runs) = task.await {
                 let _ = this.update(cx, |this, cx| {
+                    this.alert_runs(&runs, cx);
                     this.set_runs(runs);
                     cx.notify();
                 });
             }
         })
         .detach();
+    }
+
+    fn bot_name(&self, id: Uuid) -> String {
+        self.bot(id).map(|b| b.name.clone()).unwrap_or_else(|| "A teammate".into())
+    }
+
+    fn alert_approvals(&mut self, cx: &mut Context<Self>) {
+        let attached = self.mode == Mode::Attached;
+        if let (true, Some(seen)) = (attached, self.seen_approvals.as_ref()) {
+            for a in self.pending.iter().filter(|a| !seen.contains(&a.id)) {
+                let bot = a.bot_name.clone().unwrap_or_else(|| self.bot_name(a.bot_id));
+                crate::notify::show("needs", "approval", "Approval needed", format!("{bot} wants to use {}", a.tool_name), cx);
+            }
+        }
+        self.seen_approvals.get_or_insert_default().extend(self.pending.iter().map(|a| a.id));
+    }
+
+    fn alert_runs(&mut self, runs: &[Run], cx: &mut Context<Self>) {
+        if let (Mode::Attached, Some(before)) = (self.mode, self.active_runs.as_ref()) {
+            for r in runs.iter().filter(|r| before.contains(&r.id) && !r.status.is_active()) {
+                let (title, body) = crate::notify::finished(&self.bot_name(r.bot_id), r.status.as_str());
+                crate::notify::show(&format!("bot:{}", r.bot_id), "finished", title, body, cx);
+            }
+        }
+        self.active_runs = Some(runs.iter().filter(|r| r.status.is_active()).map(|r| r.id).collect());
     }
 
     fn set_runs(&mut self, mut runs: Vec<Run>) {

@@ -43,6 +43,9 @@ impl Root {
             match phase {
                 Phase::Ready(client) if this.shell.is_none() => {
                     let mode = engine.read(cx).mode;
+                    if let Some(host) = crate::engine::HOSTED.lock().unwrap().clone().filter(|_| mode == crate::engine::Mode::Hosted) {
+                        crate::notify::watch_host(host, cx);
+                    }
                     let data = cx.new(|cx| AppData::new(client, mode, cx));
                     let open = this.open.take();
                     this.shell = Some(cx.new(|cx| Shell::new(data, open, window, cx)));

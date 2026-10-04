@@ -19,6 +19,7 @@ mod desktop;
 mod engine;
 mod gallery;
 mod markdown;
+mod notify;
 mod prefs;
 mod root;
 mod settings;
@@ -125,6 +126,7 @@ fn main() {
         }
         // Toasts need an app identity when the app isn't packaged (the same id the window and installer use).
         cx.set_app_identity("dev.familiar.desktop", "Familiar");
+        notify::init(cx);
         let open = args.open.clone();
         let options = WindowOptions { show: !args.hidden, focus: !args.hidden, ..window_options(cx, "Familiar", 1180.0, 780.0) };
         let window = cx.open_window(options, move |window, cx| cx.new(|cx| root::Root::new(open, window, cx))).expect("open window");
