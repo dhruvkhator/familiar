@@ -16,8 +16,13 @@ export function riskOf(tool: string): { level: "high" | "medium" | "low"; tone: 
 }
 
 /** Pull the human-meaningful part out of a tool input. */
-// Characters that can make displayed text differ from what runs: controls, bidi overrides/isolates, zero-width.
-const HIDDEN = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F​-‏‪-‮⁠-⁤⁦-⁩﻿]/g;
+// Characters that can make displayed text differ from what runs, by Unicode category so nothing slips through:
+// Cc controls (except \t and \n), Cf format (bidi overrides/isolates, zero-width, soft hyphen, word joiner, BOM,
+// Arabic letter mark, Mongolian vowel separator, the U+E0000 "tag" block used for ASCII smuggling), Zl/Zp line and
+// paragraph separators, Co private use, Cn unassigned — plus blank-looking letters/marks those categories miss:
+// combining grapheme joiner, Hangul fillers, Mongolian free variation selectors, variation selectors.
+const HIDDEN =
+  /(?![\t\n])[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Co}\p{Cn}͏ᅟᅠ᠋-᠍ㅤﾠ︀-️\u{E0100}-\u{E01EF}]/gu;
 
 /** Make hidden characters visible as ⟨U+XXXX⟩ so an approval shows exactly what will run. */
 export function revealHidden(text: string): { text: string; hidden: boolean } {
@@ -82,7 +87,7 @@ export function ApprovalCard({ a, botName, bot, big, onDone }: { a: Approval; bo
         <span className="ml-auto text-xs text-muted tnum">{ago(a.created_at, now)}</span>
       </div>
       <div className="px-4 py-3 space-y-2">
-        {question && <p className="whitespace-pre-wrap">{question}</p>}
+        {question && <p className="whitespace-pre-wrap">{revealHidden(question).text}</p>}
         {sum && (() => {
           const shown = revealHidden(sum.text);
           return (
