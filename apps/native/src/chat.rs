@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use familiar_client::{Event, Message, Role, Run, RunKind, Thread, TypedEvent};
+use familiar_client::{Event, Message, Role, Run, RunKind, RunStatus, Thread, TypedEvent};
 use familiar_ui::anim::{self, Expand};
 use familiar_ui::components::{Button, ButtonSize, Segmented, SidebarItem, Skeleton, StatusChip, card, chip, empty, group_label};
 use familiar_ui::edge_fade::edge_faded;
@@ -312,8 +312,16 @@ impl BotPage {
         if content.is_empty() || self.sending {
             return;
         }
-        self.sending = true;
         self.composer.update(cx, |s, cx| s.set_value("", window, cx));
+        self.post(content, window, cx);
+    }
+
+    /// Post `content` into the selected thread (the composer, or Retry on a failed run).
+    fn post(&mut self, content: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sending {
+            return;
+        }
+        self.sending = true;
         self.outgoing.push(Outgoing { content: content.clone(), known: self.messages.iter().map(|m| m.id).collect(), at: Instant::now() });
         self.force_bottom = true;
         cx.notify();
@@ -888,16 +896,65 @@ impl BotPage {
             let (data, toasts) = (self.data.clone(), self.toasts.clone());
             body = body.children(self.approvals.render(&pending, &data, &toasts, window, cx));
         }
-        if !active && run.error.as_deref().is_none_or(|e| e.trim().is_empty()) {
-            body = body.child(
-                div()
-                    .text_size(px(text::SMALL))
-                    .text_color(theme.muted)
-                    .child(SharedString::from(format!("Finished {}.", ago(run.finished_at)))),
-            );
-        }
         anim::appear(SharedString::from(format!("run-{}", run.id)), card(cx).px(px(14.0)).py(px(12.0)).child(body))
             .into_any_element()
+    }
+
+    /// A failed or stopped run: one compact line under the message, with Retry (posts the same message again).
+    fn failed_notice(&self, run: &Run, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let stopped = run.status == RunStatus::Cancelled;
+        let summary = match run.error.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+            Some(e) if !stopped => format!("Didn't finish: {}", excerpt(e, 120)),
+            _ if stopped => "Stopped before it finished.".to_owned(),
+            _ => "Didn't finish.".to_owned(),
+        };
+        let content = run
+            .prompt
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .or_else(|| self.messages.iter().rev().find(|m| m.role == Role::User).map(|m| m.content.clone()));
+        let this = cx.entity();
+        anim::appear(
+            SharedString::from(format!("failed-{}", run.id)),
+            div().flex().justify_end().child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .max_w(px(560.0))
+                    .pl(px(10.0))
+                    .pr(px(4.0))
+                    .py(px(4.0))
+                    .rounded(px(RADIUS_CHIP))
+                    .bg(if stopped { theme.sunken } else { theme.bad_soft })
+                    .child(
+                        icon(if stopped { icons::INFO_CIRCLE } else { icons::DANGER_TRIANGLE })
+                            .size(px(14.0))
+                            .text_color(if stopped { theme.muted } else { theme.bad }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(text::SMALL))
+                            .text_color(if stopped { theme.muted } else { theme.ink })
+                            .child(summary),
+                    )
+                    .when_some(content, |el, content| {
+                        el.child(
+                            Button::new(SharedString::from(format!("retry-{}", run.id)), "Retry")
+                                .size(ButtonSize::Small)
+                                .ghost()
+                                .icon(icons::REFRESH)
+                                .disabled(self.sending)
+                                .on_click(move |_, window, cx| this.update(cx, |p, cx| p.post(content.clone(), window, cx))),
+                        )
+                    }),
+            ),
+        )
+        .into_any_element()
     }
 
     fn transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -961,8 +1018,14 @@ impl BotPage {
                     &theme,
                 ));
             }
+            // Like a normal chat: the live card only while the run works; a finished run leaves just its reply, a
+            // failed or stopped one a one-line notice with Retry. Run details live in the teammate's activity.
             if let Some(run) = self.runs.first().cloned() {
-                col = col.child(self.run_card(&run, window, cx));
+                if run.status.is_active() {
+                    col = col.child(self.run_card(&run, window, cx));
+                } else if matches!(run.status, RunStatus::Failed | RunStatus::Cancelled) {
+                    col = col.child(self.failed_notice(&run, cx));
+                }
             }
         }
 
