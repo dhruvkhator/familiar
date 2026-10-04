@@ -240,7 +240,8 @@ impl Shell {
                     .items_center()
                     .justify_between()
                     .px(px(16.0))
-                    .pt(px(16.0))
+                    // Under the app's own title bar the sidebar already starts lower.
+                    .pt(px(if crate::titlebar::CUSTOM { 4.0 } else { 16.0 }))
                     .pb(px(12.0))
                     .child(
                         div()

@@ -18,6 +18,7 @@ use crate::data::AppData;
 use crate::engine::{Engine, Phase, familiar_home};
 use crate::shell::Shell;
 use crate::text_input;
+use crate::titlebar;
 
 pub struct Root {
     engine: Entity<Engine>,
@@ -316,13 +317,25 @@ impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         anim::frame(window);
         let phase = self.engine.read(cx).phase.clone();
-        match phase {
+        let with_sidebar = self.shell.is_some() && !matches!(phase, Phase::Stopping);
+        let body = match phase {
             Phase::Stopping => self.stopping(cx),
             _ if self.shell.is_some() => self.shell.clone().unwrap().into_any_element(),
             Phase::Booting(message) => self.boot(&message, cx),
             Phase::FirstRun(_) => self.first_run(window, cx),
             Phase::Failed(message) => self.failed(&message, cx),
             Phase::Ready(_) => self.boot("Opening your workspace…", cx),
+        };
+        if !titlebar::CUSTOM {
+            return body;
         }
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(Theme::of(cx).bg)
+            .child(titlebar::render(with_sidebar, window, cx))
+            .child(div().flex_1().min_h_0().w_full().child(body))
+            .into_any_element()
     }
 }

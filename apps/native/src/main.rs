@@ -30,6 +30,7 @@ mod root;
 mod settings;
 mod shell;
 mod text_input;
+mod titlebar;
 mod tray;
 
 use familiar_ui::AppearanceMode;
@@ -78,12 +79,13 @@ fn parse_args() -> Args {
     args
 }
 
-fn window_options(cx: &App, title: &str, width: f32, height: f32) -> WindowOptions {
+/// `custom_titlebar`: the window draws [`titlebar`] itself (Windows) instead of the system caption.
+fn window_options(cx: &App, title: &str, width: f32, height: f32, custom_titlebar: bool) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(width), px(height)), cx))),
         titlebar: Some(TitlebarOptions {
             title: Some(SharedString::from(title.to_owned())),
-            appears_transparent: false,
+            appears_transparent: custom_titlebar && titlebar::CUSTOM,
             traffic_light_position: None,
         }),
         window_min_size: Some(size(px(820.0), px(560.0))),
@@ -128,7 +130,7 @@ fn main() {
         }
         if args.gallery {
             let section = args.section.clone();
-            cx.open_window(window_options(cx, "Familiar — Gallery", 1240.0, 860.0), move |window, cx| {
+            cx.open_window(window_options(cx, "Familiar — Gallery", 1240.0, 860.0, false), move |window, cx| {
                 cx.new(|cx| gallery::Gallery::new(section.as_deref(), window, cx))
             })
             .expect("open window");
@@ -139,7 +141,7 @@ fn main() {
         cx.set_app_identity("dev.familiar.desktop", "Familiar");
         notify::init(cx);
         let open = args.open.clone();
-        let options = WindowOptions { show: !args.hidden, focus: !args.hidden, ..window_options(cx, "Familiar", 1180.0, 780.0) };
+        let options = WindowOptions { show: !args.hidden, focus: !args.hidden, ..window_options(cx, "Familiar", 1180.0, 780.0, true) };
         let window = cx.open_window(options, move |window, cx| cx.new(|cx| root::Root::new(open, window, cx))).expect("open window");
         cx.set_global(desktop::MainWindow(window));
         tray::install(cx);
