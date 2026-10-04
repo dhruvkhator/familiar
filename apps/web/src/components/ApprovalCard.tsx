@@ -16,6 +16,19 @@ export function riskOf(tool: string): { level: "high" | "medium" | "low"; tone: 
 }
 
 /** Pull the human-meaningful part out of a tool input. */
+// Characters that can make displayed text differ from what runs: controls, bidi overrides/isolates, zero-width.
+const HIDDEN = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F​-‏‪-‮⁠-⁤⁦-⁩﻿]/g;
+
+/** Make hidden characters visible as ⟨U+XXXX⟩ so an approval shows exactly what will run. */
+export function revealHidden(text: string): { text: string; hidden: boolean } {
+  let hidden = false;
+  const out = text.replace(HIDDEN, (c) => {
+    hidden = true;
+    return `⟨U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}⟩`;
+  });
+  return { text: out, hidden };
+}
+
 export function summarizeInput(tool: string, input: Record<string, unknown> | null): { label: string; text: string } | null {
   if (!input) return null;
   const s = (k: string) => (typeof input[k] === "string" ? (input[k] as string) : null);
@@ -70,16 +83,27 @@ export function ApprovalCard({ a, botName, bot, big, onDone }: { a: Approval; bo
       </div>
       <div className="px-4 py-3 space-y-2">
         {question && <p className="whitespace-pre-wrap">{question}</p>}
-        {sum && (
-          <pre className="mono whitespace-pre-wrap break-all rounded-md bg-sunken border-l-4 border-warn px-3 py-2 text-[13px]">{sum.text}</pre>
-        )}
-        {a.reason && <p className="text-sm text-muted">{a.reason}</p>}
+        {sum && (() => {
+          const shown = revealHidden(sum.text);
+          return (
+            <>
+              {shown.hidden && (
+                <span className="inline-block rounded-md bg-bad/10 px-2 py-0.5 text-xs font-medium text-bad">
+                  Contains hidden characters — check carefully
+                </span>
+              )}
+              <pre className="mono whitespace-pre-wrap break-all rounded-md bg-sunken border-l-4 border-warn px-3 py-2 text-[13px]">{shown.text}</pre>
+            </>
+          );
+        })()}
+        {/* The reason comes from the bot/engine, not from Familiar: never let it read like our own risk assessment. */}
+        {a.reason && <p className="text-sm text-muted italic">Bot says: {revealHidden(a.reason).text}</p>}
         {a.input && !question && (
           <div>
             <button className="text-xs text-muted underline cursor-pointer" onClick={() => setShowRaw((v) => !v)}>
               {showRaw ? "Hide input" : "Show full input"}
             </button>
-            {showRaw && <pre className="mono mt-1 max-h-64 overflow-auto rounded-md bg-sunken p-2 text-xs whitespace-pre-wrap break-all">{pretty(a.input)}</pre>}
+            {showRaw && <pre className="mono mt-1 max-h-64 overflow-auto rounded-md bg-sunken p-2 text-xs whitespace-pre-wrap break-all">{revealHidden(pretty(a.input)).text}</pre>}
           </div>
         )}
         {isAsk && (
