@@ -340,3 +340,12 @@ API: `GET /api/bots/:id/live` → `{url,title,width,height,updated_at}` (404 if 
 (image/jpeg, no-store), `POST /api/bots/:id/live/input {type:'click'|'type'|'key'|'scroll'|'navigate', x?,y?,text?,
 key?,dy?,url?}` → `pg_notify('familiar_input', {owner,bot,...})` → daemon dispatches via CDP (take-over). Coordinates are in
 frame pixels.
+
+## Privacy model (local-first)
+Familiar has no hosted service of its own. The desktop app runs the engine, the API (127.0.0.1 only) and a private
+built-in PostgreSQL on the owner's machine; all data lives in `~/.familiar`. The only outbound traffic is the owner's
+own LLM requests (their Claude/Codex subscription) and whatever sites/apps their teammates use. Remote access is the
+owner's choice and never goes through infrastructure we run: (1) a private network such as Tailscale/WireGuard to the
+owner's own PC, (2) self-hosting `familiar-server` + Postgres inside an organisation's own infrastructure, or (3) a
+future optional end-to-end-encrypted relay that only forwards ciphertext. Chat channels (Telegram, WhatsApp) are
+third-party transports and are opt-in.
