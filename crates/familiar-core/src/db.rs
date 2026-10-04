@@ -389,7 +389,7 @@ impl Db {
     pub async fn bots_due_for_dream(&self, since: DateTime<Utc>) -> Result<Vec<Uuid>> {
         Ok(sqlx::query_scalar(
             "select b.id from bots b where b.owner_id = $1 and not b.paused
-               and coalesce(b.last_dreamed_at, '-infinity') < $2
+               and coalesce(b.last_dreamed_at, b.created_at) < $2
                and exists (select 1 from runs r where r.bot_id = b.id and r.kind <> 'dream'
                            and r.created_at > coalesce(b.last_dreamed_at, '-infinity'))
                and not exists (select 1 from runs r where r.bot_id = b.id and r.kind = 'dream'

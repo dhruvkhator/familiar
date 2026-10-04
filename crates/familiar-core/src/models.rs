@@ -130,11 +130,13 @@ async fn verify(bin: &str, model: &str) -> Option<bool> {
 }
 
 /// Refresh the Claude part: the plan every time (cheap), each exact version when its check is missing, older than
-/// seven days or the plan changed. Publishes after every step so pickers fill in as answers arrive.
-async fn refresh_claude(bin: &str, shared: &Shared, shutdown: &CancellationToken) {
+/// seven days or the plan changed. Publishes after every step so pickers fill in as answers arrive. Returns whether
+/// Claude Code is signed in.
+async fn refresh_claude(bin: &str, shared: &Shared, shutdown: &CancellationToken) -> bool {
     let Some(plan) = claude_plan(bin).await else {
-        set(shared, "claude", json!({ "plan": null, "models": [] }));
-        return;
+        // `signed_in: false` lets pickers say so instead of waiting for a plan check that never comes.
+        set(shared, "claude", json!({ "plan": null, "models": [], "signed_in": false }));
+        return false;
     };
     let mut cache = load_cache();
     if cache.plan.as_deref() != Some(plan.as_str()) {
@@ -149,7 +151,7 @@ async fn refresh_claude(bin: &str, shared: &Shared, shutdown: &CancellationToken
         if cache.checked.contains_key(id) {
             continue;
         }
-        let answer = tokio::select! { a = verify(bin, id) => a, _ = shutdown.cancelled() => return };
+        let answer = tokio::select! { a = verify(bin, id) => a, _ = shutdown.cancelled() => return true };
         if let Some(available) = answer {
             info!(model = id, available, "checked a Claude model against the plan");
             cache.checked.insert(id.to_owned(), Checked { available, at: now() });
@@ -157,6 +159,7 @@ async fn refresh_claude(bin: &str, shared: &Shared, shutdown: &CancellationToken
             set(shared, "claude", claude_json(Some(&plan), &cache.checked));
         }
     }
+    true
 }
 
 /// Is the Codex CLI signed in (`codex login status` exits 0 and says "Logged in")?
@@ -184,16 +187,18 @@ fn set(shared: &Shared, key: &str, value: Value) {
     v[key] = value;
 }
 
-/// At daemon start and every six hours until shutdown.
+/// At daemon start and every six hours until shutdown; every two minutes while Claude Code is signed out, so a
+/// sign-in shows up in the pickers soon.
 pub async fn run(cfg: Arc<Config>, shared: Shared, shutdown: CancellationToken) {
     if !cfg.check_models {
         return;
     }
     loop {
-        refresh_claude(&cfg.claude_bin, &shared, &shutdown).await;
+        let signed_in = refresh_claude(&cfg.claude_bin, &shared, &shutdown).await;
         refresh_codex(&cfg.codex_bin, &shared).await;
+        let wait = if signed_in { REFRESH_EVERY } else { Duration::from_secs(120) };
         tokio::select! {
-            _ = tokio::time::sleep(REFRESH_EVERY) => {}
+            _ = tokio::time::sleep(wait) => {}
             _ = shutdown.cancelled() => return,
         }
     }
