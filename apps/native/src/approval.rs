@@ -291,12 +291,8 @@ pub fn approval_card(
         let shown = |content: &str, key: &str| {
             let b = block();
             if big {
-                // The whole input, verbatim, scrolling when long.
-                b.id(SharedString::from(format!("approval-{key}-{id}")))
-                    .max_h(px(360.0))
-                    .overflow_y_scroll()
-                    .child(content.to_owned())
-                    .into_any_element()
+                // The whole input, verbatim and unclipped (the page scrolls, not a box inside it).
+                b.id(SharedString::from(format!("approval-{key}-{id}"))).child(content.to_owned()).into_any_element()
             } else {
                 b.child(head_tail(content, COMPACT_END)).into_any_element()
             }
@@ -562,6 +558,10 @@ mod tests {
         // Nested values show whole, with hidden characters written out.
         let d = detail_of(Some(&json!({ "command": "ls", "env": { "X": "a\u{200B}" } }))).unwrap();
         assert!(d.others.starts_with("env: {") && d.others.contains("a⟨U+200B⟩") && d.hidden);
+        // Field names are the model's too: written out and flagged like values.
+        let d = detail_of(Some(&json!({ "url": "https://a.example", "to\u{202E}": "b" }))).unwrap();
+        assert!(d.hidden);
+        assert_eq!(d.others, "to⟨U+202E⟩: \"b\"");
         // Only the main field, short: a compact card may approve.
         let d = detail_of(Some(&json!({ "command": "git status" }))).unwrap();
         assert!(!needs_review(&d));
