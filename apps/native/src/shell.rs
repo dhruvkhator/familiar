@@ -80,6 +80,13 @@ impl Shell {
             cx.notify()
         })
         .detach();
+        // "Review…" on a compact approval card opens the inbox.
+        let weak = cx.entity().downgrade();
+        cx.set_global(crate::approval::InboxOpener(std::rc::Rc::new(move |cx: &mut App| {
+            if let Some(shell) = weak.upgrade() {
+                shell.update(cx, |s, cx| s.navigate(Route::NeedsYou, cx));
+            }
+        })));
         // Relative times ("5m ago", "in 2h") move on their own: re-render every 30 s like the web's clock.
         cx.spawn(async move |this, cx| {
             loop {

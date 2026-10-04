@@ -33,6 +33,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tray-icon = { version = "0.21", default-features = false }
 # The live computer view's JPEG frames (the same image crate gpui links).
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+# Approval cards write out hidden characters by Unicode general category.
+unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.5"
