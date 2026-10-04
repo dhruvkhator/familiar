@@ -87,41 +87,53 @@ pub fn window_visible(_window: &Window) -> bool {
 
 // ---- single instance ----------------------------------------------------------------------------------------------
 
-/// The first copy gets a stream of "show yourself" nudges from later launches; a later copy has nudged the first and
-/// should exit.
+/// What a later launch asks of the running copy: show its window, or quit (`--quit`, gracefully: the engine drains).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Nudge {
+    Show,
+    Quit,
+}
+
+/// The first copy gets a stream of nudges from later launches; a later copy has nudged the first and should exit.
 pub enum Instance {
-    First(futures::channel::mpsc::UnboundedReceiver<()>),
+    First(futures::channel::mpsc::UnboundedReceiver<Nudge>),
     Second,
 }
 
 #[cfg(windows)]
-pub fn single_instance() -> Instance {
+pub fn single_instance(nudge: Nudge) -> Instance {
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
     use windows_sys::Win32::System::Threading::{
         CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, INFINITE, OpenEventW, SetEvent, WaitForSingleObject,
     };
     let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
-    let (mutex_name, event_name) = (wide(r"Local\dev.familiar.native"), wide(r"Local\dev.familiar.native.show"));
+    let events = [(Nudge::Show, wide(r"Local\dev.familiar.native.show")), (Nudge::Quit, wide(r"Local\dev.familiar.native.quit"))];
+    let mutex_name = wide(r"Local\dev.familiar.native");
     let (tx, rx) = futures::channel::mpsc::unbounded();
     unsafe {
         // Held (leaked) for the life of the process.
         let mutex = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
         if !mutex.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
-            let event = OpenEventW(EVENT_MODIFY_STATE, 0, event_name.as_ptr());
+            let name = &events.iter().find(|(n, _)| *n == nudge).expect("every nudge has an event").1;
+            let event = OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr());
             if !event.is_null() {
                 SetEvent(event);
                 CloseHandle(event);
             }
             return Instance::Second;
         }
-        let event = CreateEventW(std::ptr::null(), 0, 0, event_name.as_ptr());
-        if !event.is_null() {
+        for (kind, name) in events {
+            let event = CreateEventW(std::ptr::null(), 0, 0, name.as_ptr());
+            if event.is_null() {
+                continue;
+            }
             let event = event as usize;
+            let tx = tx.clone();
             std::thread::Builder::new()
                 .name("familiar-instance".into())
                 .spawn(move || {
                     while WaitForSingleObject(event as _, INFINITE) == 0 {
-                        if tx.unbounded_send(()).is_err() {
+                        if tx.unbounded_send(kind).is_err() {
                             break;
                         }
                     }
@@ -133,7 +145,7 @@ pub fn single_instance() -> Instance {
 }
 
 #[cfg(not(windows))]
-pub fn single_instance() -> Instance {
+pub fn single_instance(_nudge: Nudge) -> Instance {
     Instance::First(futures::channel::mpsc::unbounded().1)
 }
 

@@ -98,6 +98,17 @@ impl AppData {
         };
         this.reload_all(cx);
         this.start_stream(cx);
+        // Device heartbeats don't send change notices: look at the overview again shortly after boot (the daemon's
+        // first heartbeat) and then every minute, so "Computer online" and the plan check stay current.
+        cx.spawn(async move |this, cx| {
+            for secs in [3u64, 10].into_iter().chain(std::iter::repeat(60)) {
+                cx.background_executor().timer(Duration::from_secs(secs)).await;
+                if this.update(cx, |d, cx| d.reload_overview(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         this
     }
 
@@ -111,8 +122,28 @@ impl AppData {
         self.bots().iter().find(|b| b.id == id)
     }
 
+    /// In host mode the computer is this process: online while the hosted daemon runs, without waiting for its first
+    /// heartbeat to reach the overview (a stale `last_seen_at` from the last session would read "offline").
     pub fn pc_online(&self) -> bool {
+        if self.mode == Mode::Hosted
+            && crate::engine::HOSTED.lock().unwrap().as_ref().is_some_and(|h| h.daemon_status().running)
+        {
+            return true;
+        }
         self.overview.as_ref().is_some_and(|o| o.pc_online(Utc::now()))
+    }
+
+    /// A teammate just created here: list it at once (the overview reload brings its status).
+    pub fn add_bot(&mut self, bot: Bot, cx: &mut Context<Self>) {
+        if let Some(o) = self.overview.as_mut()
+            && !o.bots.iter().any(|b| b.id == bot.id)
+        {
+            o.bots.push(bot);
+        }
+        // The cached overview predates it: don't let the stale copy un-list it while the fresh one loads.
+        self.client.invalidate("/api/overview");
+        self.reload_overview(cx);
+        cx.notify();
     }
 
     /// The web's `stateOf(bot)`.
@@ -330,8 +361,6 @@ impl AppData {
                     LiveEvent::Delta(d) => {
                         let _ = tx.unbounded_send(LiveMsg::Delta(d));
                     }
-                    // The browser view's frames tick every second; nothing here shows them.
-                    LiveEvent::Notice(n) if n.t == "live_frames" => {}
                     LiveEvent::Notice(n) => {
                         let scope = n.run.clone().or_else(|| n.bot.clone()).unwrap_or_default();
                         coalescer.push(format!("{}|{scope}", n.t), Some(n));

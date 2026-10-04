@@ -2149,6 +2149,7 @@ dependencies = [
  "gpui-base",
  "gpui_platform",
  "gpui_tokio",
+ "image",
  "raw-window-handle",
  "reqwest",
  "serde",

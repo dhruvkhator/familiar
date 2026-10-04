@@ -2,30 +2,32 @@
 //! selected thread's transcript (messages oldest → newest, the pending optimistic bubble, then the latest run's card
 //! with its live events, streamed text and approvals) and the composer.
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use familiar_client::{Event, Message, Role, Run, RunKind, RunStatus, Thread, TypedEvent};
-use familiar_ui::anim::{self, Expand};
+use familiar_client::{Event, Message, Role, Run, RunKind, RunStatus, Thread};
+use familiar_ui::anim::{self, SPRING_SELECT};
 use familiar_ui::components::{Button, ButtonSize, Segmented, SidebarItem, Skeleton, StatusChip, card, chip, empty, group_label};
 use familiar_ui::edge_fade::edge_faded;
 use familiar_ui::icons::{self, icon};
 use familiar_ui::mascot::{Mascot, MascotState};
 use familiar_ui::motion::{AnimationExt as _, EASE, MotionSpec};
-use familiar_ui::theme::{RADIUS_CARD, RADIUS_CHIP, Theme, Tone, text};
+use familiar_ui::theme::{RADIUS_CARD, RADIUS_CHIP, SIDEBAR_WIDTH, Theme, Tone, text};
 use familiar_ui::toast::ToastStack;
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    AnyElement, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
 use gpui_base::input::{InputEvent, TextareaState};
 use gpui_tokio::Tokio;
-use serde_json::Value;
 use uuid::Uuid;
 
+use crate::activity::{ActivityTab, OpenThread};
 use crate::approval::ApprovalCards;
 use crate::bot_settings::BotSettings;
+use crate::computer::{Browsing, ComputerPanel};
+use crate::events::EventRows;
+use crate::memory::MemoryTab;
 use crate::data::{self, AppData, DataEvent, ago, excerpt, run_status, swr};
 use crate::markdown;
 use crate::shell::state_tone;
@@ -55,7 +57,7 @@ pub struct BotPage {
     /// Persisted events of the shown run while it is active, by seq.
     events: Vec<Event>,
     events_run: Option<Uuid>,
-    tools: HashMap<i64, Expand>,
+    rows: EventRows,
     approvals: ApprovalCards,
     composer: Entity<TextareaState>,
     outgoing: Vec<Outgoing>,
@@ -65,11 +67,19 @@ pub struct BotPage {
     /// What the transcript showed last frame; a change while at the bottom scrolls to the new bottom.
     content_rev: (usize, usize, usize, usize, bool),
     force_bottom: bool,
-    /// 0: chat, 1: settings.
+    /// 0: chat, 1: what it learned, 2: activity, 3: settings.
     tab: usize,
     settings: Option<Entity<BotSettings>>,
-    settings_scroll: ScrollHandle,
+    memory: Option<Entity<MemoryTab>>,
+    activity: Option<Entity<ActivityTab>>,
+    tab_scroll: ScrollHandle,
+    computer: Entity<ComputerPanel>,
+    computer_open: bool,
+    /// You closed the computer: it doesn't open by itself again on this page.
+    computer_dismissed: bool,
 }
+
+pub const TAB_SETTINGS: usize = 3;
 
 impl BotPage {
     pub fn new(
@@ -89,6 +99,13 @@ impl BotPage {
             _ => {}
         })
         .detach();
+        let computer = cx.new(|cx| ComputerPanel::new(data.clone(), toasts.clone(), bot, window, cx));
+        cx.subscribe(&computer, |this: &mut Self, _, _: &Browsing, cx| {
+            if !this.computer_dismissed {
+                this.set_computer(true, cx);
+            }
+        })
+        .detach();
         let mut this = Self {
             data,
             toasts,
@@ -101,7 +118,7 @@ impl BotPage {
             runs: Vec::new(),
             events: Vec::new(),
             events_run: None,
-            tools: HashMap::new(),
+            rows: EventRows::default(),
             approvals: ApprovalCards::default(),
             composer,
             outgoing: Vec::new(),
@@ -112,7 +129,12 @@ impl BotPage {
             force_bottom: true,
             tab: 0,
             settings: None,
-            settings_scroll: ScrollHandle::new(),
+            memory: None,
+            activity: None,
+            tab_scroll: ScrollHandle::new(),
+            computer,
+            computer_open: false,
+            computer_dismissed: false,
         };
         this.reload_threads(cx);
         // Opening a teammate puts the cursor in the composer.
@@ -317,7 +339,7 @@ impl BotPage {
     }
 
     /// Post `content` into the selected thread (the composer, or Retry on a failed run).
-    fn post(&mut self, content: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn post(&mut self, content: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.sending {
             return;
         }
@@ -457,15 +479,57 @@ impl BotPage {
             )
             .child(div().flex_1())
             .child(
-                Segmented::new(
-                    SharedString::from(format!("bot-tabs-{}", self.bot)),
-                    vec![("Chat".into(), Some(icons::CHAT_ROUND_LINE)), ("Settings".into(), Some(icons::SETTINGS))],
-                    self.tab,
-                )
-                .segment_width(104.0)
-                .on_select(move |i, window, cx| this.update(cx, |p, cx| p.set_tab(i, window, cx))),
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        Segmented::new(
+                            SharedString::from(format!("bot-tabs-{}", self.bot)),
+                            vec![
+                                ("Chat".into(), Some(icons::CHAT_ROUND_LINE)),
+                                ("Learned".into(), Some(icons::STAR)),
+                                ("Activity".into(), Some(icons::LIST)),
+                                ("Settings".into(), Some(icons::SETTINGS)),
+                            ],
+                            self.tab,
+                        )
+                        .segment_width(96.0)
+                        .on_select(move |i, window, cx| this.update(cx, |p, cx| p.set_tab(i, window, cx))),
+                    )
+                    .child({
+                        let this = cx.entity();
+                        let open = self.computer_open;
+                        let live = self.computer.read(cx).browsing();
+                        div()
+                            .relative()
+                            .child(
+                                Button::icon_only("computer-toggle", icons::MONITOR)
+                                    .when(open, |b| b.secondary())
+                                    .tooltip(if open { "Hide the computer" } else { "Show the computer" })
+                                    .on_click(move |_, _, cx| {
+                                        this.update(cx, |p, cx| {
+                                            let open = !p.computer_open;
+                                            p.computer_dismissed = !open;
+                                            p.set_computer(open, cx);
+                                        })
+                                    }),
+                            )
+                            .when(live, |el| {
+                                el.child(div().absolute().top(px(4.0)).right(px(4.0)).size(px(7.0)).rounded_full().bg(theme.ok))
+                            })
+                    }),
             )
             .into_any_element()
+    }
+
+    pub fn set_computer(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.computer_open != open {
+            self.computer_open = open;
+            self.computer.update(cx, |c, cx| c.set_shown(open, cx));
+            cx.notify();
+        }
     }
 
     pub fn set_tab(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -473,14 +537,23 @@ impl BotPage {
             return;
         }
         self.tab = tab;
-        if tab == 1 {
-            // Fresh from the current bot every time the tab opens.
-            let (data, toasts, bot) = (self.data.clone(), self.toasts.clone(), self.bot);
-            self.settings = Some(cx.new(|cx| BotSettings::new(data, toasts, bot, window, cx)));
-            self.settings_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
-        } else {
-            self.settings = None;
-            self.force_bottom = true;
+        self.tab_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        let (data, toasts, bot) = (self.data.clone(), self.toasts.clone(), self.bot);
+        // Settings is fresh from the current bot every time it opens; the others keep their state.
+        self.settings = (tab == TAB_SETTINGS).then(|| cx.new(|cx| BotSettings::new(data.clone(), toasts.clone(), bot, window, cx)));
+        match tab {
+            0 => self.force_bottom = true,
+            1 if self.memory.is_none() => self.memory = Some(cx.new(|cx| MemoryTab::new(data, toasts, bot, window, cx))),
+            2 if self.activity.is_none() => {
+                let activity = cx.new(|cx| ActivityTab::new(data, bot, cx));
+                cx.subscribe_in(&activity, window, |this: &mut Self, _, ev: &OpenThread, window, cx| {
+                    this.select(ev.0, cx);
+                    this.set_tab(0, window, cx);
+                })
+                .detach();
+                self.activity = Some(activity);
+            }
+            _ => {}
         }
         cx.notify();
     }
@@ -653,162 +726,6 @@ impl BotPage {
         )
     }
 
-    fn dot(color: Hsla) -> gpui::Div {
-        div().flex_none().mt(px(7.0)).size(px(6.0)).rounded_full().bg(color)
-    }
-
-    /// One persisted event (the web's `EventList` row).
-    fn event_row(&mut self, e: &Event, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let theme = Theme::of(cx).clone();
-        let mono = theme.font_mono.clone();
-        let row = |dot: Hsla, body: AnyElement| div().flex().gap(px(10.0)).child(Self::dot(dot)).child(div().flex_1().min_w_0().child(body));
-        let el = match e.typed() {
-            TypedEvent::Text(t) if !t.trim().is_empty() => row(theme.ink, markdown::render(&t, &theme).into_any_element()),
-            TypedEvent::Thinking(t) if !t.trim().is_empty() => row(
-                theme.line,
-                div()
-                    .text_size(px(text::SMALL))
-                    .text_color(theme.muted)
-                    .italic()
-                    .line_clamp(3)
-                    .child(t.trim().to_owned())
-                    .into_any_element(),
-            ),
-            TypedEvent::ToolCall(c) => {
-                let preview = ["command", "file_path", "path", "url", "query", "pattern"]
-                    .iter()
-                    .find_map(|k| c.input.get(*k).and_then(Value::as_str))
-                    .map(|s| excerpt(s, 90));
-                let exp = self.tools.entry(e.id).or_insert_with(|| Expand::new(false));
-                let openness = exp.openness();
-                let eid = e.id;
-                let this = cx.entity();
-                let json = serde_json::to_string_pretty(&c.input).unwrap_or_default();
-                let detail = exp.render(
-                    SharedString::from(format!("tool-detail-{}", e.id)),
-                    window,
-                    cx,
-                    div()
-                        .mt(px(6.0))
-                        .px(px(10.0))
-                        .py(px(8.0))
-                        .rounded(px(RADIUS_CHIP))
-                        .bg(theme.sunken)
-                        .font_family(mono.clone())
-                        .text_size(px(text::CAPTION))
-                        .text_color(theme.ink)
-                        .child(excerpt_lines(&json, 40)),
-                );
-                row(
-                    theme.accent,
-                    div()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("tool-{}", e.id)))
-                                .flex()
-                                .items_center()
-                                .gap(px(8.0))
-                                .cursor_pointer()
-                                .rounded(px(RADIUS_CHIP))
-                                .hover(|s| s.bg(theme.hover))
-                                .on_click(move |_, _, cx| {
-                                    this.update(cx, |p, cx| {
-                                        if let Some(x) = p.tools.get_mut(&eid) {
-                                            x.toggle();
-                                        }
-                                        cx.notify();
-                                    })
-                                })
-                                .child(
-                                    icon(icons::ALT_ARROW_RIGHT)
-                                        .size(px(12.0))
-                                        .text_color(theme.muted)
-                                        .with_transformation(gpui::Transformation::rotate(gpui::radians(openness * std::f32::consts::FRAC_PI_2))),
-                                )
-                                .child(
-                                    div()
-                                        .font_family(mono.clone())
-                                        .text_size(px(text::CAPTION))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(theme.ink)
-                                        .child(c.name.clone()),
-                                )
-                                .when_some(preview, |el, p| {
-                                    el.child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .font_family(mono.clone())
-                                            .text_size(px(text::CAPTION))
-                                            .text_color(theme.muted)
-                                            .child(p),
-                                    )
-                                }),
-                        )
-                        .child(detail)
-                        .into_any_element(),
-                )
-            }
-            TypedEvent::ToolResult(r) => {
-                let body = r.content.trim();
-                if body.is_empty() && !r.is_error {
-                    return None;
-                }
-                row(
-                    if r.is_error { theme.bad } else { theme.line },
-                    div()
-                        .px(px(10.0))
-                        .py(px(6.0))
-                        .rounded(px(RADIUS_CHIP))
-                        .bg(theme.sunken)
-                        .when(r.is_error, |el| el.border_l_2().border_color(theme.bad))
-                        .font_family(mono.clone())
-                        .text_size(px(text::CAPTION))
-                        .text_color(theme.muted)
-                        .line_clamp(3)
-                        .child(excerpt(body, 600))
-                        .into_any_element(),
-                )
-            }
-            TypedEvent::Approval(a) => {
-                let status = a.status.clone().unwrap_or_else(|| "approval".into());
-                let tone = match status.as_str() {
-                    "approved" | "approve" | "allow" => Tone::Ok,
-                    "pending" | "approval" => Tone::Warn,
-                    _ => Tone::Bad,
-                };
-                row(
-                    theme.warn,
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(chip(tone, status, cx))
-                        .when_some(a.tool_name.clone(), |el, t| {
-                            el.child(div().font_family(mono.clone()).text_size(px(text::CAPTION)).child(t))
-                        })
-                        .when_some(a.decided_by.clone(), |el, by| {
-                            el.child(
-                                div()
-                                    .text_size(px(text::CAPTION))
-                                    .text_color(theme.muted)
-                                    .child(SharedString::from(format!("by {by}"))),
-                            )
-                        })
-                        .into_any_element(),
-                )
-            }
-            TypedEvent::Error(m) => row(
-                theme.bad,
-                div().text_size(px(text::SMALL)).text_color(theme.bad).child(m).into_any_element(),
-            ),
-            _ => return None,
-        };
-        Some(el.into_any_element())
-    }
-
     /// The live bubble: streamed thinking (italic) and text with a blinking caret, or "Working…".
     fn live_bubble(&self, run: Uuid, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let buf = self.data.read(cx).live.get(&run).cloned().unwrap_or_default();
@@ -880,14 +797,13 @@ impl BotPage {
             body = body.child(div().text_size(px(text::SMALL)).text_color(theme.bad).child(e));
         }
         if active {
-            let mut list = div().flex().flex_col().gap(px(8.0));
-            for e in self.events.clone() {
-                if let Some(row) = self.event_row(&e, window, cx) {
-                    list = list.child(anim::appear(SharedString::from(format!("ev-{}", e.id)), div().child(row)));
-                }
-            }
+            let mut list = div().flex().flex_col().gap(px(8.0)).children(self.rows.render(&self.events, false, true, window, cx));
             list = list.child(
-                div().flex().gap(px(10.0)).child(Self::dot(theme.accent)).child(div().flex_1().min_w_0().child(self.live_bubble(rid, &theme, cx))),
+                div()
+                    .flex()
+                    .gap(px(10.0))
+                    .child(div().flex_none().mt(px(7.0)).size(px(6.0)).rounded_full().bg(theme.accent))
+                    .child(div().flex_1().min_w_0().child(self.live_bubble(rid, &theme, cx))),
             );
             body = body.child(list);
         }
@@ -1100,66 +1016,84 @@ impl BotPage {
     }
 }
 
-/// The first `n` lines of `s` (an ellipsis line when cut).
-fn excerpt_lines(s: &str, n: usize) -> String {
-    let mut lines: Vec<&str> = s.lines().take(n + 1).collect();
-    if lines.len() > n {
-        lines.truncate(n);
-        lines.push("…");
-    }
-    lines.join("\n")
-}
-
 impl Render for BotPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = self.header(cx);
-        if let Some(settings) = self.settings.clone().filter(|_| self.tab == 1) {
-            return div()
-                .size_full()
-                .flex()
-                .flex_col()
-                .child(header)
-                .child(
-                    div().flex_1().min_h_0().child(
-                        edge_faded(
-                            24.0,
-                            true,
-                            true,
+        // The computer slides in from the right (its width springs); its content keeps a fixed width meanwhile.
+        let main_w = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH;
+        let panel_w = (main_w * 0.42).clamp(340.0, 600.0);
+        let shown_w = anim::spring(
+            SharedString::from(format!("computer-w-{}", self.bot)),
+            if self.computer_open { panel_w } else { 0.0 },
+            SPRING_SELECT,
+            window,
+            cx,
+        );
+        let computer = (shown_w > 0.5).then(|| {
+            let theme = Theme::of(cx);
+            div()
+                .flex_none()
+                .h_full()
+                .w(px(shown_w))
+                .overflow_hidden()
+                .border_l_1()
+                .border_color(theme.line)
+                .bg(theme.surface)
+                .child(div().w(px(panel_w)).h_full().child(self.computer.clone()))
+        });
+        let tab: Option<AnyElement> = match self.tab {
+            1 => self.memory.clone().map(|e| e.into_any_element()),
+            2 => self.activity.clone().map(|e| e.into_any_element()),
+            TAB_SETTINGS => self.settings.clone().map(|e| e.into_any_element()),
+            _ => None,
+        };
+        let body = match tab {
+            Some(content) => div().flex_1().min_w_0().h_full().child(
+                edge_faded(
+                    24.0,
+                    true,
+                    true,
+                    div()
+                        .id(SharedString::from(format!("bot-tab-scroll-{}", self.tab)))
+                        .size_full()
+                        .overflow_y_scroll()
+                        .track_scroll(&self.tab_scroll)
+                        .child(
                             div()
-                                .id("bot-settings-scroll")
-                                .size_full()
-                                .overflow_y_scroll()
-                                .track_scroll(&self.settings_scroll)
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .flex()
-                                        .justify_center()
-                                        .px(px(40.0))
-                                        .py(px(28.0))
-                                        .child(div().w_full().max_w(px(720.0)).child(settings)),
-                                ),
-                        )
-                        .fade_overflow_y(&self.settings_scroll),
-                    ),
-                );
-        }
-        let threads = self.thread_list(cx);
-        let transcript = self.transcript(window, cx);
-        let jump = self.jump_button(cx);
-        let composer = self.composer(window, cx);
-        div().size_full().flex().flex_col().child(header).child(
-            div().flex().flex_1().min_h_0().child(threads).child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .flex()
-                    .flex_col()
-                    .child(div().relative().flex_1().min_h_0().child(transcript).when_some(jump, |el, j| el.child(j)))
-                    .child(composer),
+                                .w_full()
+                                .flex()
+                                .justify_center()
+                                .px(px(40.0))
+                                .py(px(28.0))
+                                .child(div().w_full().max_w(px(720.0)).child(content)),
+                        ),
+                )
+                .fade_overflow_y(&self.tab_scroll),
             ),
-        )
+            None => {
+                // With the computer open on a narrow window, the thread list makes room.
+                let threads = (main_w - shown_w - 236.0 >= 460.0).then(|| self.thread_list(cx));
+                let transcript = self.transcript(window, cx);
+                let jump = self.jump_button(cx);
+                let composer = self.composer(window, cx);
+                div().flex().flex_1().min_w_0().h_full().children(threads).child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .child(div().relative().flex_1().min_h_0().child(transcript).when_some(jump, |el, j| el.child(j)))
+                        .child(composer),
+                )
+            }
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(div().flex().flex_1().min_h_0().child(body).children(computer))
     }
 }
 

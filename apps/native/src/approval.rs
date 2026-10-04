@@ -6,7 +6,8 @@ use std::rc::Rc;
 
 use familiar_client::Approval;
 use familiar_ui::anim;
-use familiar_ui::components::{Button, card, chip};
+use familiar_ui::icons;
+use familiar_ui::components::{Button, ButtonSize, card, chip};
 use familiar_ui::toast::ToastStack;
 use familiar_ui::mascot::{Mascot, MascotState};
 use familiar_ui::theme::{RADIUS_CHIP, Theme, Tone, text};
@@ -47,6 +48,58 @@ pub fn risk_of(tool: &str) -> (&'static str, Tone) {
     }
 }
 
+/// What the tool would do, in plain words (the inbox's risk hint).
+pub fn action_of(tool: &str) -> &'static str {
+    let t = tool.to_lowercase();
+    match tool {
+        "Bash" | "PowerShell" => "Runs a command on your computer",
+        "Write" => "Creates or overwrites a file",
+        "Edit" | "MultiEdit" | "NotebookEdit" => "Changes a file",
+        "WebFetch" | "WebSearch" => "Reads from the web",
+        _ if ["click", "type", "fill", "select", "press", "upload", "evaluate", "navigate"].iter().any(|k| t.contains(k)) => {
+            "Acts in its browser"
+        }
+        _ if ["send", "post", "push", "merge"].iter().any(|k| t.contains(k)) => "Sends something on your behalf",
+        _ if ["create", "delete", "update", "write"].iter().any(|k| t.contains(k)) => "Changes something in a connected app",
+        _ => "Uses a tool",
+    }
+}
+
+/// The detail block of the inbox card: a label and the readable input (command, path, address, or what changes).
+fn detail_of(input: Option<&Value>) -> Option<(&'static str, String)> {
+    let input = input?;
+    let get = |k: &str| input.get(k).and_then(Value::as_str).map(str::to_owned);
+    if let Some(c) = get("command") {
+        return Some(("Command", c));
+    }
+    if let Some(p) = get("file_path").or_else(|| get("notebook_path")).or_else(|| get("path")) {
+        let change = get("content").or_else(|| get("new_string")).or_else(|| get("new_source"));
+        return Some(match change {
+            Some(c) => ("File", format!("{p}\n\n{}", lines(&c, 14))),
+            None => ("File", p),
+        });
+    }
+    if let Some(u) = get("url") {
+        return Some(("Address", u));
+    }
+    if let Some(q) = get("query") {
+        return Some(("Search", q));
+    }
+    match input {
+        Value::Object(m) if !m.is_empty() => Some(("Input", lines(&serde_json::to_string_pretty(input).unwrap_or_default(), 14))),
+        _ => None,
+    }
+}
+
+/// The first `n` lines (an ellipsis line when cut), each at most 400 chars.
+fn lines(s: &str, n: usize) -> String {
+    let mut out: Vec<String> = s.lines().take(n).map(|l| crate::data::excerpt(l, 400)).collect();
+    if s.lines().count() > n {
+        out.push("…".into());
+    }
+    out.join("\n")
+}
+
 /// The one-line input summary (command, path, url or query).
 pub fn input_summary(tool: &str, input: Option<&Value>) -> Option<String> {
     let input = input?;
@@ -59,11 +112,13 @@ pub fn input_summary(tool: &str, input: Option<&Value>) -> Option<String> {
     ["file_path", "path", "notebook_path", "url", "query"].iter().find_map(|k| get(k))
 }
 
+/// `big`: the inbox's card (plain-language action, the whole command or path, large buttons).
 pub fn approval_card(
     a: &Approval,
     bot: Option<&Teammate>,
     answer: Option<&Entity<TextareaState>>,
     decide: Decide,
+    big: bool,
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
@@ -72,6 +127,8 @@ pub fn approval_card(
     let question = question(a).filter(|_| ask);
     let summary = input_summary(&a.tool_name, a.input.as_ref());
     let name: SharedString = a.bot_name.clone().map(Into::into).or_else(|| bot.map(|b| b.name.clone())).unwrap_or_default();
+    let name_plain = name.to_string();
+    let size = if big { ButtonSize::Large } else { ButtonSize::Medium };
     let answer_blank = answer.is_some_and(|s| s.read(cx).value().trim().is_empty());
     let id = a.id;
 
@@ -99,10 +156,41 @@ pub fn approval_card(
         .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(ago(Some(a.created_at))));
 
     let mut body = div().flex().flex_col().flex_1().min_w_0().gap(px(10.0)).child(header);
-    if let Some(q) = question {
-        body = body.child(div().text_color(theme.ink).child(q));
+    if big && !ask {
+        let who = if name_plain.is_empty() { "A teammate".to_owned() } else { name_plain.clone() };
+        body = body.child(
+            div()
+                .text_size(px(text::LEAD))
+                .text_color(theme.ink)
+                .child(SharedString::from(format!("{who} wants to: {}", action_of(&a.tool_name).to_lowercase()))),
+        );
     }
-    if let Some(s) = summary.filter(|_| !ask) {
+    if let Some(q) = question {
+        body = body.child(div().text_color(theme.ink).when(big, |el| el.text_size(px(text::LEAD))).child(q));
+    }
+    let detail = if big && !ask { detail_of(a.input.as_ref()) } else { None };
+    if let Some((label, d)) = detail {
+        body = body.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(div().text_size(px(text::CAPTION)).font_weight(FontWeight::MEDIUM).text_color(theme.muted).child(label))
+                .child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(9.0))
+                        .rounded(px(RADIUS_CHIP))
+                        .bg(theme.sunken)
+                        .border_l_2()
+                        .border_color(if risk_of(&a.tool_name).1 == Tone::Bad { theme.bad } else { theme.warn })
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(text::SMALL))
+                        .text_color(theme.ink)
+                        .child(d),
+                ),
+        );
+    } else if let Some(s) = summary.filter(|_| !ask && !big) {
         body = body.child(
             div()
                 .px(px(10.0))
@@ -128,13 +216,14 @@ pub fn approval_card(
         div()
             .flex()
             .gap(px(8.0))
-            .child(div().flex_1().child(Button::new(("skip", id.as_u128() as u64), "Skip").full_width().on_click(
+            .child(div().flex_1().child(Button::new(("skip", id.as_u128() as u64), "Skip").size(size).full_width().on_click(
                 move |_, w, cx| d1(false, w, cx),
             )))
             .child(
                 div().flex_1().child(
                     Button::new(("send-answer", id.as_u128() as u64), "Send answer")
                         .primary()
+                        .size(size)
                         .full_width()
                         .disabled(answer_blank)
                         .on_click(move |_, w, cx| d2(true, w, cx)),
@@ -145,12 +234,12 @@ pub fn approval_card(
             .flex()
             .gap(px(8.0))
             .child(div().flex_1().child(
-                Button::new(("decline", id.as_u128() as u64), "Decline").danger().full_width().on_click(
+                Button::new(("decline", id.as_u128() as u64), if big { "Deny" } else { "Decline" }).danger().size(size).full_width().on_click(
                     move |_, w, cx| d1(false, w, cx),
                 ),
             ))
             .child(div().flex_1().child(
-                Button::new(("approve", id.as_u128() as u64), "Approve").primary().full_width().on_click(
+                Button::new(("approve", id.as_u128() as u64), "Approve").primary().size(size).icon(icons::CHECK).full_width().on_click(
                     move |_, w, cx| d2(true, w, cx),
                 ),
             ))
@@ -158,12 +247,12 @@ pub fn approval_card(
     body = body.child(buttons);
 
     card(cx)
-        .p(px(16.0))
+        .p(px(if big { 20.0 } else { 16.0 }))
         .flex()
         .gap(px(14.0))
         .items_start()
         .when_some(bot, |el, b| {
-            el.child(Mascot::new(format!("approval-{}", a.id), b.avatar, MascotState::NeedsYou, 40.0))
+            el.child(Mascot::new(format!("approval-{}", a.id), b.avatar, MascotState::NeedsYou, if big { 52.0 } else { 40.0 }))
         })
         .child(body)
         .into_any_element()
@@ -173,9 +262,15 @@ pub fn approval_card(
 #[derive(Default)]
 pub struct ApprovalCards {
     answers: HashMap<Uuid, Entity<TextareaState>>,
+    big: bool,
 }
 
 impl ApprovalCards {
+    /// The inbox's large cards.
+    pub fn big() -> Self {
+        Self { big: true, ..Default::default() }
+    }
+
     pub fn render<V: 'static>(
         &mut self,
         list: &[Approval],
@@ -194,7 +289,7 @@ impl ApprovalCards {
             }
             let bot = teammates.iter().find(|t| t.uuid == a.bot_id);
             let decide = decider(data.clone(), toasts.clone(), a, self.answers.get(&a.id).cloned());
-            let card = approval_card(a, bot, self.answers.get(&a.id), decide, window, cx);
+            let card = approval_card(a, bot, self.answers.get(&a.id), decide, self.big, window, cx);
             out.push(anim::stagger(SharedString::from(format!("approval-in-{}", a.id)), i, div().child(card)).into_any_element());
         }
         out

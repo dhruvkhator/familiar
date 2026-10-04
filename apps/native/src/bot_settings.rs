@@ -1,7 +1,8 @@
 //! A teammate's Settings tab (the web's `pages/Settings.tsx`): name, look (the avatar builder), persona, engine and
-//! model, paused, and delete.
+//! model, paused, and delete. The same form, in create mode, is the New teammate flow (the web's `CreateBotDialog`):
+//! name, a randomised look, what it should do, engine and a plan-checked model, and an optional hello.
 
-use familiar_client::{BotEngine, BotPatch};
+use familiar_client::{Bot, BotEngine, BotPatch, NewBot};
 use familiar_ui::anim;
 use familiar_ui::components::{Button, ButtonSize, Segmented, Switch, card};
 use familiar_ui::icons;
@@ -9,8 +10,9 @@ use familiar_ui::mascot::{Accessory, Avatar, EYE_COUNT, MOUTH_COUNT, Mascot, Mas
 use familiar_ui::theme::{RADIUS_CARD, RADIUS_CONTROL, Theme, Tone, hex, text};
 use familiar_ui::toast::ToastStack;
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_base::input::{InputEvent, InputState, TextareaState};
 use gpui_tokio::Tokio;
@@ -32,7 +34,21 @@ struct Choice {
     available: Option<bool>,
 }
 
+/// What the create form tells the shell.
+pub enum CreateEvent {
+    /// The teammate exists; `intro`: ask it to introduce itself.
+    Created { bot: Bot, intro: bool },
+    Cancelled,
+}
+
+/// The hello a new teammate gets when the owner asks for one.
+pub const INTRO: &str = "Introduce yourself in two sentences.";
+
 pub struct BotSettings {
+    /// The New teammate form (nothing exists yet).
+    create: bool,
+    /// Create mode: send [`INTRO`] once it exists (off by default: it uses the plan).
+    intro: bool,
     data: Entity<AppData>,
     toasts: Entity<ToastStack>,
     bot: Uuid,
@@ -53,14 +69,36 @@ pub struct BotSettings {
     confirm_delete: bool,
 }
 
+impl EventEmitter<CreateEvent> for BotSettings {}
+
 impl BotSettings {
     pub fn new(data: Entity<AppData>, toasts: Entity<ToastStack>, bot: Uuid, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let b = data.read(cx).bot(bot).cloned().unwrap_or_default();
+        Self::build(data, toasts, b, false, window, cx)
+    }
+
+    /// The New teammate form: a random look, Claude on Sonnet.
+    pub fn create(data: Entity<AppData>, toasts: Entity<ToastStack>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let b = Bot { model: "sonnet".into(), engine: BotEngine::Claude, ..Default::default() };
+        let mut this = Self::build(data, toasts, b, true, window, cx);
+        this.randomize(cx);
+        cx.defer_in(window, |this, window, cx| this.name.update(cx, |s, cx| s.focus(window, cx)));
+        this
+    }
+
+    fn build(data: Entity<AppData>, toasts: Entity<ToastStack>, b: Bot, create: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let bot = b.id;
         let codex = b.engine == BotEngine::Codex;
         let name = text_input::new_line("Name", false, window, cx);
         name.update(cx, |s, cx| s.set_value(b.name.clone(), window, cx));
         let persona = cx.new(|cx| {
-            TextareaState::new(window, cx).placeholder("Who is this teammate, and how should it work?").auto_grow(5, 14)
+            TextareaState::new(window, cx)
+                .placeholder(if create {
+                    "What should it do? For example: You keep an eye on my inbox and draft short, friendly replies."
+                } else {
+                    "Who is this teammate, and how should it work?"
+                })
+                .auto_grow(5, 14)
         });
         persona.update(cx, |s, cx| s.set_value(b.persona.clone().unwrap_or_default(), window, cx));
         let codex_model = text_input::new_line("gpt-5-codex", false, window, cx);
@@ -88,6 +126,8 @@ impl BotSettings {
         })
         .detach();
         let mut this = Self {
+            create,
+            intro: false,
             avatar: avatar_of(&b),
             claude_model: if codex { "sonnet".into() } else { b.model.clone() },
             catalog: None,
@@ -123,9 +163,17 @@ impl BotSettings {
         this
     }
 
+    /// Claude Code reported signed out (no plan check will come until it signs in).
+    fn signed_out(&self) -> bool {
+        self.catalog.as_ref().is_some_and(|c| c["claude"]["signed_in"] == false)
+    }
+
     /// Still waiting on the plan check (or for the first answer).
     fn checking(&self) -> bool {
         let Some(c) = &self.catalog else { return true };
+        if self.signed_out() {
+            return false;
+        }
         let models = c["claude"]["models"].as_array();
         c["claude"]["plan"].is_null() || models.is_none_or(|m| m.is_empty() || m.iter().any(|m| m["available"].is_null()))
     }
@@ -149,6 +197,9 @@ impl BotSettings {
         } else {
             self.claude_model.clone()
         };
+        if self.create {
+            return self.create_bot(name, model, cx);
+        }
         let patch = BotPatch {
             name: Some(name),
             persona: Some(self.persona.read(cx).value().to_string()),
@@ -175,6 +226,53 @@ impl BotSettings {
                     Err(e) => {
                         this.error = Some(e.clone());
                         this.toasts.update(cx, |t, cx| t.push(Tone::Bad, "Couldn't save", Some(e.into()), cx));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Create mode: make the teammate (the server picks the slug; a taken one gets a short suffix).
+    fn create_bot(&mut self, name: String, model: String, cx: &mut Context<Self>) {
+        let avatar = serde_json::from_value(self.avatar.to_json()).ok();
+        let new = NewBot {
+            name: Some(name.clone()),
+            slug: None,
+            persona: Some(self.persona.read(cx).value().trim().to_string()),
+            model: Some(model),
+            engine: Some(if self.codex { "codex" } else { "claude" }.into()),
+            avatar,
+        };
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+        let client = self.data.read(cx).client.clone();
+        let intro = self.intro;
+        let task = Tokio::spawn(cx, async move {
+            match client.create_bot(&new).await {
+                Err(familiar_client::ApiError::Http { status: 409, .. }) => {
+                    let base = kebab(&name);
+                    let base = if base.is_empty() { "teammate".to_owned() } else { base.chars().take(34).collect() };
+                    let suffix = &Uuid::new_v4().simple().to_string()[..4];
+                    client.create_bot(&NewBot { slug: Some(format!("{base}-{suffix}")), ..new }).await
+                }
+                r => r,
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let r = task.await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.message()));
+            let _ = this.update(cx, |this, cx| {
+                this.busy = false;
+                match r {
+                    Ok(bot) => {
+                        this.toasts.update(cx, |t, cx| t.push(Tone::Ok, format!("{} is ready", bot.name), None, cx));
+                        cx.emit(CreateEvent::Created { bot, intro });
+                    }
+                    Err(e) => {
+                        this.error = Some(e.clone());
+                        this.toasts.update(cx, |t, cx| t.push(Tone::Bad, "Couldn't create it", Some(e.into()), cx));
                     }
                 }
                 cx.notify();
@@ -300,7 +398,9 @@ impl BotSettings {
             let plan = chars.next().map(|c| c.to_uppercase().chain(chars).collect::<String>()).unwrap_or_default();
             notes = notes.child(caption(format!("Your plan: {plan}")));
         }
-        if checking {
+        if self.signed_out() {
+            notes = notes.child(caption("Sign in to Claude to see your models".into()));
+        } else if checking {
             notes = notes.child(caption("Checking your plan…".into()));
         }
         if !unavailable.is_empty() {
@@ -510,6 +610,35 @@ impl BotSettings {
     }
 }
 
+/// The web's `kebab`: lowercase, runs of anything else become one dash, at most 40 chars.
+fn kebab(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.trim().to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').chars().take(40).collect()
+}
+
+/// A checkbox square (the row around it takes the click).
+fn checkbox(on: bool, theme: &Theme) -> gpui::Div {
+    div()
+        .flex_none()
+        .mt(px(2.0))
+        .size(px(18.0))
+        .rounded(px(5.0))
+        .border_1()
+        .border_color(if on { theme.accent } else { theme.line })
+        .bg(if on { theme.accent } else { theme.surface })
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(on, |el| el.child(icons::icon(icons::CHECK).size(px(13.0)).text_color(theme.accent_ink)))
+}
+
 fn label(s: &'static str) -> gpui::Div {
     div().text_size(px(text::SMALL)).font_weight(FontWeight::MEDIUM).child(s)
 }
@@ -553,10 +682,30 @@ impl Render for BotSettings {
                 })
             }))
         };
+        let create = self.create;
+        let intro_this = cx.entity();
+        let cancel_this = cx.entity();
+        let create_this = cx.entity();
+        let intro = self.intro;
         div()
             .flex()
             .flex_col()
             .gap(px(22.0))
+            .when(create, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(div().text_size(px(text::HEADLINE)).font_weight(FontWeight::SEMIBOLD).child("New teammate"))
+                        .child(
+                            div()
+                                .text_size(px(text::LEAD))
+                                .text_color(theme.muted)
+                                .child("Name it, give it a look and a job. You can change all of this later."),
+                        ),
+                )
+            })
             .child(div().flex().flex_col().gap(px(6.0)).child(label("Name")).child(text_input::field("bs-name", &self.name, 38.0, window, cx)))
             .child(div().flex().flex_col().gap(px(6.0)).child(label("Look")).child(builder))
             .child(
@@ -564,9 +713,13 @@ impl Render for BotSettings {
                     .flex()
                     .flex_col()
                     .gap(px(6.0))
-                    .child(label("Persona"))
+                    .child(label(if create { "What it should do" } else { "Persona" }))
                     .child(text_input::field("bs-persona", &self.persona, 110.0, window, cx))
-                    .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child("Written at the top of its instructions.")),
+                    .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(if create {
+                        "Who it is and how it should work. Becomes the start of its instructions."
+                    } else {
+                        "Written at the top of its instructions."
+                    })),
             )
             .child(
                 div()
@@ -614,70 +767,115 @@ impl Render for BotSettings {
                     )
                     .child(div().flex().flex_col().gap(px(6.0)).child(label("Model")).child(model_control)),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.0))
-                    .child(Switch::new("bs-paused", self.paused).on_toggle(move |on, _, cx| {
-                        paused_this.update(cx, |p, cx| {
-                            p.paused = on;
-                            cx.notify()
+            .when_some(self.error.clone().filter(|_| create), |el, e| el.child(div().text_size(px(text::SMALL)).text_color(theme.bad).child(e)))
+            .when(create, |el| {
+                el.child(
+                    div()
+                        .id("bs-intro")
+                        .flex()
+                        .items_start()
+                        .gap(px(12.0))
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            intro_this.update(cx, |p, cx| {
+                                p.intro = !p.intro;
+                                cx.notify()
+                            })
                         })
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(div().font_weight(FontWeight::MEDIUM).child("Paused"))
-                            .child(
-                                div()
-                                    .text_size(px(text::CAPTION))
-                                    .text_color(theme.muted)
-                                    .child("Queued runs wait until you resume this teammate."),
-                            ),
-                    ),
-            )
-            .when_some(self.error.clone(), |el, e| el.child(div().text_size(px(text::SMALL)).text_color(theme.bad).child(e)))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(14.0))
-                    .child(
-                        Button::new("bs-save", if self.busy && !self.confirm_delete { "Saving…" } else { "Save changes" })
-                            .primary()
-                            .disabled(self.busy || name.is_empty())
-                            .on_click(move |_, window, cx| save_this.update(cx, |p, cx| p.save(window, cx))),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(text::CAPTION))
-                            .text_color(theme.muted)
-                            .child(format!("Slug: {} (fixed, it names the workspace folder)", self.slug)),
-                    ),
-            )
-            .child(
-                div()
-                    .mt(px(8.0))
-                    .p(px(16.0))
-                    .rounded(px(RADIUS_CARD))
-                    .border_1()
-                    .border_color(theme.bad.opacity(0.5))
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(div().font_weight(FontWeight::MEDIUM).child("Delete this teammate"))
-                            .child(div().text_size(px(text::SMALL)).text_color(theme.muted).child(
-                                "This removes its history from the database. The workspace folder on your PC is left alone.",
-                            )),
-                    )
-                    .child(danger),
-            )
+                        .child(checkbox(intro, &theme))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(div().font_weight(FontWeight::MEDIUM).child("Say hello when it's ready"))
+                                .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(format!(
+                                    "Opens its chat and asks: “{INTRO}” Uses a little of your plan."
+                                ))),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(
+                            Button::new("bs-create", if self.busy { "Creating…" } else { "Create teammate" })
+                                .primary()
+                                .icon(icons::PLUS)
+                                .disabled(self.busy || name.is_empty())
+                                .on_click(move |_, window, cx| create_this.update(cx, |p, cx| p.save(window, cx))),
+                        )
+                        .child(Button::new("bs-cancel", "Cancel").ghost().on_click(move |_, _, cx| {
+                            cancel_this.update(cx, |_, cx| cx.emit(CreateEvent::Cancelled))
+                        })),
+                )
+            })
+            .when(!create, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(12.0))
+                        .child(Switch::new("bs-paused", self.paused).on_toggle(move |on, _, cx| {
+                            paused_this.update(cx, |p, cx| {
+                                p.paused = on;
+                                cx.notify()
+                            })
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(div().font_weight(FontWeight::MEDIUM).child("Paused"))
+                                .child(
+                                    div()
+                                        .text_size(px(text::CAPTION))
+                                        .text_color(theme.muted)
+                                        .child("Queued runs wait until you resume this teammate."),
+                                ),
+                        ),
+                )
+                .when_some(self.error.clone(), |el, e| el.child(div().text_size(px(text::SMALL)).text_color(theme.bad).child(e)))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(14.0))
+                        .child(
+                            Button::new("bs-save", if self.busy && !self.confirm_delete { "Saving…" } else { "Save changes" })
+                                .primary()
+                                .disabled(self.busy || name.is_empty())
+                                .on_click(move |_, window, cx| save_this.update(cx, |p, cx| p.save(window, cx))),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(text::CAPTION))
+                                .text_color(theme.muted)
+                                .child(format!("Slug: {} (fixed, it names the workspace folder)", self.slug)),
+                        ),
+                )
+                .child(
+                    div()
+                        .mt(px(8.0))
+                        .p(px(16.0))
+                        .rounded(px(RADIUS_CARD))
+                        .border_1()
+                        .border_color(theme.bad.opacity(0.5))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(div().font_weight(FontWeight::MEDIUM).child("Delete this teammate"))
+                                .child(div().text_size(px(text::SMALL)).text_color(theme.muted).child(
+                                    "This removes its history from the database. The workspace folder on your PC is left alone.",
+                                )),
+                        )
+                        .child(danger),
+                )
+            })
     }
 }

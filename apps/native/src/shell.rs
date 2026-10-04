@@ -25,7 +25,8 @@ use gpui::{
 use uuid::Uuid;
 
 use crate::approval::ApprovalCards;
-use crate::chat::BotPage;
+use crate::bot_settings::{BotSettings, CreateEvent, INTRO};
+use crate::chat::{BotPage, TAB_SETTINGS};
 use crate::settings::AppSettings;
 use crate::data::{AppData, Status, Teammate, ago, excerpt, run_status, tail, until};
 
@@ -35,6 +36,7 @@ pub enum Route {
     NeedsYou,
     Teammate(SharedString),
     Settings,
+    NewTeammate,
 }
 
 pub struct Shell {
@@ -45,9 +47,13 @@ pub struct Shell {
     side_scroll: ScrollHandle,
     expanded: HashMap<Uuid, Expand>,
     approvals: ApprovalCards,
+    /// The inbox's large cards (their own answer boxes).
+    inbox: ApprovalCards,
     /// Teammate pages, kept so switching back is instant and keeps the scroll.
     pages: HashMap<Uuid, Entity<BotPage>>,
     settings: Option<Entity<AppSettings>>,
+    /// The New teammate form while it is open (fresh each time).
+    new_bot: Option<Entity<BotSettings>>,
     /// Open this teammate's page on its Settings tab (from `--open <name>/settings`).
     open_tab: Option<Uuid>,
 }
@@ -92,8 +98,10 @@ impl Shell {
             side_scroll: ScrollHandle::new(),
             expanded: HashMap::new(),
             approvals: ApprovalCards::default(),
+            inbox: ApprovalCards::big(),
             pages: HashMap::new(),
             settings: None,
+            new_bot: None,
             open_tab: None,
         }
     }
@@ -110,6 +118,7 @@ impl Shell {
             "today" => Some(Route::Today),
             "needs" => Some(Route::NeedsYou),
             "settings" => Some(Route::Settings),
+            "new" => Some(Route::NewTeammate),
             _ => {
                 let list = self.data.read(cx).teammates();
                 let id = who.strip_prefix("bot:");
@@ -130,6 +139,9 @@ impl Shell {
     }
 
     pub fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        if route != Route::NewTeammate {
+            self.new_bot = None;
+        }
         if let Some(s) = self.settings.clone() {
             let shown = route == Route::Settings;
             s.update(cx, |s, cx| s.set_shown(shown, cx));
@@ -276,11 +288,15 @@ impl Shell {
                                         .justify_between()
                                         .pr(px(4.0))
                                         .child(group_label("Teammates", cx))
-                                        .child(
+                                        .child({
+                                            let this = cx.entity();
                                             Button::icon_only("new-teammate", icons::PLUS)
                                                 .size(ButtonSize::Small)
-                                                .tooltip("New teammate"),
-                                        ),
+                                                .tooltip("New teammate")
+                                                .on_click(move |_, _, cx| {
+                                                    this.update(cx, |s, cx| s.navigate(Route::NewTeammate, cx))
+                                                })
+                                        }),
                                 )
                                 .child(teammates),
                         ),
@@ -327,6 +343,37 @@ impl Shell {
                 let (data, toasts) = (self.data.clone(), self.toasts.clone());
                 let page = self.settings.get_or_insert_with(|| cx.new(|cx| AppSettings::new(data, toasts, window, cx))).clone();
                 self.scrolled(page.into_any_element())
+            }
+            Route::NewTeammate => {
+                let form = match self.new_bot.clone() {
+                    Some(f) => f,
+                    None => {
+                        let (data, toasts) = (self.data.clone(), self.toasts.clone());
+                        let f = cx.new(|cx| BotSettings::create(data, toasts, window, cx));
+                        cx.subscribe_in(&f, window, Self::on_create).detach();
+                        self.new_bot = Some(f.clone());
+                        f
+                    }
+                };
+                self.scrolled(anim::appear("new-teammate", div().child(form)).into_any_element())
+            }
+        }
+    }
+
+    /// The New teammate form finished: show the teammate, and (if asked) have it introduce itself.
+    fn on_create(&mut self, _: &Entity<BotSettings>, ev: &CreateEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev {
+            CreateEvent::Cancelled => self.navigate(Route::Today, cx),
+            CreateEvent::Created { bot, intro } => {
+                let id = bot.id;
+                self.data.update(cx, |d, cx| d.add_bot(bot.clone(), cx));
+                let (data, toasts) = (self.data.clone(), self.toasts.clone());
+                let page = cx.new(|cx| BotPage::new(data, toasts, id, window, cx));
+                if *intro {
+                    page.update(cx, |p, cx| p.post(INTRO.to_owned(), window, cx));
+                }
+                self.pages.insert(id, page);
+                self.navigate(Route::Teammate(id.to_string().into()), cx);
             }
         }
     }
@@ -412,7 +459,13 @@ impl Shell {
                             .text_color(theme.muted)
                             .child("Name it, give it a look and a job, and it starts working beside you."),
                     )
-                    .child(Button::new("create-first", "Create a teammate").primary().icon(icons::PLUS)),
+                    .child({
+                        let this = cx.entity();
+                        Button::new("create-first", "Create a teammate")
+                            .primary()
+                            .icon(icons::PLUS)
+                            .on_click(move |_, _, cx| this.update(cx, |s, cx| s.navigate(Route::NewTeammate, cx)))
+                    }),
             ));
         }
 
@@ -699,7 +752,9 @@ impl Shell {
             "strip-in-new",
             teammates.len(),
             div().child(
-                HoverCard::new("strip-new").flat().padding(10.0).child(
+                HoverCard::new("strip-new").flat().padding(10.0).on_click(move |_, _, cx| {
+                    this.update(cx, |s, cx| s.navigate(Route::NewTeammate, cx))
+                }).child(
                     div()
                         .w(px(84.0))
                         .flex()
@@ -726,27 +781,51 @@ impl Shell {
 
     fn needs_you(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let pending = self.data.read(cx).pending.clone();
+        // Oldest first: the one that has waited longest is at the top.
+        let mut pending = self.data.read(cx).pending.clone();
+        pending.sort_by_key(|a| a.created_at);
+        let n = pending.len();
         let head = div()
-            .text_size(px(text::HEADLINE))
-            .font_weight(FontWeight::SEMIBOLD)
-            .text_color(theme.ink)
-            .child("Needs you");
-        let mut page = div().flex().flex_col().gap(px(20.0)).child(head);
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(div().text_size(px(text::HEADLINE)).font_weight(FontWeight::SEMIBOLD).text_color(theme.ink).child("Needs you"))
+                    .when(n > 0, |el| el.child(chip(Tone::Warn, format!("{n} waiting"), cx))),
+            )
+            .child(
+                div()
+                    .text_size(px(text::LEAD))
+                    .text_color(theme.muted)
+                    .child("Teammates pause here until you decide. Requests expire after 30 minutes."),
+            );
+        let mut page = div().flex().flex_col().gap(px(24.0)).child(anim::appear("needs-head", head));
         if pending.is_empty() {
             page = page.child(anim::appear(
                 "needs-empty",
-                empty(
-                    "You're all caught up",
-                    Some("When a teammate needs a decision, it shows up here.".into()),
-                    cx,
-                ),
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(10.0))
+                    .py(px(48.0))
+                    .child(Mascot::new("needs-empty", familiar_ui::mascot::default_avatar("needs"), MascotState::Done, 88.0))
+                    .child(div().text_size(px(text::TITLE)).font_weight(FontWeight::SEMIBOLD).child("You're all caught up"))
+                    .child(
+                        div()
+                            .text_color(theme.muted)
+                            .child("When a teammate wants to run something risky or has a question, it shows up here."),
+                    ),
             ));
         } else {
             let data = self.data.clone();
             let toasts = self.toasts.clone();
-            let cards = self.approvals.render(&pending, &data, &toasts, window, cx);
-            page = page.child(div().flex().flex_col().gap(px(12.0)).children(cards));
+            let cards = self.inbox.render(&pending, &data, &toasts, window, cx);
+            page = page.child(div().flex().flex_col().gap(px(14.0)).children(cards));
         }
         page
     }
@@ -760,7 +839,7 @@ impl Shell {
         let page = self.pages.entry(bot).or_insert_with(|| cx.new(|cx| BotPage::new(data, toasts, bot, window, cx))).clone();
         if self.open_tab == Some(bot) {
             self.open_tab = None;
-            page.update(cx, |p, cx| p.set_tab(1, window, cx));
+            page.update(cx, |p, cx| p.set_tab(TAB_SETTINGS, window, cx));
         }
         page.into_any_element()
     }

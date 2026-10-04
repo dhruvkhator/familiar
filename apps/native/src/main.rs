@@ -6,19 +6,24 @@
 //! look: every component, both themes, the mascot in every state, and the motion primitives.
 //!
 //! Flags (both windows): `--theme light|dark|system`, `--reduce-motion`; gallery only: `--section <name>`; shell only:
-//! `--open needs|<teammate name>|first` (opens that page once the data is in).
+//! `--open needs|new|<teammate name>|first` (opens that page once the data is in), `--hidden` (start in the tray),
+//! `--quit` (ask the running copy to quit; in host mode its engine drains first).
 
 // Release builds are GUI-subsystem binaries (no console window); debug builds keep the console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod activity;
 mod approval;
 mod bot_settings;
 mod chat;
+mod computer;
 mod data;
 mod desktop;
 mod engine;
+mod events;
 mod gallery;
 mod markdown;
+mod memory;
 mod notify;
 mod prefs;
 mod root;
@@ -41,15 +46,18 @@ struct Args {
     open: Option<String>,
     /// Start in the tray (start at login).
     hidden: bool,
+    /// Ask the running copy to quit (gracefully) and exit.
+    quit: bool,
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { gallery: false, theme: None, reduce_motion: false, section: None, open: None, hidden: false };
+    let mut args = Args { gallery: false, theme: None, reduce_motion: false, section: None, open: None, hidden: false, quit: false };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--gallery" => args.gallery = true,
             "--hidden" => args.hidden = true,
+            "--quit" => args.quit = true,
             "--reduce-motion" => args.reduce_motion = true,
             "--theme" => {
                 args.theme = Some(match it.next().as_deref() {
@@ -87,8 +95,11 @@ fn window_options(cx: &App, title: &str, width: f32, height: f32) -> WindowOptio
 fn main() {
     let args = parse_args();
     // One copy per user: a second launch shows the running window and exits.
-    let nudges = match (!args.gallery).then(desktop::single_instance) {
+    let nudge = if args.quit { desktop::Nudge::Quit } else { desktop::Nudge::Show };
+    let nudges = match (!args.gallery).then(|| desktop::single_instance(nudge)) {
         Some(desktop::Instance::Second) => return,
+        // `--quit` with nothing running: nothing to do.
+        Some(desktop::Instance::First(_)) if args.quit => return,
         Some(desktop::Instance::First(rx)) => Some(rx),
         None => None,
     };
@@ -135,8 +146,11 @@ fn main() {
         if let Some(mut nudges) = nudges {
             cx.spawn(async move |cx| {
                 use futures::StreamExt as _;
-                while nudges.next().await.is_some() {
-                    cx.update(desktop::show_main);
+                while let Some(nudge) = nudges.next().await {
+                    match nudge {
+                        desktop::Nudge::Show => cx.update(desktop::show_main),
+                        desktop::Nudge::Quit => cx.update(desktop::quit_app),
+                    }
                 }
             })
             .detach();
