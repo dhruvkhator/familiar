@@ -34,15 +34,25 @@ export function revealHidden(text: string): { text: string; hidden: boolean } {
   return { text: out, hidden };
 }
 
-export function summarizeInput(tool: string, input: Record<string, unknown> | null): { label: string; text: string } | null {
+/** Every input field except the one shown as the summary — an approval must never hide parameters. */
+export function otherInputs(input: Record<string, unknown> | null, shownKey: string | null): [string, string][] {
+  if (!input) return [];
+  return Object.entries(input)
+    .filter(([k]) => k !== shownKey)
+    .map(([k, v]) => [k, typeof v === "string" ? v : JSON.stringify(v, null, 2)]);
+}
+
+export function summarizeInput(
+  tool: string,
+  input: Record<string, unknown> | null,
+): { label: string; text: string; key: string } | null {
   if (!input) return null;
   const s = (k: string) => (typeof input[k] === "string" ? (input[k] as string) : null);
-  if (tool === "Bash" && s("command")) return { label: "command", text: s("command")! };
-  const path = s("file_path") ?? s("path") ?? s("notebook_path");
-  if (path) return { label: "path", text: path };
-  const url = s("url");
-  if (url) return { label: "url", text: url };
-  if (s("query")) return { label: "query", text: s("query")! };
+  if (tool === "Bash" && s("command")) return { label: "command", text: s("command")!, key: "command" };
+  const pathKey = ["file_path", "path", "notebook_path"].find((k) => s(k));
+  if (pathKey) return { label: "path", text: s(pathKey)!, key: pathKey };
+  if (s("url")) return { label: "url", text: s("url")!, key: "url" };
+  if (s("query")) return { label: "query", text: s("query")!, key: "query" };
   return null;
 }
 
@@ -99,6 +109,29 @@ export function ApprovalCard({ a, botName, bot, big, onDone }: { a: Approval; bo
               )}
               <pre className="mono whitespace-pre-wrap break-all rounded-md bg-sunken border-l-4 border-warn px-3 py-2 text-[13px]">{shown.text}</pre>
             </>
+          );
+        })()}
+        {!isAsk && (() => {
+          // Every other parameter is shown too (no blind approvals): e.g. a url plus a body, a query plus a recipient.
+          const extra = otherInputs(a.input, sum?.key ?? null);
+          if (!extra.length) return null;
+          return (
+            <dl className="space-y-1.5">
+              {extra.map(([k, v]) => {
+                const shown = revealHidden(v);
+                return (
+                  <div key={k}>
+                    <dt className="text-xs text-muted">
+                      {k}
+                      {shown.hidden && <span className="ml-2 font-medium text-bad">hidden characters</span>}
+                    </dt>
+                    <dd>
+                      <pre className="mono max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-md bg-sunken px-3 py-1.5 text-xs">{shown.text}</pre>
+                    </dd>
+                  </div>
+                );
+              })}
+            </dl>
           );
         })()}
         {/* The reason comes from the bot/engine, not from Familiar: never let it read like our own risk assessment. */}
