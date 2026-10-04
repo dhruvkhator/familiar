@@ -12,12 +12,16 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod approval;
+mod bot_settings;
 mod chat;
 mod data;
+mod desktop;
 mod engine;
 mod gallery;
 mod markdown;
+mod prefs;
 mod root;
+mod settings;
 mod shell;
 mod text_input;
 
@@ -28,25 +32,26 @@ use gpui::{
 
 struct Args {
     gallery: bool,
-    theme: AppearanceMode,
+    /// `None`: the saved preference.
+    theme: Option<AppearanceMode>,
     reduce_motion: bool,
     section: Option<String>,
     open: Option<String>,
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { gallery: false, theme: AppearanceMode::System, reduce_motion: false, section: None, open: None };
+    let mut args = Args { gallery: false, theme: None, reduce_motion: false, section: None, open: None };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--gallery" => args.gallery = true,
             "--reduce-motion" => args.reduce_motion = true,
             "--theme" => {
-                args.theme = match it.next().as_deref() {
+                args.theme = Some(match it.next().as_deref() {
                     Some("light") => AppearanceMode::Light,
                     Some("dark") => AppearanceMode::Dark,
                     _ => AppearanceMode::System,
-                }
+                })
             }
             "--section" => args.section = it.next(),
             "--open" => args.open = it.next(),
@@ -94,8 +99,9 @@ fn main() {
     gpui_platform::application().with_assets(familiar_ui::icons::Assets).run(move |cx: &mut App| {
         gpui_tokio::init_from_handle(cx, handle);
         gpui_base::init(cx);
-        familiar_ui::init(args.theme, cx);
-        if args.reduce_motion {
+        let saved = prefs::load();
+        familiar_ui::init(args.theme.unwrap_or(saved.theme), cx);
+        if args.reduce_motion || saved.reduce_motion {
             familiar_ui::motion::set_preference(familiar_ui::motion::ReduceMotion::On, cx);
         }
         let opened = if args.gallery {

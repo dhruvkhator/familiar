@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use familiar_client::{Event, Message, Role, Run, RunKind, Thread, TypedEvent};
 use familiar_ui::anim::{self, Expand};
-use familiar_ui::components::{Button, ButtonSize, SidebarItem, Skeleton, StatusChip, card, chip, empty, group_label};
+use familiar_ui::components::{Button, ButtonSize, Segmented, SidebarItem, Skeleton, StatusChip, card, chip, empty, group_label};
 use familiar_ui::edge_fade::edge_faded;
 use familiar_ui::icons::{self, icon};
 use familiar_ui::mascot::{Mascot, MascotState};
@@ -15,7 +15,7 @@ use familiar_ui::motion::{AnimationExt as _, EASE, MotionSpec};
 use familiar_ui::theme::{RADIUS_CARD, RADIUS_CHIP, Theme, Tone, text};
 use familiar_ui::toast::ToastStack;
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    AnyElement, AppContext as _, Context, Entity, FontWeight, Hsla, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
@@ -25,6 +25,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::approval::ApprovalCards;
+use crate::bot_settings::BotSettings;
 use crate::data::{self, AppData, DataEvent, ago, excerpt, run_status, swr};
 use crate::markdown;
 use crate::shell::state_tone;
@@ -64,6 +65,10 @@ pub struct BotPage {
     /// What the transcript showed last frame; a change while at the bottom scrolls to the new bottom.
     content_rev: (usize, usize, usize, usize, bool),
     force_bottom: bool,
+    /// 0: chat, 1: settings.
+    tab: usize,
+    settings: Option<Entity<BotSettings>>,
+    settings_scroll: ScrollHandle,
 }
 
 impl BotPage {
@@ -105,6 +110,9 @@ impl BotPage {
             thread_scroll: ScrollHandle::new(),
             content_rev: Default::default(),
             force_bottom: true,
+            tab: 0,
+            settings: None,
+            settings_scroll: ScrollHandle::new(),
         };
         this.reload_threads(cx);
         // Opening a teammate puts the cursor in the composer.
@@ -384,6 +392,7 @@ impl BotPage {
             return div().into_any_element();
         };
         let t = d.teammate(&bot);
+        let this = cx.entity();
         let active = d.runs.iter().find(|r| r.bot_id == self.bot && r.status.is_active()).cloned();
         let status_line = match &active {
             Some(r) => format!("Working on “{}”", excerpt(r.prompt.as_deref().unwrap_or("a task"), 70)),
@@ -438,7 +447,34 @@ impl BotPage {
                         )
                     }),
             )
+            .child(div().flex_1())
+            .child(
+                Segmented::new(
+                    SharedString::from(format!("bot-tabs-{}", self.bot)),
+                    vec![("Chat".into(), Some(icons::CHAT_ROUND_LINE)), ("Settings".into(), Some(icons::SETTINGS))],
+                    self.tab,
+                )
+                .segment_width(104.0)
+                .on_select(move |i, window, cx| this.update(cx, |p, cx| p.set_tab(i, window, cx))),
+            )
             .into_any_element()
+    }
+
+    pub fn set_tab(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab == tab {
+            return;
+        }
+        self.tab = tab;
+        if tab == 1 {
+            // Fresh from the current bot every time the tab opens.
+            let (data, toasts, bot) = (self.data.clone(), self.toasts.clone(), self.bot);
+            self.settings = Some(cx.new(|cx| BotSettings::new(data, toasts, bot, window, cx)));
+            self.settings_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        } else {
+            self.settings = None;
+            self.force_bottom = true;
+        }
+        cx.notify();
     }
 
     fn thread_list(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1014,6 +1050,37 @@ fn excerpt_lines(s: &str, n: usize) -> String {
 impl Render for BotPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = self.header(cx);
+        if let Some(settings) = self.settings.clone().filter(|_| self.tab == 1) {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(header)
+                .child(
+                    div().flex_1().min_h_0().child(
+                        edge_faded(
+                            24.0,
+                            true,
+                            true,
+                            div()
+                                .id("bot-settings-scroll")
+                                .size_full()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.settings_scroll)
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .justify_center()
+                                        .px(px(40.0))
+                                        .py(px(28.0))
+                                        .child(div().w_full().max_w(px(720.0)).child(settings)),
+                                ),
+                        )
+                        .fade_overflow_y(&self.settings_scroll),
+                    ),
+                );
+        }
         let threads = self.thread_list(cx);
         let transcript = self.transcript(window, cx);
         let jump = self.jump_button(cx);

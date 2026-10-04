@@ -2083,6 +2083,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-registry",
 ]
 
 [[package]]

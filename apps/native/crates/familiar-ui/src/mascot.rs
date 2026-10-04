@@ -72,6 +72,31 @@ impl Accessory {
     pub const ALL: [Self; 7] =
         [Self::None, Self::Hat, Self::Glasses, Self::Headphones, Self::Bow, Self::Antenna, Self::Crown];
 
+    /// The stored name (`bots.avatar.accessory`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Hat => "hat",
+            Self::Glasses => "glasses",
+            Self::Headphones => "headphones",
+            Self::Bow => "bow",
+            Self::Antenna => "antenna",
+            Self::Crown => "crown",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Hat => "Hat",
+            Self::Glasses => "Glasses",
+            Self::Headphones => "Headphones",
+            Self::Bow => "Bow",
+            Self::Antenna => "Antenna",
+            Self::Crown => "Crown",
+        }
+    }
+
     fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "none" => Self::None,
@@ -95,6 +120,19 @@ pub struct Avatar {
     pub eyes: u8,
     pub mouth: u8,
     pub accessory: Accessory,
+}
+
+impl Avatar {
+    /// The stored form (`bots.avatar` jsonb), as the web's AvatarBuilder writes it.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "shape": self.shape,
+            "color": format!("#{:06x}", self.color),
+            "eyes": self.eyes,
+            "mouth": self.mouth,
+            "accessory": self.accessory.as_str(),
+        })
+    }
 }
 
 pub const PALETTE: [u32; 6] = [0x7285d5, 0xe58fa4, 0x4fb98a, 0xeda84b, 0xa283d8, 0x4fa9cf];

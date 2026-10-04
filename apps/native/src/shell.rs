@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::approval::ApprovalCards;
 use crate::chat::BotPage;
+use crate::settings::AppSettings;
 use crate::data::{AppData, Status, Teammate, ago, excerpt, run_status, tail, until};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -33,6 +34,7 @@ pub enum Route {
     Today,
     NeedsYou,
     Teammate(SharedString),
+    Settings,
 }
 
 pub struct Shell {
@@ -45,6 +47,9 @@ pub struct Shell {
     approvals: ApprovalCards,
     /// Teammate pages, kept so switching back is instant and keeps the scroll.
     pages: HashMap<Uuid, Entity<BotPage>>,
+    settings: Option<Entity<AppSettings>>,
+    /// Open this teammate's page on its Settings tab (from `--open <name>/settings`).
+    open_tab: Option<Uuid>,
 }
 
 impl Shell {
@@ -52,22 +57,18 @@ impl Shell {
         familiar_ui::observe_window(window, cx);
         let mut open = open;
         cx.observe(&data, move |this: &mut Self, data, cx| {
-            if let Some(want) = open.as_deref() {
+            if open.is_some() && data.read(cx).overview.is_some() {
+                let want = open.take().unwrap_or_default();
+                this.open(&want, cx);
+            }
+            // A deleted teammate's page closes.
+            if let Route::Teammate(id) = this.route.current().clone() {
                 let d = data.read(cx);
-                if d.overview.is_some() {
-                    let want = want.to_lowercase();
-                    let route = if want == "needs" {
-                        Some(Route::NeedsYou)
-                    } else {
-                        let list = d.teammates();
-                        list.iter()
-                            .find(|t| want == "first" || t.name.to_lowercase() == want)
-                            .map(|t| Route::Teammate(t.id.clone()))
-                    };
-                    open = None;
-                    if let Some(r) = route {
-                        this.navigate(r, cx);
+                if d.overview.is_some() && !d.bots().iter().any(|b| b.id.to_string() == id.as_ref()) {
+                    if let Ok(uuid) = id.parse::<Uuid>() {
+                        this.pages.remove(&uuid);
                     }
+                    this.navigate(Route::Today, cx);
                 }
             }
             cx.notify()
@@ -92,10 +93,47 @@ impl Shell {
             expanded: HashMap::new(),
             approvals: ApprovalCards::default(),
             pages: HashMap::new(),
+            settings: None,
+            open_tab: None,
         }
     }
 
-    fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+    /// Open a page by name: `today`, `needs`, `settings`, `first`, a teammate's name or `bot:<id>`, optionally with
+    /// `/settings` for that teammate's Settings tab. Returns whether it matched.
+    pub fn open(&mut self, target: &str, cx: &mut Context<Self>) -> bool {
+        let want = target.trim().to_lowercase();
+        let (who, tab) = match want.strip_suffix("/settings") {
+            Some(w) => (w.to_owned(), true),
+            None => (want.clone(), false),
+        };
+        let route = match who.as_str() {
+            "today" => Some(Route::Today),
+            "needs" => Some(Route::NeedsYou),
+            "settings" => Some(Route::Settings),
+            _ => {
+                let list = self.data.read(cx).teammates();
+                let id = who.strip_prefix("bot:");
+                list.iter()
+                    .find(|t| match id {
+                        Some(id) => t.id.as_ref() == id,
+                        None => who == "first" || t.name.to_lowercase() == who,
+                    })
+                    .map(|t| Route::Teammate(t.id.clone()))
+            }
+        };
+        let Some(route) = route else { return false };
+        if let (Route::Teammate(id), true) = (&route, tab) {
+            self.open_tab = id.parse().ok();
+        }
+        self.navigate(route, cx);
+        true
+    }
+
+    pub fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        if let Some(s) = self.settings.clone() {
+            let shown = route == Route::Settings;
+            s.update(cx, |s, cx| s.set_shown(shown, cx));
+        }
         if self.route.set(route) {
             self.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
             cx.notify();
@@ -198,6 +236,7 @@ impl Shell {
                             .on_click(move |_, _, cx| {
                                 let next = if dark { AppearanceMode::Light } else { AppearanceMode::Dark };
                                 appearance::set_mode(next, cx);
+                                crate::prefs::update(|p| p.theme = next);
                                 this_toggle.update(cx, |_, cx| cx.notify());
                             }),
                     ),
@@ -257,7 +296,7 @@ impl Shell {
                     .p(px(8.0))
                     .border_t_1()
                     .border_color(theme.line)
-                    .child(SidebarItem::new("nav-settings", "Settings").icon(icons::SETTINGS))
+                    .child(nav("nav-settings", "Settings", icons::SETTINGS, Route::Settings, 0))
                     .child(
                         div()
                             .flex()
@@ -284,6 +323,11 @@ impl Shell {
                 self.scrolled(page)
             }
             Route::Teammate(id) => self.bot_page(id, window, cx),
+            Route::Settings => {
+                let (data, toasts) = (self.data.clone(), self.toasts.clone());
+                let page = self.settings.get_or_insert_with(|| cx.new(|cx| AppSettings::new(data, toasts, window, cx))).clone();
+                self.scrolled(page.into_any_element())
+            }
         }
     }
 
@@ -713,7 +757,12 @@ impl Shell {
         };
         let data = self.data.clone();
         let toasts = self.toasts.clone();
-        self.pages.entry(bot).or_insert_with(|| cx.new(|cx| BotPage::new(data, toasts, bot, window, cx))).clone().into_any_element()
+        let page = self.pages.entry(bot).or_insert_with(|| cx.new(|cx| BotPage::new(data, toasts, bot, window, cx))).clone();
+        if self.open_tab == Some(bot) {
+            self.open_tab = None;
+            page.update(cx, |p, cx| p.set_tab(1, window, cx));
+        }
+        page.into_any_element()
     }
 
     /// A scrolling, centred column for the overview pages.
