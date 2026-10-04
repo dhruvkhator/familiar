@@ -75,43 +75,67 @@ pub fn action_of(tool: &str) -> &'static str {
 pub struct Detail {
     pub label: &'static str,
     pub text: String,
+    /// Every input field the main block doesn't show, `key: value` (pretty JSON per value), hidden characters
+    /// written out; empty when there are none.
+    pub others: String,
     /// It had invisible or deceptive characters (now shown as `⟨U+XXXX⟩`).
     pub hidden: bool,
 }
 
-/// The input of a tool call as the owner must see it before approving: the command; a file's path and the new
-/// text; an address; a search; else the whole input as JSON. Nothing is cut here.
+/// The input of a tool call as the owner must see it before approving: the command; a file's path and its new text
+/// (an edit's old and new text); an address; a search; else the whole input as JSON. Every other field of the input
+/// is listed in `others`, so nothing the tool receives is left out. Nothing is cut here.
 pub fn detail_of(input: Option<&Value>) -> Option<Detail> {
     let input = input?;
-    let get = |k: &str| input.get(k).and_then(Value::as_str).map(str::to_owned);
-    let one = |label, raw: &str, multiline| {
-        let (text, hidden) = reveal(raw, multiline);
-        Detail { label, text, hidden }
+    let get = |k: &str| input.get(k).and_then(Value::as_str);
+    let mut hidden = false;
+    let mut show = |raw: &str, multiline: bool| {
+        let (t, h) = reveal(raw, multiline);
+        hidden |= h;
+        t
     };
-    if let Some(c) = get("command") {
-        return Some(one("Command", &c, true));
-    }
-    if let Some(p) = get("file_path").or_else(|| get("notebook_path")).or_else(|| get("path")) {
-        let (path, h1) = reveal(&p, false);
-        let change = get("content").or_else(|| get("new_string")).or_else(|| get("new_source"));
-        return Some(match change {
-            Some(c) => {
-                let (body, h2) = reveal(&c, true);
-                Detail { label: "File", text: format!("{path}\n\n{body}"), hidden: h1 || h2 }
+    // (label, main text, the keys it shows)
+    let main: Option<(&'static str, String, Vec<&str>)> = if let Some(c) = get("command") {
+        Some(("Command", show(c, true), vec!["command"]))
+    } else if let Some((key, p)) = ["file_path", "notebook_path", "path"].iter().find_map(|k| get(k).map(|p| (*k, p))) {
+        let mut text = show(p, false);
+        let mut keys = vec![key];
+        match (get("old_string"), get("new_string")) {
+            (Some(old), Some(new)) => {
+                text = format!("{text}\n\nReplaces:\n{}\n\nWith:\n{}", show(old, true), show(new, true));
+                keys.extend(["old_string", "new_string"]);
             }
-            None => Detail { label: "File", text: path, hidden: h1 },
-        });
+            _ => {
+                if let Some((k, body)) = ["content", "new_string", "new_source"].iter().find_map(|k| get(k).map(|b| (*k, b))) {
+                    text = format!("{text}\n\n{}", show(body, true));
+                    keys.push(k);
+                }
+            }
+        }
+        Some(("File", text, keys))
+    } else if let Some(u) = get("url") {
+        Some(("Address", show(u, false), vec!["url"]))
+    } else {
+        get("query").map(|q| ("Search", show(q, false), vec!["query"]))
+    };
+    let (label, text, keys) = match main {
+        Some(m) => m,
+        None => match input {
+            Value::Object(m) if !m.is_empty() => ("Input", show(&serde_json::to_string_pretty(input).unwrap_or_default(), true), Vec::new()),
+            Value::Object(_) | Value::Null => return None,
+            other => ("Input", show(&serde_json::to_string_pretty(other).unwrap_or_default(), true), Vec::new()),
+        },
+    };
+    let mut others = Vec::new();
+    if label != "Input"
+        && let Value::Object(m) = input
+    {
+        for (k, v) in m.iter().filter(|(k, _)| !keys.contains(&k.as_str())) {
+            let v = serde_json::to_string_pretty(v).unwrap_or_default();
+            others.push(format!("{}: {}", show(k, false), show(&v, true)));
+        }
     }
-    if let Some(u) = get("url") {
-        return Some(one("Address", &u, false));
-    }
-    if let Some(q) = get("query") {
-        return Some(one("Search", &q, false));
-    }
-    match input {
-        Value::Object(m) if !m.is_empty() => Some(one("Input", &serde_json::to_string_pretty(input).unwrap_or_default(), true)),
-        _ => None,
-    }
+    Some(Detail { label, text, others: others.join("\n"), hidden })
 }
 
 /// Characters that don't show, or change how the rest reads. By Unicode general category: Cc (controls), Cf (bidi
@@ -165,6 +189,12 @@ pub fn fits_compact(text: &str) -> bool {
     !text.contains('\n') && text.chars().count() <= COMPACT_FITS
 }
 
+/// A compact card can't approve this: it has hidden characters, fields beyond the main one, or more than one short
+/// line.
+pub fn needs_review(d: &Detail) -> bool {
+    d.hidden || !d.others.is_empty() || !fits_compact(&d.text)
+}
+
 /// The start and the end of `text` with the middle counted, never silently cut: `head … N more characters … tail`.
 /// Text of at most `2 * n` characters comes back whole.
 pub fn head_tail(text: &str, n: usize) -> String {
@@ -206,7 +236,7 @@ pub fn approval_card(
     let (risk_label, risk_tone) = risk_of(&a.tool_name);
     let hidden = detail.as_ref().is_some_and(|d| d.hidden) || question.as_ref().is_some_and(|q| q.1);
     // Compact cards only approve what they show whole.
-    let review = !big && !ask && (hidden || detail.as_ref().is_some_and(|d| !fits_compact(&d.text)));
+    let review = !big && !ask && (hidden || detail.as_ref().is_some_and(needs_review));
 
     let header = div()
         .flex()
@@ -248,7 +278,7 @@ pub fn approval_card(
     }
     if let Some(d) = detail {
         let border = if risk_tone == Tone::Bad { theme.bad } else { theme.warn };
-        let block = div()
+        let block = || div()
             .px(px(12.0))
             .py(px(9.0))
             .rounded(px(RADIUS_CHIP))
@@ -258,29 +288,35 @@ pub fn approval_card(
             .font_family(theme.font_mono.clone())
             .text_size(px(if big { text::SMALL } else { text::CAPTION }))
             .text_color(theme.ink);
-        let block = if big {
-            // The whole input, verbatim, scrolling when long.
-            block
-                .id(SharedString::from(format!("approval-input-{id}")))
-                .max_h(px(360.0))
-                .overflow_y_scroll()
-                .child(d.text.clone())
-                .into_any_element()
-        } else {
-            block.child(head_tail(&d.text, COMPACT_END)).into_any_element()
+        let shown = |content: &str, key: &str| {
+            let b = block();
+            if big {
+                // The whole input, verbatim, scrolling when long.
+                b.id(SharedString::from(format!("approval-{key}-{id}")))
+                    .max_h(px(360.0))
+                    .overflow_y_scroll()
+                    .child(content.to_owned())
+                    .into_any_element()
+            } else {
+                b.child(head_tail(content, COMPACT_END)).into_any_element()
+            }
         };
+        let caption = |s: &'static str| div().text_size(px(text::CAPTION)).font_weight(FontWeight::MEDIUM).text_color(theme.muted).child(s);
+        let main = shown(&d.text, "input");
+        let others = (!d.others.is_empty()).then(|| shown(&d.others, "others"));
         body = body.child(
             div()
                 .flex()
                 .flex_col()
                 .gap(px(4.0))
-                .child(div().text_size(px(text::CAPTION)).font_weight(FontWeight::MEDIUM).text_color(theme.muted).child(d.label))
-                .child(block)
+                .child(caption(d.label))
+                .child(main)
+                .when_some(others, |el, o| el.child(div().mt(px(6.0)).child(caption("Other inputs"))).child(o))
                 .when(review, |el| {
                     el.child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(if hidden {
                         "It has hidden characters: review the whole input before approving."
                     } else {
-                        "Too long to show here: review the whole input before approving."
+                        "Too much to show here: review the whole input before approving."
                     }))
                 }),
         );
@@ -509,5 +545,33 @@ mod tests {
         let d = detail_of(Some(&json!({ "to": "a@b.c", "body": "x\u{202E}" }))).unwrap();
         assert_eq!(d.label, "Input");
         assert!(d.text.contains("a@b.c"));
+        assert!(d.text.contains("⟨U+202E⟩") && d.hidden);
+        assert!(d.others.is_empty());
+    }
+
+    #[test]
+    fn every_other_field_surfaces_and_forces_review() {
+        let d = detail_of(Some(&json!({ "url": "https://harmless.example", "body": "<secrets>" }))).unwrap();
+        assert_eq!((d.label, d.text.as_str()), ("Address", "https://harmless.example"));
+        assert_eq!(d.others, "body: \"<secrets>\"");
+        assert!(needs_review(&d));
+        let d = detail_of(Some(&json!({ "query": "weather", "to": "attacker@x" }))).unwrap();
+        assert_eq!(d.text, "weather");
+        assert_eq!(d.others, "to: \"attacker@x\"");
+        assert!(needs_review(&d));
+        // Nested values show whole, with hidden characters written out.
+        let d = detail_of(Some(&json!({ "command": "ls", "env": { "X": "a\u{200B}" } }))).unwrap();
+        assert!(d.others.starts_with("env: {") && d.others.contains("a⟨U+200B⟩") && d.hidden);
+        // Only the main field, short: a compact card may approve.
+        let d = detail_of(Some(&json!({ "command": "git status" }))).unwrap();
+        assert!(!needs_review(&d));
+    }
+
+    #[test]
+    fn an_edit_shows_old_and_new_text() {
+        let d = detail_of(Some(&json!({ "file_path": "a.rs", "old_string": "x = 1", "new_string": "x = 2", "replace_all": true })))
+            .unwrap();
+        assert_eq!(d.text, "a.rs\n\nReplaces:\nx = 1\n\nWith:\nx = 2");
+        assert_eq!(d.others, "replace_all: true");
     }
 }
