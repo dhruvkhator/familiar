@@ -4,3 +4,6 @@ dist/
 .env
 .env.local
 *.log
+
+# The native app's Windows resources and installer script are sources, not build output.
+!apps/native/dist/
