@@ -138,19 +138,19 @@ function ThreadView({ bot, threadId, thread, onTitled }: { bot: BotWithStatus; t
     });
   }, [msgs.data]);
 
-  async function send() {
-    const content = text.trim();
+  async function send(retryContent?: string) {
+    const content = (retryContent ?? text).trim();
     if (!content || sending) return;
     setSending(true); setError(null);
     const mine: Outgoing = { id: "pending-" + ++seq.current, content, known: new Set((msgs.data ?? []).map((m) => m.id)), at: new Date().toISOString() };
     setOutgoing((o) => [...o, mine]);
-    setText("");
+    if (retryContent === undefined) setText("");
     stick.current = true;
     const error = await attempt(() => api.post(`/api/threads/${threadId}/messages`, { content }));
     setSending(false);
     if (error) {
       setOutgoing((o) => o.filter((p) => p.id !== mine.id));
-      setText((t) => t || content);
+      if (retryContent === undefined) setText((t) => t || content);
       setError(error);
       return;
     }
@@ -173,6 +173,7 @@ function ThreadView({ bot, threadId, thread, onTitled }: { bot: BotWithStatus; t
   }
 
   const messages = msgs.data ?? [];
+  const lastUser = [...messages].reverse().find((m) => m.role === "user");
   return (
     <div className="flex-1 min-w-0 flex flex-col min-h-0">
       <div className="md:hidden shrink-0 px-2 pt-1">
@@ -195,27 +196,29 @@ function ThreadView({ bot, threadId, thread, onTitled }: { bot: BotWithStatus; t
           {outgoing.map((p) => (
             <MessageRow key={p.id} pending bot={bot} m={{ id: p.id, role: "user", content: p.content, created_at: p.at } as Message} />
           ))}
-          {run && (
+          {run && active && (
             <div className="card">
               <div className="flex items-center gap-2 px-3 py-2 border-b border-line">
                 <RunChip status={run.status} />
                 {run.kind === "handoff" ? <Chip tone="accent">handoff</Chip> : <span className="text-xs text-muted">{run.kind} run</span>}
-                {run.parent_run_id && <Link to={`/bot/${bot.slug}/activity/${run.parent_run_id}`} className="text-xs text-accent underline">from earlier run</Link>}
                 <Link to={`/bot/${bot.slug}/activity/${run.id}`} className="text-xs text-accent underline ml-auto">Details</Link>
-                {active && <Button tone="danger" className="!min-h-8" onClick={cancel}>Cancel</Button>}
+                <Button tone="danger" className="!min-h-8" onClick={cancel}>Cancel</Button>
               </div>
-              {run.error && <p className="px-3 pt-2 text-sm text-bad break-words">{run.error}</p>}
-              {active && (
-                <div className="px-3 pt-3">
-                  <EventList runId={run.id} live />
-                </div>
-              )}
+              <div className="px-3 pt-3">
+                <EventList runId={run.id} live />
+              </div>
               {(approvals.data ?? []).length > 0 && (
                 <div className="p-3 space-y-3">
                   {(approvals.data ?? []).map((a) => <ApprovalCard key={a.id} a={a} onDone={approvals.reload} />)}
                 </div>
               )}
-              {!active && !run.error && <p className="px-3 py-2 text-sm text-muted">Finished {ago(run.finished_at)}.</p>}
+            </div>
+          )}
+          {run && (run.status === "failed" || run.status === "cancelled") && lastUser && (
+            <div className="flex justify-end items-center gap-2 text-xs text-muted">
+              <span className="text-bad truncate max-w-[60%]" title={run.error ?? ""}>{run.status === "cancelled" ? "Cancelled" : "Didn't finish"}{run.error ? ` · ${excerpt(run.error, 80)}` : ""}</span>
+              <Link to={`/bot/${bot.slug}/activity/${run.id}`} className="text-accent underline">Details</Link>
+              <Button className="!min-h-7" onClick={() => void send(lastUser.content)} disabled={sending}>Retry</Button>
             </div>
           )}
         </div>
@@ -233,7 +236,7 @@ function ThreadView({ bot, threadId, thread, onTitled }: { bot: BotWithStatus; t
               placeholder={`Message ${bot.name}`}
               aria-label="Message"
             />
-            <Button tone="primary" className="!min-h-9" onClick={send} disabled={sending || !text.trim()}>Send</Button>
+            <Button tone="primary" className="!min-h-9" onClick={() => void send()} disabled={sending || !text.trim()}>Send</Button>
           </div>
         </div>
       </div>

@@ -1,7 +1,7 @@
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
 import { useLive, useLoad } from "../lib/hooks";
-import { duration, excerpt, money, when } from "../lib/util";
+import { duration, excerpt, when, costNote } from "../lib/util";
 import type { Artifact, Run } from "../lib/types";
 import type { BotWithStatus } from "../lib/appdata";
 import { EventList } from "../components/EventList";
@@ -36,7 +36,7 @@ export function RunList({ bot }: { bot: BotWithStatus }) {
               <span className="text-xs text-muted ml-auto tnum">{when(r.created_at)}</span>
             </div>
             <p className="mt-1 truncate">{excerpt(r.prompt, 140) || "(no prompt)"}</p>
-            <p className="mono text-xs text-muted mt-0.5">{duration(r.started_at, r.finished_at)} · notional {money(r.cost_usd)}</p>
+            <p className="mono text-xs text-muted mt-0.5">{duration(r.started_at, r.finished_at)} · {costNote(r.cost_usd)}</p>
           </Link>
         </li>
       ))}
@@ -56,7 +56,7 @@ function RunDetail({ bot, runId }: { bot: BotWithStatus; runId: string }) {
           <div className="flex items-center gap-2 flex-wrap mb-2">
             <RunChip status={r.status} /><Chip tone={r.kind === "handoff" ? "accent" : "muted"}>{r.kind}</Chip>
             {r.parent_run_id && <Link className="text-xs text-accent underline" to={`/bot/${bot.slug}/activity/${r.parent_run_id}`}>from {r.kind === "handoff" ? "parent" : "earlier"} run</Link>}
-            <span className="mono text-xs text-muted">{duration(r.started_at, r.finished_at)} · notional {money(r.cost_usd)}</span>
+            <span className="mono text-xs text-muted">{duration(r.started_at, r.finished_at)} · {costNote(r.cost_usd)}</span>
           </div>
           <p className="whitespace-pre-wrap break-words mb-2">{r.prompt}</p>
           {r.error && <p className="rounded-md bg-bad-soft text-bad text-sm px-3 py-2 mb-2 break-words">{r.error}</p>}

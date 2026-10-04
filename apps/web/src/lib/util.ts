@@ -36,7 +36,12 @@ export function excerpt(s: string | null | undefined, n = 90): string {
 export function money(n: number | null | undefined): string {
   if (n == null) return "-";
   const v = Number(n);
-  return `$${v.toFixed(v < 1 ? 4 : 2)}`;
+  return `${v.toFixed(v < 1 ? 4 : 2)}`;
+}
+/** Cost as a notional API-price figure, never a bare charge. */
+export function costNote(n: number | null | undefined): string {
+  if (n == null) return "included in your plan";
+  return `≈ ${money(n)} at API prices · included in your plan`;
 }
 export function pretty(v: unknown): string {
   try { return JSON.stringify(v, null, 2) ?? String(v); } catch { return String(v); }
