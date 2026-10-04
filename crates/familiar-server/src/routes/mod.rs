@@ -16,6 +16,7 @@ pub mod channels;
 pub mod connectors;
 pub mod live;
 pub mod memories;
+pub mod models;
 pub mod overview;
 pub mod rules;
 pub mod runs;

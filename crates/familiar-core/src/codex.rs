@@ -669,6 +669,35 @@ async fn decide(
     }
 }
 
+/// The models this Codex CLI offers (`model/list` on a short-lived app-server) as `(id, label)`, or `None` when it
+/// cannot be started or doesn't answer within 30 s.
+pub async fn list_models(bin: &str) -> Option<Vec<(String, String)>> {
+    let process = spawn(bin, &std::env::temp_dir()).ok()?;
+    let rpc = process.rpc.clone();
+    let list = tokio::time::timeout(Duration::from_secs(30), async {
+        let info = json!({ "clientInfo": { "name": "familiar", "title": "familiar", "version": env!("CARGO_PKG_VERSION") } });
+        rpc.call("initialize", info).await.ok()?;
+        rpc.notify("initialized");
+        rpc.call("model/list", json!({})).await.ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    drop(rpc);
+    let _ = process.finish(Duration::from_secs(3)).await;
+    let models = list?["data"]
+        .as_array()?
+        .iter()
+        .filter(|m| m["hidden"] != true)
+        .filter_map(|m| {
+            let id = m["id"].as_str().or_else(|| m["model"].as_str())?.to_owned();
+            let label = m["displayName"].as_str().filter(|s| !s.is_empty()).unwrap_or(&id).to_owned();
+            Some((id, label))
+        })
+        .collect();
+    Some(models)
+}
+
 async fn default_model(rpc: &Rpc) -> Option<String> {
     let list = rpc.call("model/list", json!({})).await.ok()?;
     list["data"].as_array()?.iter().find(|m| m["isDefault"] == true)?["id"].as_str().map(str::to_owned)

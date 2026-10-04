@@ -288,6 +288,13 @@ async fn bots_crud_and_validation() {
 
     // engine/model validation
     assert_eq!(app.post(t, "/api/bots", json!({"name": "m", "model": "gpt-9"})).await.0, 400);
+    for bad in ["claude-", "claude-x", "claude-Opus-5", "claude-opus 5", &format!("claude-{}", "a".repeat(61))] {
+        assert_eq!(app.post(t, "/api/bots", json!({"name": "m", "model": bad})).await.0, 400, "{bad}");
+    }
+    let v = app.ok_post(t, "/api/bots", json!({"name": "Exact", "model": "claude-opus-5-5"}), 201).await;
+    assert_eq!(v["model"], "claude-opus-5-5");
+    let (s, v) = app.patch(t, &format!("/api/bots/{}", id(&v)), json!({"model": "claude-haiku-4-5-20251001"})).await;
+    assert_eq!((s, v["model"].as_str()), (200, Some("claude-haiku-4-5-20251001")));
     assert_eq!(app.post(t, "/api/bots", json!({"name": "m", "engine": "llama"})).await.0, 400);
     assert_eq!(app.post(t, "/api/bots", json!({"name": "m", "engine": "codex", "model": "bad model!"})).await.0, 400);
     let c = app.ok_post(t, "/api/bots", json!({"name": "Codex Bot", "engine": "codex", "model": "gpt-5.1-codex"}), 201).await;
@@ -304,7 +311,9 @@ async fn bots_crud_and_validation() {
     let v = app.ok_post(t, "/api/bots", json!({"name": "Face", "avatar": av}), 201).await;
     assert_eq!(v["avatar"], av);
     let fid = id(&v);
-    for bad in [json!("str"), json!({"hat": "top"}), json!({"shape": 1}), json!({"shape": "x".repeat(33)})] {
+    let built = json!({"shape": 2, "color": "#4fb98a", "eyes": 0, "mouth": 3, "accessory": "crown"});
+    assert_eq!(app.ok_post(t, "/api/bots", json!({"name": "Built", "avatar": built.clone()}), 201).await["avatar"], built);
+    for bad in [json!("str"), json!({"hat": "top"}), json!({"shape": -1}), json!({"shape": 1.5}), json!({"shape": true}), json!({"shape": "x".repeat(33)})] {
         assert_eq!(app.post(t, "/api/bots", json!({"name": "bad", "avatar": bad.clone()})).await.0, 400, "{bad}");
         assert_eq!(app.patch(t, &format!("/api/bots/{fid}"), json!({"avatar": bad})).await.0, 400);
     }
@@ -316,11 +325,11 @@ async fn bots_crud_and_validation() {
     let (s, v) = app.patch(t, &format!("/api/bots/{bid}"), json!({"paused": true, "persona": "be nice", "name": "RB"})).await;
     assert_eq!((s, v["paused"].clone(), v["persona"].as_str(), v["name"].as_str()), (200, json!(true), Some("be nice"), Some("RB")));
     assert_eq!(app.get(t, &format!("/api/bots/{bid}")).await.1["paused"], true);
-    assert_eq!(len(&app.get(t, "/api/bots").await.1), 4);
+    assert_eq!(len(&app.get(t, "/api/bots").await.1), 6);
     assert_eq!(app.get(t, "/api/bots/not-a-uuid").await.0, 400);
     assert_eq!(app.get(t, &format!("/api/bots/{}", Uuid::new_v4())).await.0, 404);
     let (_, ov) = app.get(t, "/api/overview").await;
-    assert_eq!((len(&ov["bots"]), ov["pending_approvals"].clone()), (4, json!(0)));
+    assert_eq!((len(&ov["bots"]), ov["pending_approvals"].clone()), (6, json!(0)));
 
     // skills are read-only (the daemon mirrors them)
     app.exec("insert into skills (owner_id, bot_id, name, body) select owner_id, id, 'sk', 'b' from bots where slug = 'ok-1'", &[]).await;
@@ -1052,4 +1061,39 @@ async fn mint_owner_session_only_for_a_single_owner() {
     app.second().await;
     assert_eq!(mint_owner_session(&app.pool).await.unwrap(), None, "two users: no unambiguous owner");
     assert_eq!(app.get(&tok, "/api/me").await.0, 200, "existing sessions are untouched");
+}
+
+// ------------------------------------------------------------------ models (from the newest computer's heartbeat)
+
+#[tokio::test(flavor = "multi_thread")]
+async fn models_come_from_the_newest_device() {
+    let app = app!();
+    let a = app.owner().await;
+    let t = a.tok.as_str();
+    let (s, v) = app.get(t, "/api/models").await;
+    assert_eq!(s, 200);
+    assert_eq!(v, json!({"claude": {"plan": null, "models": []}, "codex": {"models": []}}), "nothing reported yet");
+
+    let old = json!({"models": {"claude": {"plan": "pro", "models": [{"id": "sonnet", "label": "Sonnet 5.5", "alias": true, "available": true}]}}});
+    let new = json!({"utilization": 0.1, "models": {
+        "claude": {"plan": "max", "models": [{"id": "claude-opus-5-5", "label": "Opus 5.5", "alias": false, "available": true}]},
+        "codex": {"models": [{"id": "gpt-5-codex", "label": "GPT-5-Codex"}]}}});
+    for (name, info, ago) in [("old", old, "2 hours"), ("new", new, "1 minute"), ("none", json!({"utilization": 0.2}), "0 seconds")] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "insert into devices (id, owner_id, name, version, last_seen_at, info) values ($1, $2, $3, 'test', now() - interval '{ago}', $4)"
+        )))
+        .bind(Uuid::new_v4())
+        .bind(a.id)
+        .bind(name)
+        .bind(sqlx::types::Json(info))
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    }
+    let (_, v) = app.get(t, "/api/models").await;
+    assert_eq!(v["claude"]["plan"], "max", "the newest device that reported models wins");
+    assert_eq!(v["claude"]["models"][0]["id"], "claude-opus-5-5");
+    assert_eq!(v["codex"]["models"][0]["id"], "gpt-5-codex");
+    let b = app.second().await;
+    assert_eq!(app.get(&b.tok, "/api/models").await.1["claude"]["models"], json!([]), "owner-scoped");
 }

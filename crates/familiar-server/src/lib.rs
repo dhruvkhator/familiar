@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use routes::{
-    approvals, artifacts, bots, channels, connectors, live, memories, overview, rules, runs,
+    approvals, artifacts, bots, channels, connectors, live, memories, models, overview, rules, runs,
     schedules, skills, stream, threads, triggers,
 };
 
@@ -73,6 +73,7 @@ fn router(state: S, web_origins: &[String]) -> Router {
         .route("/api/auth/account", patch(auth::update_account))
         .route("/api/me", get(auth::me))
         .route("/api/overview", get(overview::get))
+        .route("/api/models", get(models::get))
         .route("/api/bots", get(bots::list).post(bots::create))
         .route(
             "/api/bots/{id}",

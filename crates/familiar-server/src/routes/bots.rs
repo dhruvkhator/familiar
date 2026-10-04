@@ -73,7 +73,7 @@ fn nullable<'de, D: serde::Deserializer<'de>>(
     Ok(Some(serde::Deserialize::deserialize(d)?))
 }
 
-/// claude: fixed model names; codex: any sane model id.
+/// claude: an alias (`sonnet`, ...) or an exact version id (`claude-opus-5-5`); codex: any sane model id.
 fn check_model(engine: &str, model: &str) -> R<String> {
     if engine == "codex" {
         let ok = !model.is_empty()
@@ -88,9 +88,21 @@ fn check_model(engine: &str, model: &str) -> R<String> {
                 "model must match ^[A-Za-z0-9._-]{1,64}$ for the codex engine",
             ))
         }
+    } else if MODELS.contains(&model) || exact_claude(model) {
+        Ok(model.to_string())
     } else {
-        one_of(model, "model", &MODELS)
+        Err(ApiError::bad(format!(
+            "model must be one of {} or match ^claude-[a-z0-9.-]{{3,60}}$ for the claude engine",
+            MODELS.join(", ")
+        )))
     }
+}
+
+/// `^claude-[a-z0-9.-]{3,60}$`
+fn exact_claude(model: &str) -> bool {
+    model.strip_prefix("claude-").is_some_and(|rest| {
+        (3..=60).contains(&rest.len()) && rest.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'.' || c == b'-')
+    })
 }
 
 fn check_avatar(v: &serde_json::Value) -> R<()> {
@@ -101,9 +113,15 @@ fn check_avatar(v: &serde_json::Value) -> R<()> {
         if !AVATAR_KEYS.contains(&k.as_str()) {
             return Err(ApiError::bad(format!("avatar.{k} is not a known field")));
         }
-        if val.as_str().is_none_or(|s| s.chars().count() > 32) {
+        // The avatar builders store the shape / eyes / mouth as small indexes and the rest as strings.
+        let ok = match val {
+            serde_json::Value::String(s) => s.chars().count() <= 32,
+            serde_json::Value::Number(n) => n.as_u64().is_some_and(|n| n < 100),
+            _ => false,
+        };
+        if !ok {
             return Err(ApiError::bad(format!(
-                "avatar.{k} must be a string of at most 32 characters"
+                "avatar.{k} must be a string of at most 32 characters or a small whole number"
             )));
         }
     }

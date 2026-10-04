@@ -7,6 +7,7 @@ pub mod config;
 pub mod daemon;
 pub mod db;
 pub mod mcp;
+pub mod models;
 pub mod permissions;
 pub mod reviewer;
 pub mod runner;

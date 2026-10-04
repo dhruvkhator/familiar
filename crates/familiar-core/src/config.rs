@@ -44,6 +44,14 @@ pub struct Config {
     /// How long a spawned `claude` may stay silent before the run fails as stuck (default 150 s; tests lower it).
     #[serde(default)]
     pub startup_timeout_secs: Option<u64>,
+    /// Look up which models this computer's Claude plan and Codex CLI offer (`models.rs`; default on, tests turn it
+    /// off so the fake CLIs see only run invocations).
+    #[serde(default = "default_true")]
+    pub check_models: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize)]

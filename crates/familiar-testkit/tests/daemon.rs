@@ -101,6 +101,7 @@ impl H {
             "browser_bin": self.dir.join("no-such-browser.exe"),
             "device_name": "testkit",
             "max_parallel": 2,
+            "check_models": false,
         });
         for (k, v) in extra.as_object().cloned().unwrap_or_default() {
             cfg[k] = v;

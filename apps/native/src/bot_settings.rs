@@ -2,6 +2,7 @@
 //! model, paused, and delete.
 
 use familiar_client::{BotEngine, BotPatch};
+use familiar_ui::anim;
 use familiar_ui::components::{Button, ButtonSize, Segmented, Switch, card};
 use familiar_ui::icons;
 use familiar_ui::mascot::{Accessory, Avatar, EYE_COUNT, MOUTH_COUNT, Mascot, MascotState, PALETTE, SHAPE_COUNT};
@@ -18,8 +19,18 @@ use uuid::Uuid;
 use crate::data::{AppData, avatar_of};
 use crate::text_input;
 
-/// The web's `CLAUDE_MODELS`.
-const CLAUDE_MODELS: [&str; 4] = ["sonnet", "opus", "haiku", "fable"];
+/// The Claude aliases (always available, they run the newest version) and the version each runs today; shown until
+/// `/api/models` answers.
+const CLAUDE_ALIASES: [(&str, &str); 4] =
+    [("sonnet", "Sonnet 5.5"), ("opus", "Opus 5.5"), ("haiku", "Haiku 4.5"), ("fable", "Fable 5.1")];
+
+/// One model of the picker.
+struct Choice {
+    id: String,
+    label: String,
+    /// `None`: not verified against the plan yet.
+    available: Option<bool>,
+}
 
 pub struct BotSettings {
     data: Entity<AppData>,
@@ -31,7 +42,10 @@ pub struct BotSettings {
     /// Codex: any model the CLI accepts.
     codex_model: Entity<InputState>,
     codex: bool,
-    claude_model: usize,
+    claude_model: String,
+    /// `/api/models`: what this computer's plan and Codex CLI offer (`None` until it answers).
+    catalog: Option<serde_json::Value>,
+    show_unavailable: bool,
     paused: bool,
     avatar: Avatar,
     busy: bool,
@@ -73,9 +87,11 @@ impl BotSettings {
             }
         })
         .detach();
-        Self {
+        let mut this = Self {
             avatar: avatar_of(&b),
-            claude_model: CLAUDE_MODELS.iter().position(|m| *m == b.model).unwrap_or(0),
+            claude_model: if codex { "sonnet".into() } else { b.model.clone() },
+            catalog: None,
+            show_unavailable: false,
             data,
             toasts,
             bot,
@@ -88,7 +104,30 @@ impl BotSettings {
             busy: false,
             error: None,
             confirm_delete: false,
-        }
+        };
+        this.load_catalog(cx);
+        // The plan check reports through the computer's minute heartbeat: look again while it is still running.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_secs(20)).await;
+                let Ok(()) = this.update(cx, |p, cx| {
+                    if p.checking() {
+                        p.load_catalog(cx);
+                    }
+                }) else {
+                    break;
+                };
+            }
+        })
+        .detach();
+        this
+    }
+
+    /// Still waiting on the plan check (or for the first answer).
+    fn checking(&self) -> bool {
+        let Some(c) = &self.catalog else { return true };
+        let models = c["claude"]["models"].as_array();
+        c["claude"]["plan"].is_null() || models.is_none_or(|m| m.is_empty() || m.iter().any(|m| m["available"].is_null()))
     }
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -108,7 +147,7 @@ impl BotSettings {
                 m => m.to_owned(),
             }
         } else {
-            CLAUDE_MODELS[self.claude_model].to_owned()
+            self.claude_model.clone()
         };
         let patch = BotPatch {
             name: Some(name),
@@ -142,6 +181,162 @@ impl BotSettings {
             });
         })
         .detach();
+    }
+
+    fn load_catalog(&mut self, cx: &mut Context<Self>) {
+        let client = self.data.read(cx).client.clone();
+        crate::data::swr(self, &client, "/api/models".into(), cx, |this, v: serde_json::Value, _| this.catalog = Some(v));
+    }
+
+    /// The Claude choices: aliases first, then exact versions, with what the plan check said.
+    fn claude_choices(&self) -> (Option<String>, Vec<Choice>) {
+        let claude = self.catalog.as_ref().map(|c| &c["claude"]);
+        let plan = claude.and_then(|c| c["plan"].as_str()).map(str::to_owned);
+        let listed: Vec<Choice> = claude
+            .and_then(|c| c["models"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|m| {
+                let id = m["id"].as_str()?.to_owned();
+                let label = m["label"].as_str().unwrap_or(&id).to_owned();
+                let alias = m["alias"] == true;
+                let label = if alias { format!("{label} · latest") } else { label };
+                Some(Choice { id, label, available: if alias { Some(true) } else { m["available"].as_bool() } })
+            })
+            .collect();
+        if listed.is_empty() {
+            let aliases = CLAUDE_ALIASES
+                .iter()
+                .map(|(id, label)| Choice { id: (*id).into(), label: format!("{label} · latest"), available: Some(true) })
+                .collect();
+            return (plan, aliases);
+        }
+        (plan, listed)
+    }
+
+    /// A selectable model pill.
+    fn pill(&self, id: String, label: String, selected: bool, enabled: bool, cx: &mut Context<Self>, pick: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let this = cx.entity();
+        div()
+            .id(SharedString::from(format!("bs-model-{id}")))
+            .px(px(12.0))
+            .py(px(6.0))
+            .rounded(px(RADIUS_CONTROL))
+            .border_1()
+            .border_color(if selected { theme.accent } else { theme.line })
+            .bg(if selected { theme.accent_soft } else { theme.surface })
+            .text_size(px(text::SMALL))
+            .font_weight(if selected { FontWeight::MEDIUM } else { FontWeight::NORMAL })
+            .text_color(if !enabled { theme.muted } else if selected { theme.accent } else { theme.ink })
+            .when(!enabled, |el| el.opacity(0.6))
+            .when(enabled, |el| {
+                el.cursor_pointer()
+                    .hover(|s| s.bg(theme.hover))
+                    .on_click(move |_, window, cx| this.update(cx, |p, cx| {
+                        pick(p, window, cx);
+                        cx.notify()
+                    }))
+            })
+            .child(label)
+            .into_any_element()
+    }
+
+    fn model_picker(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let caption = |s: String| div().text_size(px(text::CAPTION)).text_color(theme.muted).child(s);
+        if self.codex {
+            let listed: Vec<(String, String)> = self
+                .catalog
+                .as_ref()
+                .and_then(|c| c["codex"]["models"].as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|m| Some((m["id"].as_str()?.to_owned(), m["label"].as_str().unwrap_or_default().to_owned())))
+                .collect();
+            let current = self.codex_model.read(cx).value().trim().to_owned();
+            let mut pills = div().flex().flex_wrap().gap(px(6.0));
+            for (id, label) in listed.iter() {
+                let label = if label.is_empty() { id.clone() } else { label.clone() };
+                let pick = id.clone();
+                pills = pills.child(self.pill(id.clone(), label, *id == current, true, cx, move |p, window, cx| {
+                    p.codex_model.update(cx, |s, cx| s.set_value(pick.clone(), window, cx));
+                }));
+            }
+            return div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .when(!listed.is_empty(), |el| el.child(pills))
+                .child(text_input::field("bs-codex-model", &self.codex_model, 38.0, window, cx))
+                .child(caption(match (&self.catalog, listed.is_empty()) {
+                    (None, _) => "Checking your Codex models…".into(),
+                    (Some(_), true) => "Any model your Codex CLI accepts.".into(),
+                    (Some(_), false) => "Pick one your Codex CLI lists, or type any model it accepts.".into(),
+                }))
+                .into_any_element();
+        }
+        let (plan, choices) = self.claude_choices();
+        let current = self.claude_model.clone();
+        let mut pills = div().flex().flex_wrap().gap(px(6.0));
+        let mut shown_current = false;
+        for c in choices.iter().filter(|c| c.available == Some(true)) {
+            shown_current |= c.id == current;
+            let pick = c.id.clone();
+            pills = pills.child(self.pill(c.id.clone(), c.label.clone(), c.id == current, true, cx, move |p, _, _| p.claude_model = pick.clone()));
+        }
+        if !shown_current {
+            // The saved model, even if the plan check hasn't vouched for it (yet).
+            let label = choices.iter().find(|c| c.id == current).map(|c| c.label.clone()).unwrap_or_else(|| current.clone());
+            pills = pills.child(self.pill(current.clone(), label, true, true, cx, |_, _, _| {}));
+        }
+        let checking = self.checking();
+        let unavailable: Vec<&Choice> = choices.iter().filter(|c| c.available == Some(false)).collect();
+        let this = cx.entity();
+        let mut col = div().flex().flex_col().gap(px(8.0)).child(pills);
+        let mut notes = div().flex().items_center().gap(px(12.0));
+        if let Some(plan) = plan.as_deref().filter(|p| *p != "unknown") {
+            let mut chars = plan.chars();
+            let plan = chars.next().map(|c| c.to_uppercase().chain(chars).collect::<String>()).unwrap_or_default();
+            notes = notes.child(caption(format!("Your plan: {plan}")));
+        }
+        if checking {
+            notes = notes.child(caption("Checking your plan…".into()));
+        }
+        if !unavailable.is_empty() {
+            let open = self.show_unavailable;
+            notes = notes.child(
+                div()
+                    .id("bs-unavailable")
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .cursor_pointer()
+                    .text_size(px(text::CAPTION))
+                    .text_color(theme.muted)
+                    .hover(|s| s.text_color(theme.ink))
+                    .on_click(move |_, _, cx| this.update(cx, |p, cx| {
+                        p.show_unavailable = !p.show_unavailable;
+                        cx.notify()
+                    }))
+                    .child(SharedString::from(format!("Not on your plan ({})", unavailable.len())))
+                    .child(
+                        icons::icon(icons::ALT_ARROW_DOWN)
+                            .size(px(12.0))
+                            .text_color(theme.muted)
+                            .with_transformation(gpui::Transformation::rotate(gpui::radians(if open { std::f32::consts::PI } else { 0.0 }))),
+                    ),
+            );
+        }
+        col = col.child(notes);
+        if self.show_unavailable && !unavailable.is_empty() {
+            let mut off = div().flex().flex_wrap().gap(px(6.0));
+            for c in unavailable {
+                off = off.child(self.pill(c.id.clone(), c.label.clone(), false, false, cx, |_, _, _| {}));
+            }
+            col = col.child(anim::appear("bs-unavailable-list", off));
+        }
+        col.into_any_element()
     }
 
     fn delete(&mut self, cx: &mut Context<Self>) {
@@ -327,34 +522,11 @@ impl Render for BotSettings {
         let this = cx.entity();
         let builder = self.builder(cx);
         let engine_this = cx.entity();
-        let model_this = cx.entity();
         let paused_this = cx.entity();
         let save_this = cx.entity();
         let del_this = cx.entity();
         let codex = self.codex;
-        let model_control: AnyElement = if codex {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(6.0))
-                .child(text_input::field("bs-codex-model", &self.codex_model, 38.0, window, cx))
-                .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child("Any model your Codex CLI accepts."))
-                .into_any_element()
-        } else {
-            Segmented::new(
-                "bs-model",
-                CLAUDE_MODELS.iter().map(|m| (SharedString::from(*m), None)).collect(),
-                self.claude_model,
-            )
-            .segment_width(80.0)
-            .on_select(move |i, _, cx| {
-                model_this.update(cx, |p, cx| {
-                    p.claude_model = i;
-                    cx.notify()
-                })
-            })
-            .into_any_element()
-        };
+        let model_control = self.model_picker(window, cx);
         let danger = if self.confirm_delete {
             div()
                 .flex()
@@ -399,13 +571,14 @@ impl Render for BotSettings {
             .child(
                 div()
                     .flex()
-                    .gap(px(28.0))
-                    .flex_wrap()
+                    .flex_col()
+                    .gap(px(16.0))
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .gap(px(6.0))
+                            .items_start()
                             .child(label("Engine"))
                             .child(
                                 Segmented::new("bs-engine", vec![("Claude".into(), None), ("Codex".into(), None)], codex as usize)
@@ -416,10 +589,17 @@ impl Render for BotSettings {
                                             if to_codex != p.codex {
                                                 p.codex = to_codex;
                                                 if to_codex && p.codex_model.read(cx).value().trim().is_empty() {
-                                                    p.codex_model.update(cx, |s, cx| s.set_value("gpt-5-codex", window, cx));
+                                                    // The first model the Codex CLI lists, else the long-standing default.
+                                                    let first = p
+                                                        .catalog
+                                                        .as_ref()
+                                                        .and_then(|c| c["codex"]["models"][0]["id"].as_str())
+                                                        .unwrap_or("gpt-5-codex")
+                                                        .to_owned();
+                                                    p.codex_model.update(cx, |s, cx| s.set_value(first, window, cx));
                                                 }
-                                                if !to_codex {
-                                                    p.claude_model = 0;
+                                                if !to_codex && p.claude_model.trim().is_empty() {
+                                                    p.claude_model = "sonnet".into();
                                                 }
                                             }
                                             cx.notify()
@@ -432,7 +612,7 @@ impl Render for BotSettings {
                                 "Runs on your Claude Code sign-in."
                             })),
                     )
-                    .child(div().flex().flex_col().gap(px(6.0)).min_w(px(240.0)).child(label("Model")).child(model_control)),
+                    .child(div().flex().flex_col().gap(px(6.0)).child(label("Model")).child(model_control)),
             )
             .child(
                 div()

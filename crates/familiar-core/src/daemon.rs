@@ -121,6 +121,8 @@ pub async fn run_with_signals(cfg: Config, shutdown: CancellationToken, signals:
     mcp::serve(mcp_listener, ctx.clone(), shutdown.clone());
     tokio::spawn(crate::tools::ensure_playwright());
     tokio::spawn(crate::telegram::run(ctx.clone(), shutdown.clone()));
+    let models: crate::models::Shared = Arc::default();
+    tokio::spawn(crate::models::run(ctx.cfg.clone(), models.clone(), shutdown.clone()));
     let stale = ctx.db.fail_stale_runs().await?;
     if stale > 0 {
         warn!("marked {stale} interrupted run(s) as failed");
@@ -134,7 +136,7 @@ pub async fn run_with_signals(cfg: Config, shutdown: CancellationToken, signals:
         hostname::get().map(|h| h.to_string_lossy().into_owned()).unwrap_or_else(|_| "familiar".into())
     });
     tokio::spawn({
-        let (ctx, db, shutdown, active) = (ctx.clone(), ctx.db.clone(), shutdown.clone(), active.clone());
+        let (ctx, db, shutdown, active, models) = (ctx.clone(), ctx.db.clone(), shutdown.clone(), active.clone(), models.clone());
         let health = ctx.cfg.server_url.as_deref().map(|u| format!("{}/healthz", u.trim_end_matches('/')));
         async move {
             // Minute heartbeat also keeps free-tier databases that pause when idle awake.
@@ -147,11 +149,15 @@ pub async fn run_with_signals(cfg: Config, shutdown: CancellationToken, signals:
                     warn!("heartbeat failed: {e:#}");
                 }
                 let (utilization, resets_at) = *ctx.utilization.lock().unwrap();
-                let info = serde_json::json!({
+                let mut info = serde_json::json!({
                     "utilization": utilization, "resets_at": resets_at, "throttled": ctx.throttled(),
                     "active_runs": active.lock().unwrap().len(), "claude_version": claude_version,
                     "daemon_version": env!("CARGO_PKG_VERSION"),
                 });
+                let models = models.lock().unwrap().clone();
+                if !models.is_null() {
+                    info["models"] = models;
+                }
                 let _ = db.set_device_info(device, &info).await;
                 if let Some(url) = health.as_deref().filter(|_| n % 10 == 0) {
                     let _ = http.get(url).timeout(Duration::from_secs(90)).send().await;
