@@ -51,13 +51,34 @@ impl Root {
                 Phase::FirstRun(_) if this.setup.is_none() => this.setup = Some(SetupForm::new(window, cx)),
                 _ => {}
             }
+            crate::tray::sync(cx);
             cx.notify();
         })
         .detach();
-        // Closing the window in host mode drains the engine first; the app quits when that is done.
+        // With the tray up, closing the window hides it and the engine keeps working; Quit in the tray quits.
+        // Without one, closing quits (in host mode the engine drains first; the app quits when that is done).
         let quitting = engine.clone();
-        window.on_window_should_close(cx, move |_, cx| quitting.update(cx, |e, cx| e.request_quit(cx)));
+        window.on_window_should_close(cx, move |window, cx| {
+            if crate::tray::installed(cx) {
+                crate::desktop::hide_window(window);
+                return false;
+            }
+            quitting.update(cx, |e, cx| e.request_quit(cx))
+        });
         Self { engine, shell: None, open, setup: None }
+    }
+
+    /// Quit for real (the tray's Quit). Host mode shows the window while in-flight work drains.
+    pub fn quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.engine.update(cx, |e, cx| e.request_quit(cx)) {
+            cx.quit();
+        } else {
+            crate::desktop::show_window(window);
+        }
+    }
+
+    pub fn shell(&self) -> Option<Entity<Shell>> {
+        self.shell.clone()
     }
 
     fn submit_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {

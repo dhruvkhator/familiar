@@ -815,7 +815,8 @@ fn run_detail(r: &Run) -> String {
         parts.push(if secs < 60 { format!("took {secs}s") } else { format!("took {}m", secs / 60) });
     }
     if let Some(c) = r.cost_usd.filter(|c| *c > 0.0) {
-        parts.push(format!("${c:.2}"));
+        // Claude Code's notional list-price figure; runs use the owner's plan, nothing is billed.
+        parts.push(format!("≈ ${c:.2} at API prices · included in your plan"));
     }
     parts.join(" · ")
 }

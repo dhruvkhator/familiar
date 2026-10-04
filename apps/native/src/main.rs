@@ -24,6 +24,7 @@ mod root;
 mod settings;
 mod shell;
 mod text_input;
+mod tray;
 
 use familiar_ui::AppearanceMode;
 use gpui::{
@@ -37,14 +38,17 @@ struct Args {
     reduce_motion: bool,
     section: Option<String>,
     open: Option<String>,
+    /// Start in the tray (start at login).
+    hidden: bool,
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { gallery: false, theme: None, reduce_motion: false, section: None, open: None };
+    let mut args = Args { gallery: false, theme: None, reduce_motion: false, section: None, open: None, hidden: false };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--gallery" => args.gallery = true,
+            "--hidden" => args.hidden = true,
             "--reduce-motion" => args.reduce_motion = true,
             "--theme" => {
                 args.theme = Some(match it.next().as_deref() {
@@ -81,6 +85,12 @@ fn window_options(cx: &App, title: &str, width: f32, height: f32) -> WindowOptio
 
 fn main() {
     let args = parse_args();
+    // One copy per user: a second launch shows the running window and exits.
+    let nudges = match (!args.gallery).then(desktop::single_instance) {
+        Some(desktop::Instance::Second) => return,
+        Some(desktop::Instance::First(rx)) => Some(rx),
+        None => None,
+    };
     // Debug builds log to the console; release builds have none and log to ~/.familiar/logs/native.log.
     if cfg!(debug_assertions) {
         let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
@@ -104,21 +114,34 @@ fn main() {
         if args.reduce_motion || saved.reduce_motion {
             familiar_ui::motion::set_preference(familiar_ui::motion::ReduceMotion::On, cx);
         }
-        let opened = if args.gallery {
+        if args.gallery {
             let section = args.section.clone();
             cx.open_window(window_options(cx, "Familiar — Gallery", 1240.0, 860.0), move |window, cx| {
                 cx.new(|cx| gallery::Gallery::new(section.as_deref(), window, cx))
             })
-            .map(|_| ())
-        } else {
-            let open = args.open.clone();
-            cx.open_window(window_options(cx, "Familiar", 1180.0, 780.0), move |window, cx| {
-                cx.new(|cx| root::Root::new(open, window, cx))
+            .expect("open window");
+            cx.activate(true);
+            return;
+        }
+        // Toasts need an app identity when the app isn't packaged (the same id the window and installer use).
+        cx.set_app_identity("dev.familiar.desktop", "Familiar");
+        let open = args.open.clone();
+        let options = WindowOptions { show: !args.hidden, focus: !args.hidden, ..window_options(cx, "Familiar", 1180.0, 780.0) };
+        let window = cx.open_window(options, move |window, cx| cx.new(|cx| root::Root::new(open, window, cx))).expect("open window");
+        cx.set_global(desktop::MainWindow(window));
+        tray::install(cx);
+        if let Some(mut nudges) = nudges {
+            cx.spawn(async move |cx| {
+                use futures::StreamExt as _;
+                while nudges.next().await.is_some() {
+                    cx.update(desktop::show_main);
+                }
             })
-            .map(|_| ())
-        };
-        opened.expect("open window");
-        cx.activate(true);
+            .detach();
+        }
+        if !args.hidden {
+            cx.activate(true);
+        }
     });
     // Normally the window drained the engine before quitting; if the app ended another way, drain it now.
     let host = engine::HOSTED.lock().unwrap().take();

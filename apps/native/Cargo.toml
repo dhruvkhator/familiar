@@ -30,8 +30,12 @@ tokio = { version = "1", features = ["full"] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+tray-icon = { version = "0.21", default-features = false }
+
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.5"
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 embed-resource = "3.0.11"
