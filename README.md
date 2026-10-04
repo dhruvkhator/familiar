@@ -54,8 +54,9 @@ teammates, and stops for your approval before doing anything risky.
 - Proactive and dream runs are read-only. Approvals expire after 30 minutes.
 
 ## Install
-Download `Familiar-setup.exe` from [Releases](https://github.com/dhruvkhator/familiar/releases) (Windows; macOS/Linux
-later), install, and open Familiar. First launch sets up the built-in database, checks your Claude Code / Codex
+Download `Familiar-<version>-setup.exe` from [Releases](https://github.com/dhruvkhator/familiar/releases) (Windows;
+macOS/Linux later), install (no admin rights needed), and open Familiar. The installer isn't code-signed yet, so Windows
+SmartScreen may warn: choose *More info → Run anyway*, and compare the file with `SHA256SUMS.txt` if you like. First launch sets up the built-in database, checks your Claude Code / Codex
 sign-in, and walks you through creating your first teammate. Requires [Claude Code](https://docs.claude.com/en/docs/claude-code)
 and/or the [Codex CLI](https://www.npmjs.com/package/@openai/codex) signed in, plus Node 20+ for browser/connector tools.
 
