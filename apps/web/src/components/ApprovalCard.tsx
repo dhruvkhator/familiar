@@ -119,14 +119,16 @@ export function ApprovalCard({ a, botName, bot, big, onDone }: { a: Approval; bo
             <dl className="space-y-1.5">
               {extra.map(([k, v]) => {
                 const shown = revealHidden(v);
+                const key = revealHidden(k);
                 return (
                   <div key={k}>
-                    <dt className="text-xs text-muted">
-                      {k}
-                      {shown.hidden && <span className="ml-2 font-medium text-bad">hidden characters</span>}
+                    <dt className="mono text-xs text-muted">
+                      {/* Parameter names are model-chosen too: escape them and render them as code, never as labels. */}
+                      {key.text}
+                      {(shown.hidden || key.hidden) && <span className="ml-2 font-sans font-medium text-bad">hidden characters</span>}
                     </dt>
                     <dd>
-                      <pre className="mono max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-md bg-sunken px-3 py-1.5 text-xs">{shown.text}</pre>
+                      <pre className="mono whitespace-pre-wrap break-all rounded-md bg-sunken px-3 py-1.5 text-xs">{shown.text}</pre>
                     </dd>
                   </div>
                 );
