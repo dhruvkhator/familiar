@@ -37,7 +37,7 @@ jobs:
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           $v = if ($env:EVENT -eq "push") { $env:REF_NAME.TrimStart("v") } else { $env:INPUT_VERSION }
-          if ($v -notmatch '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$') { throw "bad version '$v'" }
+          if ($v -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$') { throw "bad version '$v'" }
           "value=$v" >> $env:GITHUB_OUTPUT
 
       # apps/native pins its toolchain in rust-toolchain.toml; rustup installs it on the first cargo call.

@@ -15,6 +15,13 @@
 #ifndef OutputDir
   #define OutputDir "."
 #endif
+; Windows file versions are numbers only: 0.1.0-alpha.1 -> 0.1.0 (AppVersion keeps the full string).
+#define PreDash Pos("-", AppVersion)
+#if PreDash > 0
+  #define NumericVersion Copy(AppVersion, 1, PreDash - 1)
+#else
+  #define NumericVersion AppVersion
+#endif
 
 [Setup]
 ; Never change AppId: it identifies the installation across upgrades.
@@ -26,7 +33,7 @@ AppPublisher=Familiar contributors
 AppPublisherURL=https://github.com/dhruvkhator/familiar
 AppSupportURL=https://github.com/dhruvkhator/familiar/issues
 AppUpdatesURL=https://github.com/dhruvkhator/familiar/releases
-VersionInfoVersion={#AppVersion}
+VersionInfoVersion={#NumericVersion}
 PrivilegesRequired=lowest
 DefaultDirName={autopf}\Familiar
 DisableProgramGroupPage=yes
