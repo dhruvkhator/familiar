@@ -360,7 +360,7 @@ impl Client {
 
     // ---- approvals & rules ----------------------------------------------
 
-    /// `status`: pending | approved | denied | expired (none = all).
+    /// `status`: pending | approved | denied | expired | revise (none = all).
     pub async fn approvals(&self, status: Option<&str>, bot: Option<Uuid>) -> Result<Vec<Approval>, ApiError> {
         let q = qs(&[("status", status.map(str::to_string)), ("bot_id", bot.map(|b| b.to_string()))]);
         self.get(&format!("/api/approvals{q}")).await
@@ -372,6 +372,10 @@ impl Client {
             b["response"] = json!(r);
         }
         self.mutate(Method::POST, &format!("/api/approvals/{id}"), Some(b), true).await
+    }
+    /// Any decision: edits, a note, ask for changes, always allow (see [`ApprovalDecision`]).
+    pub async fn decide(&self, id: Uuid, d: &ApprovalDecision) -> Result<Decided, ApiError> {
+        self.mutate(Method::POST, &format!("/api/approvals/{id}"), Some(body(d)), true).await
     }
     /// No `bot`: global rules; `bot`: that bot's own rules; `all`: everything.
     pub async fn rules(&self, bot: Option<Uuid>, all: bool) -> Result<Vec<Rule>, ApiError> {
@@ -389,6 +393,14 @@ impl Client {
 
     pub async fn schedules(&self, bot: Uuid) -> Result<Vec<Schedule>, ApiError> {
         self.get(&format!("/api/bots/{bot}/schedules")).await
+    }
+    /// Every teammate's schedules, with label, teammate name and last run.
+    pub async fn all_schedules(&self) -> Result<Vec<Schedule>, ApiError> {
+        self.get("/api/schedules").await
+    }
+    /// Queue a schedule's run now (409 while one is still queued).
+    pub async fn run_schedule(&self, id: Uuid) -> Result<Run, ApiError> {
+        self.mutate(Method::POST, &format!("/api/schedules/{id}/run"), Some(json!({})), true).await
     }
     pub async fn create_schedule(&self, bot: Uuid, s: &NewSchedule) -> Result<Schedule, ApiError> {
         self.mutate(Method::POST, &format!("/api/bots/{bot}/schedules"), Some(body(s)), true).await

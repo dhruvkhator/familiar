@@ -123,3 +123,53 @@ fn request_bodies_skip_unset() {
     assert_eq!(serde_json::to_value(BotPatch { avatar: Some(serde_json::Value::Null), ..Default::default() }).unwrap(), json!({"avatar": null}));
     assert_eq!(serde_json::to_value(LiveInput::click(3, 4)).unwrap(), json!({"type": "click", "x": 3, "y": 4}));
 }
+
+#[test]
+fn drafts_offers_and_decisions() {
+    let a: Approval = de(json!({
+        "id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "tool_name": "propose_draft", "status": "revise",
+        "input": {"kind": "post", "channel": "X", "body": "Hi"}, "editable": ["body", "subject", "to"],
+        "allow_rule": null, "edited_input": {"kind": "post", "channel": "X", "body": "Hello"}, "response": "warmer"
+    }));
+    assert!(a.is_draft());
+    assert_eq!(a.status, ApprovalStatus::Revise);
+    assert_eq!(a.editable, ["body", "subject", "to"]);
+    assert_eq!(a.edited_input.unwrap()["body"], "Hello");
+    // The decide answer: the approval, plus the rule "Always allow" added.
+    let d: Decided = de(json!({
+        "id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "tool_name": "Bash", "status": "approved", "allow_rule": "Bash(git status)",
+        "rule": {"id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f11", "pattern": "Bash(git status)", "decision": "allow"}
+    }));
+    assert_eq!(d.approval.status, ApprovalStatus::Approved);
+    assert!(!d.approval.is_draft());
+    assert_eq!(d.rule.map(|r| (r.pattern, r.decision)), Some(("Bash(git status)".to_owned(), RuleDecision::Allow)));
+    let plain: Decided = de(json!({"tool_name": "Bash", "status": "denied"}));
+    assert!(plain.rule.is_none());
+
+    let body = serde_json::to_value(ApprovalDecision {
+        decision: Some("approve".into()),
+        edits: Some([("body".to_owned(), "Hello".to_owned())].into()),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(body, json!({"decision": "approve", "edits": {"body": "Hello"}}));
+
+    let ev: Event = de(json!({"id": 1, "seq": 2, "kind": "approval",
+        "payload": {"tool_name": "propose_draft", "status": "approved", "decided_by": "user", "edited": true}}));
+    let TypedEvent::Approval(e) = ev.typed() else { panic!() };
+    assert!(e.edited);
+}
+
+#[test]
+fn schedules_page_rows() {
+    let s: Schedule = de(json!({
+        "id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "bot_id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f11", "cron": "0 9 * * 1-5",
+        "prompt": "standup", "kind": "scheduled", "enabled": true, "label": "Morning standup", "bot_name": "Ada",
+        "bot_slug": "ada", "last_status": "succeeded", "last_error": null, "last_finished_at": "2026-10-02T10:00:00Z"
+    }));
+    assert_eq!((s.label.as_deref(), s.bot_name.as_deref()), (Some("Morning standup"), Some("Ada")));
+    assert_eq!(s.last_status, Some(RunStatus::Succeeded));
+    assert!(s.last_finished_at.is_some());
+    let patch = serde_json::to_value(SchedulePatch { label: Some("Standup".into()), ..Default::default() }).unwrap();
+    assert_eq!(patch, json!({"label": "Standup"}));
+}

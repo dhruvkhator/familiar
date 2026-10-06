@@ -37,7 +37,8 @@ tolerant_enum!(EventKind {
     Result = "result", RateLimit = "rate_limit",
 });
 tolerant_enum!(ApprovalStatus {
-    Pending = "pending", Approved = "approved", Denied = "denied", Expired = "expired",
+    // revise: "Ask for changes" on a draft.
+    Pending = "pending", Approved = "approved", Denied = "denied", Expired = "expired", Revise = "revise",
 });
 tolerant_enum!(RuleDecision { Allow = "allow", Deny = "deny", Ask = "ask", Review = "review" });
 tolerant_enum!(Role { User = "user", Assistant = "assistant", System = "system" });
@@ -182,6 +183,8 @@ pub struct ApprovalEvent {
     pub status: Option<String>,
     pub decided_by: Option<String>,
     pub reason: Option<String>,
+    /// The owner changed the input (or the draft) before approving.
+    pub edited: bool,
 }
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ArtifactEvent {
@@ -256,6 +259,7 @@ impl Event {
                 status: s(p, &["status", "decision"]),
                 decided_by: s(p, &["decided_by"]),
                 reason: s(p, &["reason"]),
+                edited: p.get("edited").and_then(Value::as_bool).unwrap_or(false),
             }),
             EventKind::Artifact => match s(p, &["artifact_id", "id"]).and_then(|x| x.parse().ok()) {
                 Some(artifact_id) => TypedEvent::Artifact(ArtifactEvent {
@@ -296,6 +300,28 @@ pub struct Approval {
     pub decided_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub bot_name: Option<String>,
+    /// Input fields the owner may rewrite before approving ("Edit & approve"; a draft's body, subject and to).
+    pub editable: Vec<String>,
+    /// The rule "Always allow this" adds for the teammate; None = not offered.
+    pub allow_rule: Option<String>,
+    /// What the owner approved when they changed it (`input` keeps the proposal).
+    pub edited_input: Option<Value>,
+}
+
+impl Approval {
+    /// A teammate's draft (`propose_draft`): a post, reply, email, DM or comment waiting for the owner.
+    pub fn is_draft(&self) -> bool {
+        self.tool_name == "propose_draft"
+    }
+}
+
+/// `POST /api/approvals/{id}`'s answer: the decided approval, and the rule "Always allow" added (or found).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct Decided {
+    #[serde(flatten)]
+    pub approval: Approval,
+    pub rule: Option<Rule>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -322,6 +348,14 @@ pub struct Schedule {
     pub gate_command: Option<String>,
     pub last_run_at: Option<DateTime<Utc>>,
     pub next_run_at: Option<DateTime<Utc>>,
+    // Only from `GET /api/schedules` (every teammate's schedules):
+    /// Its name: the title of its thread.
+    pub label: Option<String>,
+    pub bot_name: Option<String>,
+    /// How its newest run went.
+    pub last_status: Option<RunStatus>,
+    pub last_error: Option<String>,
+    pub last_finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -600,7 +634,15 @@ body!(
     BotPatch { name: String, persona: String, model: String, paused: bool, engine: String, avatar: Value }
 );
 body!(NewSchedule { cron: String, prompt: String, kind: String, enabled: bool, gate_command: String });
-body!(SchedulePatch { cron: String, prompt: String, kind: String, enabled: bool, gate_command: String });
+body!(SchedulePatch { label: String, cron: String, prompt: String, kind: String, enabled: bool, gate_command: String });
+body!(
+    /// An owner's decision. `decision`: approve | deny | revise (drafts: "Ask for changes"). `response`: the answer to
+    /// a question, or the note on a denial / request for changes. `edits`: new text for the approval's `editable`
+    /// fields. `always`: approve and add its `allow_rule`.
+    ApprovalDecision {
+        decision: String, response: String, edits: std::collections::BTreeMap<String, String>, always: bool,
+    }
+);
 body!(NewRule { bot_id: Uuid, pattern: String, decision: String, note: String });
 body!(MemoryPatch { content: String, status: String });
 body!(NewTrigger { name: String, prompt: String, kind: String });
