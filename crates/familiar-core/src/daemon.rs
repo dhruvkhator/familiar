@@ -217,6 +217,14 @@ async fn listen(ctx: Ctx, mut listener: PgListener, wake: Arc<Notify>, active: A
                         if owner == ctx.db.owner {
                             let ctx = ctx.clone();
                             tokio::spawn(async move {
+                                // Opening a page (the Set up checklist's "Log in to …") starts the bot's browser even
+                                // before its first run, so you can sign in to sites in its own profile.
+                                if ev["type"] == "navigate"
+                                    && let Ok(b) = ctx.db.bot(bot).await
+                                {
+                                    let profiles = ctx.cfg.bots_dir().join(".browsers");
+                                    ctx.browsers.ensure(b.id, &b.slug, profiles, ctx.cfg.browser_bin.as_deref()).await;
+                                }
                                 if let Err(e) = ctx.browsers.input(&ctx.db, bot, &ev).await {
                                     warn!("take-over input failed: {e:#}");
                                 }
