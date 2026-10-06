@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use familiar_client::{
-    Approval, ApprovalStatus, Bot, BotStatus, Client, Coalescer, Delta, DeltaKind, LiveEvent, Notice, Overview, Run,
-    Schedule, resync_wins,
+    Approval, ApprovalDecision, ApprovalStatus, Bot, BotStatus, Client, Coalescer, Delta, DeltaKind, LiveEvent, Notice,
+    Overview, Run, Schedule, resync_wins,
 };
 use familiar_ui::mascot::{Accessory, Avatar, MascotState, resolve_avatar};
 use futures::StreamExt as _;
@@ -67,6 +67,7 @@ pub struct AppData {
     pub runs: Vec<Run>,
     pub runs_loaded: bool,
     pub schedules: Vec<Schedule>,
+    pub schedules_loaded: bool,
     pub live: HashMap<Uuid, LiveBuf>,
     /// Approvals already seen (`None` before the first load): a new one is a notification in attached mode.
     seen_approvals: Option<HashSet<Uuid>>,
@@ -90,6 +91,7 @@ impl AppData {
             runs: Vec::new(),
             runs_loaded: false,
             schedules: Vec::new(),
+            schedules_loaded: false,
             live: HashMap::new(),
             seen_approvals: None,
             active_runs: None,
@@ -281,7 +283,13 @@ impl AppData {
         if let (true, Some(seen)) = (attached, self.seen_approvals.as_ref()) {
             for a in self.pending.iter().filter(|a| !seen.contains(&a.id)) {
                 let bot = a.bot_name.clone().unwrap_or_else(|| self.bot_name(a.bot_id));
-                crate::notify::show("needs", "approval", "Approval needed", format!("{bot} wants to use {}", a.tool_name), cx);
+                if a.is_draft() {
+                    let field = |k: &str| a.input.as_ref().and_then(|i| i[k].as_str()).unwrap_or_default().to_owned();
+                    let body = crate::notify::draft_body(&bot, &field("kind"), &field("channel"));
+                    crate::notify::show("needs", "draft", "Draft to review", body, cx);
+                } else {
+                    crate::notify::show("needs", "approval", "Approval needed", format!("{bot} wants to use {}", a.tool_name), cx);
+                }
             }
         }
         self.seen_approvals.get_or_insert_default().extend(self.pending.iter().map(|a| a.id));
@@ -309,37 +317,22 @@ impl AppData {
         self.runs_loaded = true;
     }
 
+    /// Every teammate's schedules (one call), with their labels and last runs: Today's "Coming up" and Schedules.
     pub fn reload_schedules(&mut self, cx: &mut Context<Self>) {
-        let paths = self.home_paths(|id| format!("/api/bots/{id}/schedules"));
-        let client = self.client.clone();
-        let task = Tokio::spawn(cx, async move {
-            let all = futures::future::join_all(paths.iter().map(|p| client.get::<Vec<Schedule>>(p))).await;
-            all.into_iter().flat_map(|r| r.unwrap_or_default()).collect::<Vec<Schedule>>()
+        self.fetch("/api/schedules".into(), cx, |this, s: Vec<Schedule>, _| {
+            this.schedules = s;
+            this.schedules_loaded = true;
         });
-        cx.spawn(async move |this, cx| {
-            if let Ok(s) = task.await {
-                let _ = this.update(cx, |this, cx| {
-                    this.schedules = s;
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
     }
 
-    /// Decide an approval (`response`: the answer to an `ask_user`). Refreshes pending + overview after.
-    pub fn decide(
-        &mut self,
-        id: Uuid,
-        approve: bool,
-        response: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> Task<Result<(), String>> {
+    /// Decide an approval (approve, deny, ask for changes; with an answer, a note, edits or "always"). Refreshes
+    /// pending + overview after.
+    pub fn decide(&mut self, id: Uuid, d: ApprovalDecision, cx: &mut Context<Self>) -> Task<Result<(), String>> {
         // Hide it at once; a failure brings it back on the reload.
         self.pending.retain(|a| a.id != id);
         cx.notify();
         let client = self.client.clone();
-        let task = Tokio::spawn(cx, async move { client.decide_approval(id, approve, response.as_deref()).await });
+        let task = Tokio::spawn(cx, async move { client.decide(id, &d).await });
         cx.spawn(async move |this, cx| {
             let r = match task.await {
                 Ok(Ok(_)) => Ok(()),
@@ -411,6 +404,8 @@ impl AppData {
                     Some("runs") => {
                         self.reload_runs(cx);
                         self.reload_overview(cx);
+                        // A schedule's last run shows on the Schedules page.
+                        self.reload_schedules(cx);
                     }
                     Some("approvals") => {
                         self.reload_pending(cx);

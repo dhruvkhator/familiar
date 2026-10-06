@@ -931,6 +931,17 @@ impl Gallery {
             bot_name: Some("Ada".into()),
             ..Default::default()
         };
+        let draft = familiar_client::Approval {
+            tool_name: "propose_draft".into(),
+            input: Some(serde_json::json!({
+                "kind": "reply", "channel": "X", "to": "https://x.com/someone/status/1",
+                "body": "Thanks for trying it! Drafts now wait for your OK before anything goes out."
+            })),
+            reason: Some("They asked whether Familiar posts on its own.".into()),
+            created_at: chrono::Utc::now(),
+            bot_name: Some("Ada".into()),
+            ..Default::default()
+        };
         let bot = self.teammates.first().cloned();
         let decide: crate::approval::Decide = std::rc::Rc::new(|_, _, _| {});
         div()
@@ -938,7 +949,8 @@ impl Gallery {
             .flex_col()
             .gap(px(16.0))
             .child(crate::approval::approval_card(&a, bot.as_ref(), None, decide.clone(), false, window, cx))
-            .child(crate::approval::approval_card(&a, bot.as_ref(), None, decide, true, window, cx))
+            .child(crate::approval::approval_card(&a, bot.as_ref(), None, decide.clone(), true, window, cx))
+            .child(crate::approval::approval_card(&draft, bot.as_ref(), None, decide, true, window, cx))
     }
 
     // --- Icons ------------------------------------------------------------------------------------------------

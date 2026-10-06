@@ -2104,6 +2104,7 @@ dependencies = [
  "tokio-util",
  "toml 1.1.6+spec-1.1.0",
  "tracing",
+ "unicode-properties",
  "uuid",
 ]
 
@@ -2174,6 +2175,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "croner",
+ "familiar-core",
  "familiar-crypto",
  "hex",
  "rand 0.10.3",

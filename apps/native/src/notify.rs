@@ -80,6 +80,9 @@ pub fn watch_host(host: familiar_host::Host, cx: &mut App) {
 fn on_signal(signal: familiar_host::Signal, cx: &mut App) {
     use familiar_host::Signal;
     match signal {
+        Signal::ApprovalPending { bot, tool } if tool == "propose_draft" => {
+            show("needs", "draft", "Draft to review", draft_body(&bot, "", ""), cx)
+        }
         Signal::ApprovalPending { bot, tool } => {
             show("needs", "approval", "Approval needed", format!("{bot} wants to use {tool}"), cx)
         }
@@ -91,6 +94,20 @@ fn on_signal(signal: familiar_host::Signal, cx: &mut App) {
     }
 }
 
+/// The body of a new draft's notification: "Ada drafted a post for X. Review it in Needs you." (kind and channel when
+/// known; the daemon's signal only names the teammate).
+pub fn draft_body(bot: &str, kind: &str, channel: &str) -> String {
+    let what = match (kind.trim(), channel.trim()) {
+        ("", _) => "something to send".to_owned(),
+        ("dm", "") => "a message".to_owned(),
+        ("dm", c) => format!("a message for {c}"),
+        ("email", _) => "an email".to_owned(),
+        (k, "") => format!("a {k}"),
+        (k, c) => format!("a {k} for {c}"),
+    };
+    format!("{bot} drafted {what}. Review it in Needs you.")
+}
+
 /// Title and body for a finished run.
 pub fn finished(bot: &str, status: &str) -> (String, String) {
     match status {
@@ -98,5 +115,17 @@ pub fn finished(bot: &str, status: &str) -> (String, String) {
         "failed" => (format!("{bot} ran into a problem"), "The run failed. Open Familiar for the details.".to_owned()),
         "cancelled" => (format!("{bot} stopped"), "The run was cancelled.".to_owned()),
         other => (format!("{bot} finished"), format!("Run {other}.")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn draft_notifications() {
+        assert_eq!(draft_body("Ada", "post", "X"), "Ada drafted a post for X. Review it in Needs you.");
+        assert_eq!(draft_body("Ada", "email", "Gmail"), "Ada drafted an email. Review it in Needs you.");
+        assert_eq!(draft_body("Ada", "", ""), "Ada drafted something to send. Review it in Needs you.");
     }
 }

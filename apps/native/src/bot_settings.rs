@@ -92,6 +92,8 @@ pub struct BotSettings {
     answers: Vec<(String, String, Answer)>,
     /// Connector names for the template's suggestions.
     presets: Vec<ConnectorPreset>,
+    /// Edit mode: this teammate's own allow rules ("Always allow" on an approval adds them), to see and remove.
+    allowed: Option<Vec<familiar_client::Rule>>,
 }
 
 impl EventEmitter<CreateEvent> for BotSettings {}
@@ -221,8 +223,12 @@ impl BotSettings {
             template: None,
             answers: Vec::new(),
             presets: Vec::new(),
+            allowed: None,
         };
         this.load_catalog(cx);
+        if !create {
+            this.load_allowed(cx);
+        }
         // The plan check reports through the computer's minute heartbeat: look again while it is still running.
         cx.spawn(async move |this, cx| {
             loop {
@@ -795,6 +801,85 @@ pub(crate) fn checkbox(on: bool, theme: &Theme) -> gpui::Div {
         .when(on, |el| el.child(icons::icon(icons::CHECK).size(px(13.0)).text_color(theme.accent_ink)))
 }
 
+impl BotSettings {
+    fn load_allowed(&mut self, cx: &mut Context<Self>) {
+        let client = self.data.read(cx).client.clone();
+        crate::data::swr(self, &client, format!("/api/rules?bot_id={}", self.bot), cx, |this, list: Vec<familiar_client::Rule>, _| {
+            this.allowed = Some(list.into_iter().filter(|r| r.decision == familiar_client::RuleDecision::Allow).collect());
+        });
+    }
+
+    fn remove_rule(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        let client = self.data.read(cx).client.clone();
+        if let Some(list) = self.allowed.as_mut() {
+            list.retain(|r| r.id != id);
+        }
+        cx.notify();
+        let task = Tokio::spawn(cx, async move { client.delete_rule(id).await });
+        cx.spawn(async move |this, cx| {
+            let r = task.await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.message()));
+            let _ = this.update(cx, |this, cx| {
+                match r {
+                    Ok(()) => this.toasts.update(cx, |t, cx| t.push(Tone::Ok, "It asks you again from now on", None, cx)),
+                    Err(e) => this.toasts.update(cx, |t, cx| t.push(Tone::Bad, "Couldn't remove that", Some(e.into()), cx)),
+                }
+                this.data.read(cx).client.invalidate("/api/rules");
+                this.load_allowed(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// "Allowed without asking": the teammate's allow rules in plain words, each with Remove.
+    fn allowed_view(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let list = self.allowed.as_ref()?;
+        let mut col = div().flex().flex_col().gap(px(6.0)).child(label("Allowed without asking"));
+        if list.is_empty() {
+            col = col.child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(
+                "Nothing yet. \"Always allow\" on an approval adds a rule here; it takes effect at once and you can remove it.",
+            ));
+        }
+        for r in list {
+            let id = r.id;
+            let this = cx.entity();
+            col = col.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(theme.sunken)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_size(px(text::SMALL)).text_color(theme.ink).child(crate::approval::rule_words(&r.pattern)))
+                            .child(
+                                div()
+                                    .font_family(theme.font_mono.clone())
+                                    .text_size(px(text::CAPTION))
+                                    .text_color(theme.muted)
+                                    .truncate()
+                                    .child(crate::approval::reveal(&r.pattern, false).0),
+                            ),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("bs-rule-{id}")), "Remove")
+                            .size(ButtonSize::Small)
+                            .ghost()
+                            .on_click(move |_, _, cx| this.update(cx, |p, cx| p.remove_rule(id, cx))),
+                    ),
+            );
+        }
+        Some(col.into_any_element())
+    }
+}
+
 fn label(s: &'static str) -> gpui::Div {
     div().text_size(px(text::SMALL)).font_weight(FontWeight::MEDIUM).child(s)
 }
@@ -972,6 +1057,7 @@ impl Render for BotSettings {
                     )
                     .child(div().flex().flex_col().gap(px(6.0)).child(label("Model")).child(model_control)),
             )
+            .when_some(if create { None } else { self.allowed_view(cx) }, |el, v| el.child(v))
             .when_some(summary, |el, summary| {
                 el.child(div().flex().flex_col().gap(px(6.0)).child(label("What it sets up")).child(summary))
             })

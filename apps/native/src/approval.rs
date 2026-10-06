@@ -1,24 +1,32 @@
-//! The approval card (the web's `components/ApprovalCard.tsx`): a tool call waiting for a decision, or an `ask_user`
-//! question waiting for an answer. Shared by Today, the chat's run card and the Needs you inbox.
+//! The approval card (the web's `components/ApprovalCard.tsx`): a tool call waiting for a decision, an `ask_user`
+//! question waiting for an answer, or a teammate's draft (a post, reply, email, DM or comment from `propose_draft`)
+//! waiting for the owner to approve it, edit it, send it back or reject it. Shared by Today, the chat's run card and
+//! the Needs you inbox.
 //!
 //! Approving must never be blind: every tool input is shown with its hidden characters written out (bidi overrides,
 //! zero-width and control characters as `⟨U+202E⟩`, flagged "Contains hidden characters"); compact cards show the
 //! start and end of a long input and send you to the inbox (the whole input, verbatim) instead of offering Approve;
-//! the model's own explanation is labelled as its words.
+//! the model's own explanation is labelled as its words. A draft's text is shown whole in its edit boxes, with any
+//! hidden characters taken out of what you approve (and the original shown written out).
+//!
+//! Besides approve and deny a card offers what the daemon allowed for it: "Edit & approve" (the approval's
+//! `editable` fields; the daemon checks the edit again before it runs), a note with a denial (Claude only: Codex
+//! approvals carry no message) and "Always allow" (the approval's `allow_rule`, confirmed first).
 
-use std::collections::HashMap;
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
-use familiar_client::Approval;
+use familiar_client::{Approval, ApprovalDecision, BotEngine};
 use familiar_ui::anim;
 use familiar_ui::icons;
 use familiar_ui::components::{Button, ButtonSize, card, chip};
 use familiar_ui::toast::ToastStack;
 use familiar_ui::mascot::{Mascot, MascotState};
-use familiar_ui::theme::{RADIUS_CHIP, Theme, Tone, text};
+use familiar_ui::theme::{RADIUS_CHIP, RADIUS_CONTROL, Theme, Tone, text};
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_base::input::{InputEvent, TextareaState};
 use uuid::Uuid;
@@ -27,7 +35,55 @@ use serde_json::Value;
 use crate::data::{AppData, Teammate, ago};
 use crate::text_input;
 
-pub type Decide = Rc<dyn Fn(bool, &mut Window, &mut App)>;
+/// What the owner chose on a card.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Choice {
+    /// Approve as shown: a question with the answer box, a draft with whatever the owner changed in its fields.
+    Approve,
+    /// Approve the owner's edit of a tool call's input ("Edit & approve").
+    ApproveEdited,
+    /// Approve and add the offered rule ("Always allow").
+    AlwaysAllow,
+    /// Deny (Skip, Reject), with the note if one was written.
+    Deny,
+    /// A draft goes back to the teammate for changes, with the note.
+    Revise,
+}
+
+pub type Decide = Rc<dyn Fn(Choice, &mut Window, &mut App)>;
+
+/// The extra part of a card that is open.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Panel {
+    #[default]
+    None,
+    /// The tool call's editable field.
+    Edit,
+    /// A note for the teammate, sent with this choice (Deny or Revise).
+    Note(Choice),
+    /// "Always allow": what it allows, to confirm.
+    Always,
+}
+
+/// A card's own text boxes and open panel, kept across renders by [`ApprovalCards`].
+pub struct CardState {
+    pub answer: Option<Entity<TextareaState>>,
+    /// The fields the owner may edit, with their boxes: a draft's to / subject / body (always shown), or the field of a
+    /// tool call that "Edit & approve" offers.
+    pub fields: Vec<(String, Entity<TextareaState>)>,
+    /// What each field started as (a draft's without hidden characters), to tell an edit.
+    pub start: Vec<String>,
+    pub note: Entity<TextareaState>,
+    pub panel: Rc<Cell<Panel>>,
+    /// The teammate's engine passes a note on to the model (Codex approvals are accept / decline only).
+    pub can_note: bool,
+}
+
+/// What a card needs besides the approval: its state, and a way to open a panel.
+pub struct CardUi<'a> {
+    pub state: &'a CardState,
+    pub set_panel: Rc<dyn Fn(Panel, &mut Window, &mut App)>,
+}
 
 pub fn is_ask(a: &Approval) -> bool {
     a.tool_name == "ask_user"
@@ -179,6 +235,105 @@ pub fn reveal(s: &str, multiline: bool) -> (String, bool) {
     (out, hidden)
 }
 
+/// `s` without its hidden characters (what a draft's edit box starts from).
+pub fn strip_hidden(s: &str, multiline: bool) -> String {
+    s.chars().filter(|c| !hidden_char(*c, multiline)).collect()
+}
+
+/// A draft field as proposed.
+pub fn draft_field<'a>(a: &'a Approval, key: &str) -> Option<&'a str> {
+    a.input.as_ref().and_then(|i| i.get(key)).and_then(Value::as_str)
+}
+
+/// The draft fields a card shows, in order: who it goes to (when it has a recipient or its kind needs one), the subject
+/// (emails), the text.
+pub fn draft_keys(a: &Approval) -> Vec<&'static str> {
+    let kind = draft_field(a, "kind").unwrap_or_default();
+    let mut keys = Vec::new();
+    if draft_field(a, "to").is_some() || matches!(kind, "reply" | "email" | "dm" | "comment") {
+        keys.push("to");
+    }
+    if draft_field(a, "subject").is_some() || kind == "email" {
+        keys.push("subject");
+    }
+    keys.push("body");
+    keys.into_iter().filter(|k| a.editable.iter().any(|e| e == k) || a.editable.is_empty()).collect()
+}
+
+/// What the teammate wants to do with a draft, after "Ada wants to …".
+pub fn draft_action(kind: &str, channel: &str) -> String {
+    match kind {
+        "post" => format!("post this on {channel}"),
+        "reply" => format!("reply on {channel}"),
+        "email" => format!("send this email ({channel})"),
+        "dm" => format!("send a message on {channel}"),
+        "comment" => format!("comment on {channel}"),
+        _ => format!("send this on {channel}"),
+    }
+}
+
+/// The length limit of a draft's text where it goes, with the network's name: X 280, Instagram captions 2,200,
+/// LinkedIn connection notes 300 and posts 3,000, Threads 500, Bluesky 300.
+pub fn char_limit(channel: &str, kind: &str) -> Option<(usize, &'static str)> {
+    let c = channel.trim().to_lowercase();
+    match c.as_str() {
+        "x" | "twitter" | "x.com" | "x (twitter)" => Some((280, "X")),
+        "instagram" | "ig" => Some((2200, "Instagram")),
+        "linkedin" if kind == "dm" => Some((300, "LinkedIn notes")),
+        "linkedin" => Some((3000, "LinkedIn")),
+        "threads" => Some((500, "Threads")),
+        "bluesky" | "bsky" => Some((300, "Bluesky")),
+        _ => None,
+    }
+}
+
+/// A short mark for a channel's tile (no brand logos are bundled): "X", "IG", "in", "@" for email, else initials.
+pub fn channel_mark(channel: &str, kind: &str) -> String {
+    let c = channel.trim().to_lowercase();
+    match c.as_str() {
+        "x" | "twitter" | "x.com" => "X".into(),
+        "instagram" => "IG".into(),
+        "linkedin" => "in".into(),
+        "reddit" => "r/".into(),
+        "hacker news" | "hn" => "Y".into(),
+        _ if kind == "email" || c.contains("mail") => "@".into(),
+        _ => channel.split_whitespace().filter_map(|w| w.chars().next()).take(2).collect::<String>().to_uppercase(),
+    }
+}
+
+/// The fields whose text changed from where they started (trimmed, as the API stores drafts): the edits to send.
+pub fn changed_fields(values: &[(String, String)], start: &[String]) -> BTreeMap<String, String> {
+    values
+        .iter()
+        .zip(start)
+        .filter(|((_, v), s)| v.trim() != s.trim())
+        .map(|((k, v), _)| (k.clone(), v.trim().to_owned()))
+        .collect()
+}
+
+/// What an "Always allow" rule lets the teammate do, after "From now on, Ada may …".
+pub fn rule_words(rule: &str) -> String {
+    if let Some(cmd) = rule.strip_prefix("Bash(").and_then(|r| r.strip_suffix(')')) {
+        if cmd.contains('*') {
+            // An owner-written pattern.
+            return format!("run commands like `{cmd}`");
+        }
+        return format!("run exactly `{cmd}` (that command, nothing longer or chained)");
+    }
+    match rule {
+        "Bash" => "run any command (except those that always need you)".into(),
+        "*" => "use any tool (except actions that always need you)".into(),
+        "Write" => "create and overwrite files in its workspace".into(),
+        "Edit" | "MultiEdit" | "NotebookEdit" => "change files in its workspace".into(),
+        r if r.starts_with("mcp__") => {
+            let mut parts = r.trim_start_matches("mcp__").splitn(2, "__");
+            let (server, tool) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
+            format!("use {}'s {} (it only reads)", server, tool.replace('_', " "))
+        }
+        r => format!("use {r}"),
+    }
+}
+
 /// What a compact card can show in full: one line of at most this many characters.
 const COMPACT_FITS: usize = 200;
 /// How much of each end a compact card shows of a longer input.
@@ -214,11 +369,11 @@ impl gpui::Global for InboxOpener {}
 
 /// `big`: the inbox's card (plain-language action, the whole input verbatim, large buttons). A compact card shows the
 /// start and end of a long or multi-line input and offers "Review…" (the inbox) instead of Approve: nothing is
-/// approved unseen. Deny is always there.
+/// approved unseen. Deny is always there. `ui`: the card's boxes and panels (None: approve / deny only).
 pub fn approval_card(
     a: &Approval,
     bot: Option<&Teammate>,
-    answer: Option<&Entity<TextareaState>>,
+    ui: Option<CardUi<'_>>,
     decide: Decide,
     big: bool,
     window: &mut Window,
@@ -226,17 +381,23 @@ pub fn approval_card(
 ) -> AnyElement {
     let theme = Theme::of(cx).clone();
     let ask = is_ask(a);
+    let draft = a.is_draft();
     let question = question(a).filter(|_| ask).map(|q| reveal(&q, true));
-    let detail = if ask { None } else { detail_of(a.input.as_ref()) };
+    let detail = if ask || draft { None } else { detail_of(a.input.as_ref()) };
     let name: SharedString = a.bot_name.clone().map(Into::into).or_else(|| bot.map(|b| b.name.clone())).unwrap_or_default();
     let who = if name.is_empty() { "A teammate".to_owned() } else { reveal(&name, false).0 };
     let size = if big { ButtonSize::Large } else { ButtonSize::Medium };
-    let answer_blank = answer.is_some_and(|s| s.read(cx).value().trim().is_empty());
     let id = a.id;
+    let key = id.as_u128() as u64;
+    let panel = ui.as_ref().map(|u| u.state.panel.get()).unwrap_or_default();
     let (risk_label, risk_tone) = risk_of(&a.tool_name);
-    let hidden = detail.as_ref().is_some_and(|d| d.hidden) || question.as_ref().is_some_and(|q| q.1);
+    let draft_hidden = draft
+        && ["kind", "channel", "to", "subject", "body"].iter().any(|k| draft_field(a, k).is_some_and(|v| reveal(v, *k == "body").1));
+    let hidden = detail.as_ref().is_some_and(|d| d.hidden) || question.as_ref().is_some_and(|q| q.1) || draft_hidden;
     // Compact cards only approve what they show whole.
-    let review = !big && !ask && (hidden || detail.as_ref().is_some_and(needs_review));
+    let review = !big && !ask && !draft && (hidden || detail.as_ref().is_some_and(needs_review));
+    let channel = reveal(draft_field(a, "channel").unwrap_or("its channel"), false).0;
+    let kind = reveal(draft_field(a, "kind").unwrap_or("other"), false).0;
 
     let header = div()
         .flex()
@@ -244,13 +405,17 @@ pub fn approval_card(
         .gap(px(8.0))
         .flex_wrap()
         .child(div().font_weight(FontWeight::MEDIUM).child(SharedString::from(who.clone())))
-        .child(chip(Tone::Warn, if ask { "question" } else { "needs approval" }, cx))
-        .when(!ask, |el| el.child(chip(risk_tone, risk_label, cx)))
+        .child(match (ask, draft) {
+            (true, _) => chip(Tone::Warn, "question", cx),
+            (_, true) => chip(Tone::Accent, format!("draft {kind}"), cx),
+            _ => chip(Tone::Warn, "needs approval", cx),
+        })
+        .when(!ask && !draft, |el| el.child(chip(risk_tone, risk_label, cx)))
         .when(hidden, |el| {
-            let tone = if risk_tone == Tone::Muted { Tone::Warn } else { risk_tone };
+            let tone = if risk_tone == Tone::Muted || draft { Tone::Warn } else { risk_tone };
             el.child(chip(tone, "Contains hidden characters", cx))
         })
-        .when(!ask, |el| {
+        .when(!ask && !draft, |el| {
             el.child(
                 div()
                     .font_family(theme.font_mono.clone())
@@ -265,39 +430,53 @@ pub fn approval_card(
     let mut body = div().flex().flex_col().flex_1().min_w_0().gap(px(10.0)).child(header);
     // Familiar's own words about the action come first and read loudest.
     if !ask {
+        let action = if draft { draft_action(&kind, &channel) } else { action_of(&a.tool_name).to_lowercase() };
         body = body.child(
             div()
-                .text_size(px(if big { text::LEAD } else { text::BODY }))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.ink)
-                .child(SharedString::from(format!("{who} wants to {}", action_of(&a.tool_name).to_lowercase()))),
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .when(draft, |el| el.child(channel_tile(&channel_mark(&channel, &kind), &theme)))
+                .child(
+                    div()
+                        .text_size(px(if big { text::LEAD } else { text::BODY }))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.ink)
+                        .child(SharedString::from(format!("{who} wants to {action}"))),
+                ),
         );
     }
     if let Some((q, _)) = question {
         body = body.child(div().text_color(theme.ink).when(big, |el| el.text_size(px(text::LEAD))).child(q));
     }
-    if let Some(d) = detail {
-        let border = if risk_tone == Tone::Bad { theme.bad } else { theme.warn };
-        let block = || div()
+    let caption = |s: SharedString| {
+        div().text_size(px(text::CAPTION)).font_weight(FontWeight::MEDIUM).text_color(theme.muted).child(s)
+    };
+    let block = |big: bool| {
+        div()
             .px(px(12.0))
             .py(px(9.0))
             .rounded(px(RADIUS_CHIP))
             .bg(theme.sunken)
             .border_l_2()
-            .border_color(border)
             .font_family(theme.font_mono.clone())
             .text_size(px(if big { text::SMALL } else { text::CAPTION }))
-            .text_color(theme.ink);
-        let shown = |content: &str, key: &str| {
-            let b = block();
+            .text_color(theme.ink)
+    };
+    if draft {
+        body = body.child(draft_fields(a, ui.as_ref(), big, draft_hidden, window, cx));
+    }
+    if let Some(d) = detail {
+        let border = if risk_tone == Tone::Bad { theme.bad } else { theme.warn };
+        let shown = |content: &str, k: &str| {
+            let b = block(big).border_color(border);
             if big {
                 // The whole input, verbatim and unclipped (the page scrolls, not a box inside it).
-                b.id(SharedString::from(format!("approval-{key}-{id}"))).child(content.to_owned()).into_any_element()
+                b.id(SharedString::from(format!("approval-{k}-{id}"))).child(content.to_owned()).into_any_element()
             } else {
                 b.child(head_tail(content, COMPACT_END)).into_any_element()
             }
         };
-        let caption = |s: &'static str| div().text_size(px(text::CAPTION)).font_weight(FontWeight::MEDIUM).text_color(theme.muted).child(s);
         let main = shown(&d.text, "input");
         let others = (!d.others.is_empty()).then(|| shown(&d.others, "others"));
         body = body.child(
@@ -305,9 +484,9 @@ pub fn approval_card(
                 .flex()
                 .flex_col()
                 .gap(px(4.0))
-                .child(caption(d.label))
+                .child(caption(d.label.into()))
                 .child(main)
-                .when_some(others, |el, o| el.child(div().mt(px(6.0)).child(caption("Other inputs"))).child(o))
+                .when_some(others, |el, o| el.child(div().mt(px(6.0)).child(caption("Other inputs".into()))).child(o))
                 .when(review, |el| {
                     el.child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(if hidden {
                         "It has hidden characters: review the whole input before approving."
@@ -329,55 +508,77 @@ pub fn approval_card(
                 .child(SharedString::from(format!("{who} says: “{r}”"))),
         );
     }
-    if let Some(state) = answer.filter(|_| ask) {
-        body = body.child(text_input::field(("answer", id.as_u128() as u64), state, 60.0, window, cx));
+    if let Some(state) = ui.as_ref().and_then(|u| u.state.answer.as_ref()).filter(|_| ask) {
+        body = body.child(text_input::field(("answer", key), state, 60.0, window, cx));
     }
-    let (d1, d2) = (decide.clone(), decide);
-    let buttons = if ask {
-        div()
-            .flex()
-            .gap(px(8.0))
-            .child(div().flex_1().child(Button::new(("skip", id.as_u128() as u64), "Skip").size(size).full_width().on_click(
-                move |_, w, cx| d1(false, w, cx),
-            )))
-            .child(
-                div().flex_1().child(
-                    Button::new(("send-answer", id.as_u128() as u64), "Send answer")
-                        .primary()
-                        .size(size)
-                        .full_width()
-                        .disabled(answer_blank)
-                        .on_click(move |_, w, cx| d2(true, w, cx)),
-                ),
-            )
-    } else {
-        let approve = if review {
-            Button::new(("review", id.as_u128() as u64), "Review…").primary().size(size).icon(icons::EYE).full_width().on_click(
-                |_, _, cx| {
-                    if let Some(open) = cx.try_global::<InboxOpener>().map(|o| o.0.clone()) {
-                        open(cx);
-                    }
-                },
-            )
-        } else {
-            Button::new(("approve", id.as_u128() as u64), "Approve")
-                .primary()
-                .size(size)
-                .icon(icons::CHECK)
-                .full_width()
-                .on_click(move |_, w, cx| d2(true, w, cx))
-        };
-        div()
-            .flex()
-            .gap(px(8.0))
-            .child(div().flex_1().child(
-                Button::new(("decline", id.as_u128() as u64), "Deny").danger().size(size).full_width().on_click(
-                    move |_, w, cx| d1(false, w, cx),
-                ),
-            ))
-            .child(div().flex_1().child(approve))
-    };
-    body = body.child(buttons);
+
+    // Panels: the tool call's edit box, a note, the "Always allow" confirmation.
+    if let Some(u) = ui.as_ref() {
+        match panel {
+            Panel::Edit if !draft => {
+                if let Some((field, state)) = u.state.fields.first() {
+                    body = body.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .child(caption(format!("Your version of the {field}").into()))
+                            .child(text_input::field(("edit", key), state, 38.0, window, cx))
+                            .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(
+                                "Familiar checks your version like any other request before it runs; some changes need one more OK.",
+                            )),
+                    );
+                }
+            }
+            Panel::Note(choice) => {
+                let label = match (choice, draft) {
+                    (Choice::Revise, _) => format!("What should {who} change?"),
+                    (_, true) => format!("Why not? {who} reads this (optional)"),
+                    _ => format!("Tell {who} why (optional)"),
+                };
+                body = body.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .child(caption(label.into()))
+                        .child(text_input::field(("note", key), &u.state.note, 38.0, window, cx)),
+                );
+            }
+            Panel::Always => {
+                if let Some(rule) = a.allow_rule.as_deref() {
+                    body = body.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .px(px(12.0))
+                            .py(px(10.0))
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(theme.accent_soft)
+                            .child(div().font_weight(FontWeight::MEDIUM).text_color(theme.ink).child("Always allow this?"))
+                            .child(div().text_size(px(text::SMALL)).text_color(theme.ink).child(SharedString::from(format!(
+                                "From now on, {who} may {} without asking you.",
+                                rule_words(rule)
+                            ))))
+                            .child(
+                                div()
+                                    .font_family(theme.font_mono.clone())
+                                    .text_size(px(text::CAPTION))
+                                    .text_color(theme.muted)
+                                    .child(SharedString::from(format!("Rule: {}", reveal(rule, false).0))),
+                            )
+                            .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(
+                                "Only this teammate, from its next step on. Your deny rules and actions that always need you still win.                                  Remove it any time: its Settings tab, under Allowed without asking.",
+                            )),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    body = body.child(buttons(a, ui.as_ref(), decide, panel, review, size, cx));
 
     card(cx)
         .p(px(if big { 20.0 } else { 16.0 }))
@@ -391,10 +592,245 @@ pub fn approval_card(
         .into_any_element()
 }
 
-/// Approval cards with their answer boxes, for any view that lists approvals.
+/// The channel's tile beside a draft's action line.
+fn channel_tile(mark: &str, theme: &Theme) -> gpui::Div {
+    div()
+        .flex_none()
+        .size(px(28.0))
+        .rounded(px(8.0))
+        .bg(theme.ink)
+        .text_color(theme.bg)
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(text::CAPTION))
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(SharedString::from(mark.to_owned()))
+}
+
+/// A draft's fields: editable boxes (to, subject, text with its length and the network's limit), attached files, and the
+/// original written out when it had hidden characters. Without `ui` (the gallery) the text is shown read-only.
+fn draft_fields(a: &Approval, ui: Option<&CardUi<'_>>, big: bool, hidden: bool, window: &mut Window, cx: &mut App) -> AnyElement {
+    let theme = Theme::of(cx).clone();
+    let key = a.id.as_u128() as u64;
+    let channel = draft_field(a, "channel").unwrap_or_default();
+    let kind = draft_field(a, "kind").unwrap_or_default();
+    let label = |k: &str| match k {
+        "to" if kind == "email" => "To",
+        "to" if matches!(kind, "reply" | "comment") => "Replying to",
+        "to" => "To",
+        "subject" => "Subject",
+        _ => "Text",
+    };
+    let caption = |s: &str| {
+        div().text_size(px(text::CAPTION)).font_weight(FontWeight::MEDIUM).text_color(theme.muted).child(s.to_owned())
+    };
+    let mut col = div().flex().flex_col().gap(px(10.0));
+    match ui {
+        Some(u) => {
+            for (i, (field, state)) in u.state.fields.iter().enumerate() {
+                let min_h = if field == "body" { if big { 96.0 } else { 60.0 } } else { 38.0 };
+                let mut f = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(caption(label(field)))
+                    .child(text_input::field(("draft", key * 8 + i as u64), state, min_h, window, cx));
+                if field == "body" {
+                    let value = state.read(cx).value().to_string();
+                    let n = value.trim().chars().count();
+                    let edited = u.state.start.get(i).is_some_and(|s| s.trim() != value.trim());
+                    let (count, tone) = match char_limit(channel, kind) {
+                        Some((max, net)) if n > max => (format!("{n} / {max}: too long for {net}"), theme.bad),
+                        Some((max, net)) => (format!("{n} / {max} characters ({net})"), theme.muted),
+                        None => (format!("{n} characters"), theme.muted),
+                    };
+                    f = f.child(
+                        div()
+                            .flex()
+                            .gap(px(8.0))
+                            .text_size(px(text::CAPTION))
+                            .child(div().text_color(tone).child(count))
+                            .when(u.state.fields.iter().zip(&u.state.start).any(|((_, s), st)| s.read(cx).value().trim() != st.trim()) || edited, |el| {
+                                el.child(div().text_color(theme.accent).child("· Edited by you"))
+                            }),
+                    );
+                }
+                col = col.child(f);
+            }
+        }
+        None => {
+            for k in draft_keys(a) {
+                let v = reveal(draft_field(a, k).unwrap_or_default(), k == "body").0;
+                col = col.child(
+                    div().flex().flex_col().gap(px(4.0)).child(caption(label(k))).child(
+                        div().px(px(12.0)).py(px(9.0)).rounded(px(RADIUS_CHIP)).bg(theme.sunken).text_color(theme.ink).child(v),
+                    ),
+                );
+            }
+        }
+    }
+    if let Some(media) = a.input.as_ref().and_then(|i| i["media"].as_array()).filter(|m| !m.is_empty()) {
+        let names: Vec<String> = media.iter().filter_map(Value::as_str).map(|m| reveal(m, false).0).collect();
+        col = col.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .flex_wrap()
+                .child(caption("Attached"))
+                .children(names.into_iter().map(|n| chip(Tone::Muted, n, cx))),
+        );
+    }
+    if hidden {
+        // What the teammate wrote, written out, so the owner sees what was taken out.
+        let mut original = String::new();
+        for k in ["to", "subject", "body"] {
+            if let Some(v) = draft_field(a, k) {
+                original.push_str(&format!("{}: {}\n", label(k), reveal(v, k == "body").0));
+            }
+        }
+        let original = if big { original } else { head_tail(&original, COMPACT_END) };
+        col = col.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(div().text_size(px(text::CAPTION)).text_color(theme.warn).child(
+                    "It had hidden characters (written out below). They are taken out of the text you approve.",
+                ))
+                .child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(9.0))
+                        .rounded(px(RADIUS_CHIP))
+                        .bg(theme.sunken)
+                        .border_l_2()
+                        .border_color(theme.warn)
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(text::CAPTION))
+                        .child(original.trim_end().to_owned()),
+                ),
+        );
+    }
+    col.into_any_element()
+}
+
+/// The card's buttons for its kind and open panel.
+fn buttons(a: &Approval, ui: Option<&CardUi<'_>>, decide: Decide, panel: Panel, review: bool, size: ButtonSize, cx: &mut App) -> AnyElement {
+    let key = a.id.as_u128() as u64;
+    let ask = is_ask(a);
+    let draft = a.is_draft();
+    let pick = |c: Choice| {
+        let d = decide.clone();
+        move |_: &gpui::ClickEvent, w: &mut Window, cx: &mut App| d(c, w, cx)
+    };
+    let open = |p: Panel| {
+        let set = ui.map(|u| u.set_panel.clone());
+        move |_: &gpui::ClickEvent, w: &mut Window, cx: &mut App| {
+            if let Some(set) = set.as_ref() {
+                set(p, w, cx)
+            }
+        }
+    };
+    let half = |b: Button| div().flex_1().child(b.size(size).full_width());
+    let row = || div().flex().gap(px(8.0));
+    let blank = |s: &Entity<TextareaState>, cx: &App| s.read(cx).value().trim().is_empty();
+
+    if ask {
+        let answer_blank = ui.and_then(|u| u.state.answer.as_ref()).is_some_and(|s| blank(s, cx));
+        return row()
+            .child(half(Button::new(("skip", key), "Skip").on_click(pick(Choice::Deny))))
+            .child(half(Button::new(("send-answer", key), "Send answer").primary().disabled(answer_blank).on_click(pick(Choice::Approve))))
+            .into_any_element();
+    }
+    let cancel = || half(Button::new(("cancel", key), "Cancel").ghost().on_click(open(Panel::None)));
+    match panel {
+        Panel::Note(choice) if ui.is_some() => {
+            let note_blank = ui.is_some_and(|u| blank(&u.state.note, cx));
+            let (label, danger) = match (choice, draft) {
+                (Choice::Revise, _) => ("Send back for changes", false),
+                (_, true) => ("Reject", true),
+                _ => ("Deny", true),
+            };
+            let mut b = Button::new(("note-send", key), label).on_click(pick(choice));
+            b = if danger { b.danger() } else { b.primary().disabled(note_blank) };
+            return row().child(cancel()).child(half(b)).into_any_element();
+        }
+        Panel::Edit if ui.is_some() && !draft => {
+            let empty = ui.and_then(|u| u.state.fields.first()).is_none_or(|(_, s)| blank(s, cx));
+            return row()
+                .child(cancel())
+                .child(half(Button::new(("approve-edit", key), "Approve my version").primary().icon(icons::CHECK).disabled(empty).on_click(pick(Choice::ApproveEdited))))
+                .into_any_element();
+        }
+        Panel::Always if ui.is_some() && a.allow_rule.is_some() => {
+            return row()
+                .child(cancel())
+                .child(half(Button::new(("approve-always", key), "Approve and always allow").primary().icon(icons::CHECK).on_click(pick(Choice::AlwaysAllow))))
+                .into_any_element();
+        }
+        _ => {}
+    }
+    let can_note = ui.is_some_and(|u| u.state.can_note);
+    if draft {
+        let edited = ui.is_some_and(|u| {
+            u.state.fields.iter().zip(&u.state.start).any(|((_, s), st)| s.read(cx).value().trim() != st.trim())
+        });
+        let body_blank = ui.and_then(|u| u.state.fields.iter().find(|(k, _)| k == "body")).is_some_and(|(_, s)| blank(s, cx));
+        let reject = Button::new(("reject", key), "Reject").danger();
+        let reject = if can_note { reject.on_click(open(Panel::Note(Choice::Deny))) } else { reject.on_click(pick(Choice::Deny)) };
+        return row()
+            .child(half(reject))
+            .when(can_note, |el| el.child(half(Button::new(("revise", key), "Ask for changes").on_click(open(Panel::Note(Choice::Revise))))))
+            .child(half(
+                Button::new(("approve", key), if edited { "Approve with edits" } else { "Approve" })
+                    .primary()
+                    .icon(icons::CHECK)
+                    .disabled(body_blank)
+                    .on_click(pick(Choice::Approve)),
+            ))
+            .into_any_element();
+    }
+    let approve = if review {
+        Button::new(("review", key), "Review…").primary().icon(icons::EYE).on_click(|_, _, cx| {
+            if let Some(open) = cx.try_global::<InboxOpener>().map(|o| o.0.clone()) {
+                open(cx);
+            }
+        })
+    } else {
+        Button::new(("approve", key), "Approve").primary().icon(icons::CHECK).on_click(pick(Choice::Approve))
+    };
+    let main = row().child(half(Button::new(("decline", key), "Deny").danger().on_click(pick(Choice::Deny)))).child(half(approve));
+    let Some(u) = ui else { return main.into_any_element() };
+    let can_edit = !review && !u.state.fields.is_empty();
+    let can_always = !review && a.allow_rule.is_some();
+    let small = |id: &'static str, label: &'static str, glyph: &'static str, p: Panel| {
+        Button::new((id, key), label).ghost().size(ButtonSize::Small).icon(glyph).on_click(open(p))
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(main)
+        .when(can_edit || can_note || can_always, |el| {
+            el.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(4.0))
+                    .when(can_edit, |el| el.child(small("edit-open", "Edit & approve", icons::PEN, Panel::Edit)))
+                    .when(can_note, |el| el.child(small("note-open", "Deny with a note", icons::CHAT_ROUND_LINE, Panel::Note(Choice::Deny))))
+                    .when(can_always, |el| el.child(small("always-open", "Always allow…", icons::STAR, Panel::Always))),
+            )
+        })
+        .into_any_element()
+}
+
+/// Approval cards with their boxes, for any view that lists approvals.
 #[derive(Default)]
 pub struct ApprovalCards {
-    answers: HashMap<Uuid, Entity<TextareaState>>,
+    cards: HashMap<Uuid, CardState>,
     big: bool,
 }
 
@@ -402,6 +838,50 @@ impl ApprovalCards {
     /// The inbox's large cards.
     pub fn big() -> Self {
         Self { big: true, ..Default::default() }
+    }
+
+    /// The boxes of a card, made once per approval.
+    fn state<V: 'static>(&mut self, a: &Approval, can_note: bool, window: &mut Window, cx: &mut Context<V>) -> &CardState {
+        let big = self.big;
+        self.cards.entry(a.id).or_insert_with(|| {
+            let mut boxes = Vec::new();
+            let mut new_box = |placeholder: &str, rows: usize, value: &str, window: &mut Window, cx: &mut Context<V>| {
+                let state = text_input::new_field(placeholder.to_owned(), false, rows, window, cx);
+                if !value.is_empty() {
+                    let v = value.to_owned();
+                    state.update(cx, |s, cx| s.set_value(v, window, cx));
+                }
+                cx.subscribe(&state, |_, _, _: &InputEvent, cx| cx.notify()).detach();
+                boxes.push(state.clone());
+                state
+            };
+            let answer = is_ask(a).then(|| new_box("Your answer", 4, "", window, cx));
+            let (mut fields, mut start) = (Vec::new(), Vec::new());
+            if a.is_draft() {
+                for k in draft_keys(a) {
+                    let v = strip_hidden(draft_field(a, k).unwrap_or_default(), k == "body");
+                    let (placeholder, rows) = match k {
+                        "body" => ("The text", if big { 18 } else { 8 }),
+                        "subject" => ("Subject", 2),
+                        _ => ("Who it goes to", 2),
+                    };
+                    fields.push((k.to_owned(), new_box(placeholder, rows, &v, window, cx)));
+                    start.push(v);
+                }
+            } else if !is_ask(a) {
+                // A field with hidden characters is reviewed as shown, not edited blind.
+                for k in a.editable.iter().take(1) {
+                    let Some(v) = a.input.as_ref().and_then(|i| i.get(k)).and_then(Value::as_str) else { continue };
+                    if reveal(v, true).1 {
+                        continue;
+                    }
+                    fields.push((k.clone(), new_box(k, 12, v, window, cx)));
+                    start.push(v.to_owned());
+                }
+            }
+            let note = new_box("A note for your teammate", 4, "", window, cx);
+            CardState { answer, fields, start, note, panel: Rc::new(Cell::new(Panel::None)), can_note }
+        })
     }
 
     pub fn render<V: 'static>(
@@ -413,46 +893,111 @@ impl ApprovalCards {
         cx: &mut Context<V>,
     ) -> Vec<AnyElement> {
         let teammates = data.read(cx).teammates();
+        self.cards.retain(|id, _| list.iter().any(|a| a.id == *id));
+        // A decided draft hands the keyboard to the next one, for going through a batch.
+        let drafts: Vec<Uuid> = list.iter().filter(|a| a.is_draft()).map(|a| a.id).collect();
+        let view = cx.entity().downgrade();
         let mut out = Vec::new();
+        for a in list {
+            let can_note = data.read(cx).bot(a.bot_id).is_none_or(|b| b.engine != BotEngine::Codex);
+            self.state(a, can_note, window, cx);
+        }
         for (i, a) in list.iter().enumerate() {
-            if is_ask(a) && !self.answers.contains_key(&a.id) {
-                let state = text_input::new_field("Your answer", false, 4, window, cx);
-                cx.subscribe(&state, |_, _, _: &InputEvent, cx| cx.notify()).detach();
-                self.answers.insert(a.id, state);
-            }
+            let state = &self.cards[&a.id];
             let bot = teammates.iter().find(|t| t.uuid == a.bot_id);
-            let decide = decider(data.clone(), toasts.clone(), a, self.answers.get(&a.id).cloned());
-            let card = approval_card(a, bot, self.answers.get(&a.id), decide, self.big, window, cx);
+            let next = drafts
+                .iter()
+                .skip_while(|d| **d != a.id)
+                .nth(1)
+                .and_then(|n| self.cards.get(n))
+                .and_then(|s| s.fields.iter().find(|(k, _)| k == "body"))
+                .map(|(_, s)| s.clone())
+                .filter(|_| self.big);
+            let decide = decider(data.clone(), toasts.clone(), a, Some(state), next);
+            let (cell, view) = (state.panel.clone(), view.clone());
+            let (edit_box, note_box) = (state.fields.first().map(|f| f.1.clone()), state.note.clone());
+            let set_panel: Rc<dyn Fn(Panel, &mut Window, &mut App)> = Rc::new(move |p, window, cx| {
+                cell.set(p);
+                // The box the panel is about gets the keyboard.
+                match p {
+                    Panel::Edit => {
+                        if let Some(b) = edit_box.as_ref() {
+                            b.update(cx, |s, cx| s.focus(window, cx));
+                        }
+                    }
+                    Panel::Note(_) => note_box.update(cx, |s, cx| s.focus(window, cx)),
+                    _ => {}
+                }
+                let _ = view.update(cx, |_, cx| cx.notify());
+            });
+            let ui = CardUi { state, set_panel };
+            let card = approval_card(a, bot, Some(ui), decide, self.big, window, cx);
             out.push(anim::stagger(SharedString::from(format!("approval-in-{}", a.id)), i, div().child(card)).into_any_element());
         }
         out
     }
 }
 
-/// The decide handler of a card: reads the answer box, calls the API, toasts the outcome.
+/// The decide handler of a card: reads its boxes, calls the API, toasts the outcome. `next`: the box to focus after.
 pub fn decider(
     data: Entity<AppData>,
     toasts: Entity<ToastStack>,
     a: &Approval,
-    answer: Option<Entity<TextareaState>>,
+    state: Option<&CardState>,
+    next: Option<Entity<TextareaState>>,
 ) -> Decide {
-    let ask = is_ask(a);
-    let id = a.id;
-    Rc::new(move |approve, _window, cx| {
-        let response = if ask && approve { answer.as_ref().map(|s| s.read(cx).value().to_string()) } else { None };
-        let task = data.update(cx, |d, cx| d.decide(id, approve, response, cx));
-        let toasts = toasts.clone();
+    let (id, ask, draft) = (a.id, is_ask(a), a.is_draft());
+    let rule = a.allow_rule.clone();
+    let who = a.bot_name.clone().unwrap_or_else(|| "Your teammate".into());
+    let answer = state.and_then(|s| s.answer.clone());
+    let fields: Vec<(String, Entity<TextareaState>)> = state.map(|s| s.fields.clone()).unwrap_or_default();
+    let start: Vec<String> = state.map(|s| s.start.clone()).unwrap_or_default();
+    let note = state.map(|s| s.note.clone());
+    Rc::new(move |choice, window, cx| {
+        let values: Vec<(String, String)> = fields.iter().map(|(k, s)| (k.clone(), s.read(cx).value().to_string())).collect();
+        let note_text = note.as_ref().map(|n| n.read(cx).value().trim().to_owned()).filter(|n| !n.is_empty());
+        let mut d = ApprovalDecision { decision: Some("approve".into()), ..Default::default() };
+        match choice {
+            Choice::Approve if ask => d.response = answer.as_ref().map(|s| s.read(cx).value().to_string()),
+            Choice::Approve if draft => d.edits = Some(changed_fields(&values, &start)).filter(|e| !e.is_empty()),
+            Choice::Approve => {}
+            Choice::ApproveEdited => d.edits = Some(values.into_iter().take(1).collect()),
+            Choice::AlwaysAllow => d.always = Some(true),
+            Choice::Deny => {
+                d.decision = Some("deny".into());
+                d.response = note_text.filter(|_| !ask);
+            }
+            Choice::Revise => {
+                d.decision = Some("revise".into());
+                d.response = note_text;
+            }
+        }
+        let edited = d.edits.is_some();
+        let task = data.update(cx, |data, cx| data.decide(id, d, cx));
+        if let Some(n) = next.as_ref() {
+            n.update(cx, |s, cx| s.focus(window, cx));
+        }
+        let (toasts, rule, who) = (toasts.clone(), rule.clone(), who.clone());
         cx.spawn(async move |cx| {
             let r = task.await;
             let _ = toasts.update(cx, |t, cx| match r {
                 Ok(()) => {
-                    let title = match (ask, approve) {
-                        (true, true) => "Answer sent",
-                        (true, false) => "Skipped",
-                        (false, true) => "Approved",
-                        (false, false) => "Declined",
+                    let (tone, title, detail) = match (choice, ask, draft) {
+                        (Choice::Approve, true, _) => (Tone::Ok, "Answer sent", None),
+                        (Choice::Deny, true, _) => (Tone::Muted, "Skipped", None),
+                        (Choice::Approve, _, true) if edited => (Tone::Ok, "Approved with your edits", None),
+                        (Choice::Approve, ..) => (Tone::Ok, "Approved", None),
+                        (Choice::ApproveEdited, ..) => (Tone::Ok, "Approved your version", None),
+                        (Choice::AlwaysAllow, ..) => (
+                            Tone::Ok,
+                            "Approved, and always allowed",
+                            rule.as_deref().map(|r| format!("From now on, {who} may {} without asking.", rule_words(r))),
+                        ),
+                        (Choice::Revise, ..) => (Tone::Muted, "Sent back for changes", None),
+                        (Choice::Deny, _, true) => (Tone::Muted, "Rejected", None),
+                        (Choice::Deny, ..) => (Tone::Muted, "Declined", None),
                     };
-                    t.push(if approve { Tone::Ok } else { Tone::Muted }, title, None, cx)
+                    t.push(tone, title, detail.map(Into::into), cx)
                 }
                 Err(e) => t.push(Tone::Bad, "Couldn't send that", Some(e.into()), cx),
             });
@@ -573,5 +1118,62 @@ mod tests {
             .unwrap();
         assert_eq!(d.text, "a.rs\n\nReplaces:\nx = 1\n\nWith:\nx = 2");
         assert_eq!(d.others, "replace_all: true");
+    }
+
+    fn draft(input: Value, editable: &[&str]) -> Approval {
+        Approval {
+            tool_name: "propose_draft".into(),
+            input: Some(input),
+            editable: editable.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn draft_fields_follow_the_kind() {
+        let all = ["body", "subject", "to"];
+        assert_eq!(draft_keys(&draft(json!({ "kind": "post", "channel": "X", "body": "hi" }), &all)), ["body"]);
+        assert_eq!(draft_keys(&draft(json!({ "kind": "email", "channel": "Gmail", "body": "hi" }), &all)), ["to", "subject", "body"]);
+        assert_eq!(draft_keys(&draft(json!({ "kind": "reply", "channel": "X", "to": "u", "body": "hi" }), &all)), ["to", "body"]);
+        // Only what the approval lets the owner edit gets a box.
+        assert_eq!(draft_keys(&draft(json!({ "kind": "email", "channel": "Gmail", "body": "hi" }), &["body"])), ["body"]);
+    }
+
+    #[test]
+    fn limits_marks_and_actions() {
+        assert_eq!(char_limit("X", "post"), Some((280, "X")));
+        assert_eq!(char_limit(" instagram ", "post"), Some((2200, "Instagram")));
+        assert_eq!(char_limit("LinkedIn", "dm"), Some((300, "LinkedIn notes")));
+        assert_eq!(char_limit("LinkedIn", "post"), Some((3000, "LinkedIn")));
+        assert_eq!(char_limit("Gmail", "email"), None);
+        assert_eq!(channel_mark("X", "post"), "X");
+        assert_eq!(channel_mark("Instagram", "post"), "IG");
+        assert_eq!(channel_mark("Gmail", "email"), "@");
+        assert_eq!(channel_mark("hacker news", "comment"), "Y");
+        assert_eq!(channel_mark("slack team", "post"), "ST");
+        assert_eq!(draft_action("post", "X"), "post this on X");
+        assert_eq!(draft_action("reply", "Reddit"), "reply on Reddit");
+        assert_eq!(draft_action("email", "Gmail"), "send this email (Gmail)");
+    }
+
+    #[test]
+    fn edits_are_what_changed() {
+        let values = vec![("to".to_owned(), "@a".to_owned()), ("body".to_owned(), " Hello there \n".to_owned())];
+        let start = vec!["@a".to_owned(), "Hello".to_owned()];
+        let e = changed_fields(&values, &start);
+        assert_eq!(e.into_iter().collect::<Vec<_>>(), vec![("body".to_owned(), "Hello there".to_owned())]);
+        assert!(changed_fields(&[("body".to_owned(), "Hello ".to_owned())], &["Hello".to_owned()]).is_empty());
+        // Hidden characters are taken out of what the owner approves.
+        assert_eq!(strip_hidden("pay\u{202E}moc.live\u{200B}", true), "paymoc.live");
+        assert_eq!(strip_hidden("line one\nline two", true), "line one\nline two");
+        assert_eq!(strip_hidden("a\nb", false), "ab");
+    }
+
+    #[test]
+    fn always_allow_reads_plainly() {
+        assert_eq!(rule_words("Bash(ls -la)"), "run exactly `ls -la` (that command, nothing longer or chained)");
+        assert_eq!(rule_words("Write"), "create and overwrite files in its workspace");
+        assert_eq!(rule_words("mcp__github__get_issue"), "use github's get issue (it only reads)");
+        assert_eq!(rule_words("Bash(git status *)"), "run commands like `git status *`");
     }
 }

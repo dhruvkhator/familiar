@@ -238,7 +238,8 @@ impl EventRows {
                 let status = a.status.clone().unwrap_or_else(|| "approval".into());
                 let tone = match status.as_str() {
                     "approved" | "approve" | "allow" => Tone::Ok,
-                    "pending" | "approval" => Tone::Warn,
+                    // revise: a draft sent back for changes.
+                    "pending" | "approval" | "revise" => Tone::Warn,
                     _ => Tone::Bad,
                 };
                 row(
@@ -256,6 +257,8 @@ impl EventRows {
                                 div().text_size(px(text::CAPTION)).text_color(theme.muted).child(SharedString::from(format!("by {by}"))),
                             )
                         })
+                        // The owner approved their own version of the input or the draft.
+                        .when(a.edited, |el| el.child(chip(Tone::Accent, "Edited by you", cx)))
                         .into_any_element(),
                 )
             }
