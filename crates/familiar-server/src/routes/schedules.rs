@@ -1,6 +1,7 @@
 use axum::{Json, extract::State, http::StatusCode};
 use serde::Deserialize;
 use std::str::FromStr;
+use uuid::Uuid;
 
 use super::{Body, Id, Row, found, one_of, owned, text};
 use crate::{
@@ -22,6 +23,71 @@ pub(super) fn cron(s: &str) -> R<String> {
     let expr = fields.join(" ");
     croner::Cron::from_str(&expr).map_err(|e| ApiError::bad(format!("invalid cron: {e}")))?;
     Ok(expr)
+}
+
+/// A schedule row plus what the Schedules page shows next to it: its label (the title of its thread), its teammate,
+/// and how its newest run went.
+const WITH_CONTEXT: &str = "(to_jsonb(s) - 'owner_id') || jsonb_build_object(
+       'label', t.title, 'bot_name', b.name, 'bot_slug', b.slug,
+       'last_status', lr.status, 'last_error', lr.error, 'last_finished_at', lr.finished_at)";
+
+const CONTEXT_JOINS: &str = "join bots b on b.id = s.bot_id
+     left join threads t on t.id = s.thread_id
+     left join lateral (select r.status, r.error, r.finished_at from runs r
+                        where r.thread_id = s.thread_id order by r.created_at desc limit 1) lr on true";
+
+/// Every schedule of every teammate (the Schedules page), by teammate then next run.
+pub async fn list_all(State(st): State<S>, a: Auth) -> R<Json<Vec<Row>>> {
+    let rows = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "select {WITH_CONTEXT} from schedules s {CONTEXT_JOINS}
+         where s.owner_id = $1
+         order by lower(b.name), s.next_run_at nulls last, s.id"
+    )))
+    .bind(a.user)
+    .fetch_all(&st.pool)
+    .await?;
+    Ok(Json(rows))
+}
+
+/// Queue a schedule's run now, in its own thread, without moving its next fire time. One at a time: a run of it
+/// that is still queued answers 409.
+pub async fn run_now(State(st): State<S>, a: Auth, Id(id): Id) -> R<(StatusCode, Json<Row>)> {
+    let mut tx = st.pool.begin().await?;
+    let sched: Option<(Uuid, Option<Uuid>, String, String)> = sqlx::query_as(
+        "select bot_id, thread_id, kind, prompt from schedules where id = $1 and owner_id = $2 for update",
+    )
+    .bind(id)
+    .bind(a.user)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (bot, thread, kind, prompt) = sched.ok_or(ApiError::NotFound)?;
+    let thread = thread.ok_or_else(|| ApiError::bad("this schedule has no thread"))?;
+    let queued: bool = sqlx::query_scalar(
+        "select exists(select 1 from runs where thread_id = $1 and status = 'queued')",
+    )
+    .bind(thread)
+    .fetch_one(&mut *tx)
+    .await?;
+    if queued {
+        return Err(ApiError::conflict("a run of this schedule is already waiting to start"));
+    }
+    let run: Row = sqlx::query_scalar(
+        "insert into runs (owner_id, bot_id, thread_id, kind, prompt, status)
+         values ($1, $2, $3, $4, $5, 'queued') returning to_jsonb(runs) - 'owner_id'",
+    )
+    .bind(a.user)
+    .bind(bot)
+    .bind(thread)
+    .bind(kind)
+    .bind(prompt)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query("update schedules set last_run_at = now() where id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(run)))
 }
 
 pub async fn list(State(st): State<S>, a: Auth, Id(bot): Id) -> R<Json<Vec<Row>>> {
@@ -88,6 +154,8 @@ pub async fn create(
 
 #[derive(Deserialize)]
 pub struct SchedulePatch {
+    /// The schedule's name (the title of its thread).
+    label: Option<String>,
     cron: Option<String>,
     prompt: Option<String>,
     kind: Option<String>,
@@ -112,9 +180,15 @@ pub async fn update(
         .as_deref()
         .map(|k| one_of(k, "kind", &KINDS))
         .transpose()?;
+    let label = p
+        .label
+        .as_deref()
+        .map(|s| text(s, "label", 100))
+        .transpose()?;
     let gate_set = p.gate_command.is_some();
     let gate = gate(p.gate_command.as_deref())?;
-    let row = sqlx::query_scalar(
+    let mut tx = st.pool.begin().await?;
+    let row: Option<Row> = sqlx::query_scalar(
         "update schedules set cron = coalesce($3, cron), prompt = coalesce($4, prompt),
                 kind = coalesce($5, kind), enabled = coalesce($6, enabled),
                 gate_command = case when $7 then $8 else gate_command end
@@ -128,8 +202,18 @@ pub async fn update(
     .bind(p.enabled)
     .bind(gate_set)
     .bind(gate)
-    .fetch_optional(&st.pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    if let (Some(label), Some(r)) = (label, row.as_ref()) {
+        let thread = r.0["thread_id"].as_str().and_then(|t| t.parse::<Uuid>().ok());
+        sqlx::query("update threads set title = $1 where id = $2 and owner_id = $3")
+            .bind(label)
+            .bind(thread)
+            .bind(a.user)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
     found(row)
 }
 

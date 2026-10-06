@@ -445,6 +445,101 @@ async fn approvals_decide_only_when_pending() {
     assert_eq!(len(&app.get(t, "/api/approvals?status=pending").await.1), 0);
 }
 
+/// A pending approval as the daemon makes it: with what the owner may edit and the rule "Always allow" would add.
+async fn offered(app: &App, a: &User, run: Uuid, bot: Uuid, tool: &str, input: Value, editable: &[&str], rule: Option<&str>) -> Uuid {
+    sqlx::query_scalar(
+        "insert into approvals (owner_id, run_id, bot_id, tool_name, input, editable, allow_rule)
+         values ($1, $2, $3, $4, $5, $6, $7) returning id",
+    )
+    .bind(a.id)
+    .bind(run)
+    .bind(bot)
+    .bind(tool)
+    .bind(sqlx::types::Json(input))
+    .bind(editable.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    .bind(rule)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approvals_edit_note_revise_and_always_allow() {
+    let app = app!();
+    let a = app.owner().await;
+    let t = &a.tok;
+    let bot = app.bot(t, "Editor").await;
+    let (_, run) = app.chat(t, &bot, "do it").await;
+    let (b, r) = (bot.parse::<Uuid>().unwrap(), uid(&run));
+    let bash = json!({ "command": "git status", "description": "look around" });
+    let decide = |id: Uuid| format!("/api/approvals/{id}");
+
+    // Edit & approve: only the offered field, only with approve, never together with "always".
+    let x = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(git status)")).await;
+    for bad in [
+        json!({ "decision": "approve", "edits": { "description": "x" } }),
+        json!({ "decision": "approve", "edits": { "command": " " } }),
+        json!({ "decision": "deny", "edits": { "command": "ls" } }),
+        json!({ "decision": "approve", "always": true, "edits": { "command": "ls" } }),
+        json!({ "decision": "revise", "response": "shorter" }),
+    ] {
+        assert_eq!(app.post(t, &decide(x), bad.clone()).await.0, 400, "{bad}");
+    }
+    let (s, v) = app.post(t, &decide(x), json!({ "decision": "approve", "edits": { "command": "git status --short" } })).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["status"], "approved");
+    assert_eq!(v["edited_input"], json!({ "command": "git status --short", "description": "look around" }));
+    assert_eq!(v["input"], bash, "the proposal is kept as it was");
+    assert!(v.get("rule").is_none());
+
+    // Deny with a note: the note is the response.
+    let y = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(git status)")).await;
+    let (_, v) = app.post(t, &decide(y), json!({ "decision": "deny", "response": "use the dashboard instead" })).await;
+    assert_eq!((v["status"].as_str(), v["response"].as_str()), (Some("denied"), Some("use the dashboard instead")));
+    assert!(v["edited_input"].is_null());
+
+    // Always allow: approves and adds the offered rule for this teammate only; the same rule is not added twice.
+    for _ in 0..2 {
+        let z = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(git status)")).await;
+        let (s, v) = app.post(t, &decide(z), json!({ "decision": "approve", "always": true })).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["status"], "approved");
+        assert_eq!((v["rule"]["pattern"].as_str(), v["rule"]["decision"].as_str()), (Some("Bash(git status)"), Some("allow")));
+        assert_eq!(v["rule"]["bot_id"].as_str(), Some(bot.as_str()));
+    }
+    let (_, rules) = app.get(t, &format!("/api/rules?bot_id={bot}")).await;
+    assert_eq!(len(&rules), 1, "{rules}");
+    assert_eq!(len(&app.get(t, "/api/rules").await.1), 0, "no global rule");
+
+    // Never for what the daemon didn't offer (always-human actions), nor for questions and drafts.
+    let h = offered(&app, &a, r, b, "Bash", json!({ "command": "rm -rf build" }), &["command"], None).await;
+    assert_eq!(app.post(t, &decide(h), json!({ "decision": "approve", "always": true })).await.0, 400);
+    let d = offered(&app, &a, r, b, "propose_draft", json!({ "kind": "post", "channel": "X", "body": "Hi" }), &[], Some("propose_draft")).await;
+    assert_eq!(app.post(t, &decide(d), json!({ "decision": "approve", "always": true })).await.0, 400);
+    assert_eq!(len(&app.get(t, &format!("/api/rules?bot_id={bot}")).await.1), 1);
+    let (_, pending) = app.get(t, "/api/approvals?status=pending").await;
+    assert_eq!(len(&pending), 2, "refused decisions leave the approval pending");
+    assert_eq!(pending[0]["editable"], json!([]));
+
+    // Drafts: edit and approve (the proposal stays as it was), ask for changes, reject with a note.
+    let draft = json!({ "kind": "reply", "channel": "X", "to": "https://x.com/a/status/1", "body": "Thanks!" });
+    let fields = ["body", "subject", "to"];
+    let d1 = offered(&app, &a, r, b, "propose_draft", draft.clone(), &fields, None).await;
+    assert_eq!(app.post(t, &decide(d1), json!({ "decision": "approve", "edits": { "channel": "LinkedIn" } })).await.0, 400);
+    let (s, v) = app.post(t, &decide(d1), json!({ "decision": "approve", "edits": { "body": " Thank you! \n", "subject": "" } })).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["edited_input"]["body"], "Thank you!");
+    assert_eq!(v["input"]["body"], "Thanks!");
+    let d2 = offered(&app, &a, r, b, "propose_draft", draft.clone(), &fields, None).await;
+    let (_, v) = app.post(t, &decide(d2), json!({ "decision": "revise", "response": "shorter, no exclamation mark" })).await;
+    assert_eq!((v["status"].as_str(), v["response"].as_str()), (Some("revise"), Some("shorter, no exclamation mark")));
+    assert_eq!(len(&app.get(t, "/api/approvals?status=revise").await.1), 1);
+    let d3 = offered(&app, &a, r, b, "propose_draft", draft, &fields, None).await;
+    let (_, v) = app.post(t, &decide(d3), json!({ "decision": "deny", "response": "not this one" })).await;
+    assert_eq!(v["status"], "denied");
+    assert_eq!(app.post(t, &decide(d3), json!({ "decision": "approve" })).await.0, 409);
+}
+
 // ------------------------------------------------------------------ rules
 
 #[tokio::test(flavor = "multi_thread")]
@@ -515,6 +610,50 @@ async fn schedules_cron_and_gate() {
     assert_eq!(app.del(t, &sp).await.0, 204);
     assert_eq!(app.del(t, &sp).await.0, 404);
     assert_eq!(app.patch(t, &sp, json!({"enabled": true})).await.0, 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schedules_page_label_and_run_now() {
+    let app = app!();
+    let a = app.owner().await;
+    let t = &a.tok;
+    let (beta, alpha) = (app.bot(t, "Beta").await, app.bot(t, "Alpha").await);
+    let s1 = app.ok_post(t, &format!("/api/bots/{beta}/schedules"), json!({"cron": "0 9 * * 1-5", "prompt": "standup"}), 201).await;
+    let s2 = app.ok_post(t, &format!("/api/bots/{alpha}/schedules"), json!({"cron": "0 8 * * *", "prompt": "news", "enabled": false}), 201).await;
+
+    // Every teammate's schedules in one list, by teammate, each with its label and teammate.
+    let (s, all) = app.get(t, "/api/schedules").await;
+    assert_eq!((s, len(&all)), (200, 2));
+    assert_eq!((all[0]["bot_name"].as_str(), all[0]["id"].as_str()), (Some("Alpha"), s2["id"].as_str()));
+    assert_eq!(all[1]["label"], "Schedule: standup");
+    assert!(all[1]["last_status"].is_null());
+
+    let sp = format!("/api/schedules/{}", id(&s1));
+    assert_eq!(app.patch(t, &sp, json!({"label": "  "})).await.0, 400);
+    assert_eq!(app.patch(t, &sp, json!({"label": "l".repeat(101)})).await.0, 400);
+    let (s, v) = app.patch(t, &sp, json!({"label": " Morning standup ", "cron": "30 9 * * 1-5"})).await;
+    assert_eq!((s, v["cron"].as_str()), (200, Some("30 9 * * 1-5")));
+    let (_, all) = app.get(t, "/api/schedules").await;
+    assert_eq!(all[1]["label"], "Morning standup");
+
+    // Run now: one queued run in the schedule's own thread, its fire time untouched; not twice while queued.
+    let (s, run) = app.post(t, &format!("{sp}/run"), json!({})).await;
+    assert_eq!(s, 201, "{run}");
+    assert_eq!((run["kind"].as_str(), run["status"].as_str(), run["prompt"].as_str()), (Some("scheduled"), Some("queued"), Some("standup")));
+    assert_eq!(run["thread_id"], s1["thread_id"]);
+    assert_eq!(app.post(t, &format!("{sp}/run"), json!({})).await.0, 409);
+    let (_, all) = app.get(t, "/api/schedules").await;
+    assert_eq!(all[1]["last_status"], "queued");
+    assert!(all[1]["last_run_at"].is_string());
+    // A turned-off schedule can still be run by hand.
+    assert_eq!(app.post(t, &format!("/api/schedules/{}/run", id(&s2)), json!({})).await.0, 201);
+    assert_eq!(app.post(t, &format!("/api/schedules/{}/run", Uuid::new_v4()), json!({})).await.0, 404);
+
+    // Another user sees and runs none of them.
+    let b = app.second().await;
+    assert_eq!(len(&app.get(&b.tok, "/api/schedules").await.1), 0);
+    assert_eq!(app.post(&b.tok, &format!("{sp}/run"), json!({})).await.0, 404);
+    assert_eq!(app.patch(&b.tok, &sp, json!({"label": "mine"})).await.0, 404);
 }
 
 // ------------------------------------------------------------------ memories + dream

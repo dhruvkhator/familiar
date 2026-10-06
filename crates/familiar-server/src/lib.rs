@@ -102,10 +102,12 @@ fn router(state: S, web_origins: &[String]) -> Router {
             "/api/bots/{id}/schedules",
             get(schedules::list).post(schedules::create),
         )
+        .route("/api/schedules", get(schedules::list_all))
         .route(
             "/api/schedules/{id}",
             patch(schedules::update).delete(schedules::remove),
         )
+        .route("/api/schedules/{id}/run", post(schedules::run_now))
         .route(
             "/api/bots/{id}/memories",
             get(memories::list).post(memories::create),
