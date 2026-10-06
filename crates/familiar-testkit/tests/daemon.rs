@@ -870,8 +870,8 @@ async fn edited_tool_input_is_rechecked() {
 
     // 1. A plain edit: allowed, and the tool runs the owner's version (other fields untouched).
     let (a1, _, input, _) = h.pending_approval(run).await;
-    // "Always allow" would cover exactly this command, nothing more.
-    assert_eq!(h.offer(a1).await, (vec!["command".to_owned()], Some("Bash(wc -l notes.md)".to_owned())));
+    // Shell commands can be edited, never always allowed.
+    assert_eq!(h.offer(a1).await, (vec!["command".to_owned()], None));
     h.decide_edited(a1, json!({ "command": "wc -l notes.md todo.md", "description": input["description"] })).await;
 
     // 2. Edited into a recursive delete: a second approval of exactly that, with nothing to edit or always allow.
@@ -953,8 +953,7 @@ async fn always_allow_rule_is_narrow() {
 }
 
 /// Rules are read again for every decision: one the owner adds counts for the next call of a running session, one
-/// they delete stops counting; a deny rule beats an allow rule for the same command; and an exact "Always allow" rule
-/// whose path now runs through a junction out of the workspace asks the owner instead.
+/// they delete stops counting; a deny rule beats an allow rule for the same command.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rules_apply_live_and_deny_wins() {
     let Some(mut h) = setup("rules_apply_live_and_deny_wins").await else { return };
@@ -965,20 +964,8 @@ async fn rules_apply_live_and_deny_wins() {
         tool("Bash", json!({ "command": "ls -la" })),
         tool("Bash", json!({ "command": "pwd" })),
         tool("Bash", json!({ "command": "ls -l" })),
-        tool("Bash", json!({ "command": "cat link/secret.txt" })),
         { "result": "done" },
     ]]));
-    // The teammate's workspace exists before its first run: put a junction in it that leads out.
-    let ws = h.dir.join("live");
-    let outside = h.dir.join("outside");
-    std::fs::create_dir_all(&ws).unwrap();
-    std::fs::create_dir_all(&outside).unwrap();
-    std::fs::write(outside.join("secret.txt"), "s").unwrap();
-    let linked = if cfg!(windows) {
-        std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(ws.join("link")).arg(&outside).output().is_ok_and(|o| o.status.success())
-    } else {
-        std::process::Command::new("ln").arg("-s").arg(&outside).arg(ws.join("link")).status().is_ok_and(|s| s.success())
-    };
     h.start();
     let bot = h.bot("live").await;
     let rule = |pattern: &'static str, decision: &'static str| {
@@ -997,7 +984,6 @@ async fn rules_apply_live_and_deny_wins() {
     let ls = rule("Bash(ls -la)", "allow").await;
     rule("Bash(ls -l)", "allow").await;
     rule("Bash(ls -l)", "deny").await;
-    rule("Bash(cat link/secret.txt)", "allow").await;
     let thread = h.thread(bot).await;
     let run = h.say(thread, "go").await;
 
@@ -1017,22 +1003,12 @@ async fn rules_apply_live_and_deny_wins() {
     .await;
     assert_eq!(again.1 .0["command"], "ls -la");
     h.decide(again.0, "denied", None).await;
-    // 3. `pwd` went through on the new rule; 4. `ls -l` is denied by the deny rule without asking; 5. the junction.
-    if linked {
-        let (a, _, input, _) = h.pending_approval(run).await;
-        assert_eq!(input["command"], "cat link/secret.txt", "a path through a junction is asked, not auto-approved");
-        h.decide(a, "denied", None).await;
-    }
+    // 3. `pwd` went through on the new rule; 4. `ls -l` is denied by the deny rule without asking.
     assert_eq!(h.finished(run).await.0, "succeeded");
     let d: Vec<String> = h.invocation(0).decisions().iter().map(|d| d["behavior"].as_str().unwrap().to_owned()).collect();
-    // Without the junction the path stays inside the workspace and the exact rule applies.
-    let last = if linked { "deny" } else { "allow" };
-    assert_eq!(d, ["allow", "allow", "deny", "allow", "deny", last]);
+    assert_eq!(d, ["allow", "allow", "deny", "allow", "deny"]);
     let asked: Vec<String> = h.approvals(run).await.into_iter().map(|a| a.0).collect();
-    assert_eq!(asked.len(), if linked { 3 } else { 2 }, "{asked:?}");
-    if !linked {
-        eprintln!("rules_apply_live_and_deny_wins: could not create a junction here, its part was skipped");
-    }
+    assert_eq!(asked.len(), 2, "only the Write and the ls -la after its rule went: {asked:?}");
     h.finish().await;
 }
 

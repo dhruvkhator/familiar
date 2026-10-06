@@ -477,7 +477,6 @@ async fn drive(
                     run.clone(),
                     msg,
                     rules.to_vec(),
-                    spec.cwd.to_path_buf(),
                     proc.stdin.clone(),
                     events.clone(),
                     scope.clone(),
@@ -547,13 +546,11 @@ pub(crate) fn list_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Answer one `can_use_tool` request. Runs as its own task so the stdout loop keeps draining.
-#[allow(clippy::too_many_arguments)]
 async fn decide(
     ctx: Ctx,
     run: Run,
     msg: Value,
     rules: Vec<Rule>,
-    workspace: PathBuf,
     stdin: mpsc::UnboundedSender<Value>,
     events: Events,
     cancel: CancellationToken,
@@ -564,8 +561,7 @@ async fn decide(
     let input = req["input"].clone();
     let reason = req["decision_reason"].as_str().or_else(|| req["description"].as_str());
     let verdict =
-        decide_tool(&ctx, &run, &tool, &input, req["tool_use_id"].as_str(), reason, &rules, &workspace, &events, &cancel, true)
-            .await;
+        decide_tool(&ctx, &run, &tool, &input, req["tool_use_id"].as_str(), reason, &rules, &events, &cancel, true).await;
     // An owner's edit replaces the input (`updatedInput`): the tool runs what they approved.
     let input = verdict.input.as_ref().unwrap_or(&input);
     let _ = stdin.send(claude::permission_reply(&request_id, verdict.allow, input, &verdict.message));
@@ -618,8 +614,7 @@ impl Decision {
 }
 
 /// The engine-neutral permission decision for one tool call (Claude's can_use_tool, Codex's approval requests):
-/// research-only → deny; owner deny rules → deny; always-human → owner; safe navigation / owner allow rules (that
-/// still hold, [`permissions::rule_holds`]) → allow; `review` rules → reviewer; everything else → owner. The rules are
+/// research-only → deny; owner deny rules → deny; always-human → owner; safe navigation / owner allow rules → allow; `review` rules → reviewer; everything else → owner. The rules are
 /// read again for every decision, so one the owner adds or removes counts at once, also in a running session (`rules`,
 /// the run's copy, is only the fallback when the database can't be reached, minus its allow rules). Records an
 /// `approval` event. `can_edit`: the engine runs an edited input (Claude's `updatedInput`; Codex can only accept or
@@ -633,7 +628,6 @@ pub async fn decide_tool(
     tool_use_id: Option<&str>,
     engine_reason: Option<&str>,
     rules: &[Rule],
-    workspace: &Path,
     events: &Events,
     cancel: &CancellationToken,
     can_edit: bool,
@@ -659,9 +653,7 @@ pub async fn decide_tool(
         owner(format!("Always needs you: this {why}.")).await
     } else if permissions::safe_navigation(tool, input).await {
         ("approved".to_owned(), "rule", String::new(), None)
-    } else if let Some(rule) =
-        permissions::owner_allows(rules, tool, input).filter(|r| permissions::rule_holds(r, tool, input, workspace))
-    {
+    } else if let Some(rule) = permissions::owner_allows(rules, tool, input) {
         ("approved".to_owned(), "rule", format!("allowed by rule `{}`", rule.pattern), None)
     } else {
         let mut reason = engine_reason.map(str::to_owned);

@@ -64,66 +64,6 @@ pub fn owner_allows<'a>(rules: &'a [Rule], tool: &str, input: &Value) -> Option<
         .find(|r| matches(&r.pattern, tool, input))
 }
 
-/// Whether an allow rule may approve this call without the owner, given what is on disk now. An exact command rule
-/// ("Always allow", `Bash(cat notes/today.md)`) holds only while every path it names resolves inside the workspace
-/// with no symlink or junction on the way: a link created later must not turn an approved read into a read of
-/// `~/.ssh`. Other rules hold as written.
-pub fn rule_holds(rule: &Rule, tool: &str, input: &Value, workspace: &std::path::Path) -> bool {
-    let exact = rule.pattern.starts_with("Bash(") && !rule.pattern.contains('*');
-    if tool != "Bash" || !exact {
-        return true;
-    }
-    let cwd = input["cwd"].as_str().map(std::path::Path::new);
-    input["command"].as_str().is_some_and(|c| paths_inside(c, cwd, workspace))
-}
-
-/// Every argument of `command` (flags aside) resolved from `cwd` (else the workspace) stays inside `workspace`, and no
-/// part of the way is a symlink or a reparse point (a Windows junction). A part that doesn't exist yet ends the walk
-/// (`mkdir new/dir`): nothing there can lead elsewhere.
-pub fn paths_inside(command: &str, cwd: Option<&std::path::Path>, workspace: &std::path::Path) -> bool {
-    use std::path::Component;
-    let Ok(root) = workspace.canonicalize() else { return false };
-    let base = match cwd {
-        Some(c) => match c.canonicalize() {
-            Ok(c) if c.starts_with(&root) => c,
-            _ => return false,
-        },
-        None => root.clone(),
-    };
-    for arg in command.split(' ').skip(1).filter(|w| !w.is_empty() && !w.starts_with('-')) {
-        let mut path = base.clone();
-        let mut existing = base.clone();
-        for part in std::path::Path::new(arg).components() {
-            match part {
-                Component::Normal(p) => path.push(p),
-                Component::CurDir => continue,
-                // Absolute, drive, UNC or `..`: never.
-                _ => return false,
-            }
-            match std::fs::symlink_metadata(&path) {
-                Ok(m) if m.file_type().is_symlink() || reparse_point(&m) => return false,
-                Ok(_) => existing = path.clone(),
-                Err(_) => break,
-            }
-        }
-        if !existing.canonicalize().is_ok_and(|e| e.starts_with(&root)) {
-            return false;
-        }
-    }
-    true
-}
-
-#[cfg(windows)]
-fn reparse_point(m: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    m.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT: symlinks, junctions, mount points
-}
-
-#[cfg(not(windows))]
-fn reparse_point(_: &std::fs::Metadata) -> bool {
-    false
-}
-
 /// Shell control operators, substitutions or redirections: more than one plain command.
 fn compound(command: &str) -> bool {
     command.contains(['\n', '\r', ';', '&', '|', '<', '>', '`']) || command.contains("$(")
@@ -144,15 +84,6 @@ pub fn editable_field(tool: &str, input: &Value) -> Option<&'static str> {
     input[field].is_string().then_some(field)
 }
 
-/// The only programs "Always allow" is offered for: plain commands that read the workspace or make empty files and
-/// folders, and cannot run anything else, write elsewhere or reach the network. An allowlist on purpose: a denylist of
-/// everything that can run code (interpreters, `tar --to-command`, `zip -TT`, pagers, file openers...) is never
-/// complete. Left out although harmless-looking: `sort -o`, `uniq IN OUT`, `tree -o` write files; `rg --pre` runs one.
-const ALWAYS_PROGRAMS: &[&str] = &[
-    "ls", "dir", "pwd", "cat", "head", "tail", "wc", "grep", "diff", "cut", "file", "stat", "du", "df", "echo", "date",
-    "whoami", "which", "mkdir", "touch",
-];
-
 /// Action words of a connector tool that only read (`get_issue`, `listRepos`, `search_code`). Anything else, and any
 /// tool whose name also carries a write word, gets no "Always allow". `fetch` and `query` are left out on purpose: a
 /// fetch can carry data out in its URL, and a SQL "query" tool may write.
@@ -163,50 +94,22 @@ const WRITE_WORDS: &[&str] = &[
     "approve", "close", "archive", "draft", "submit", "share", "transfer", "pay", "buy", "order", "modify", "save",
 ];
 
-/// The rule "Always allow this" adds for this call, or None when it must not be offered. Offered only for:
-/// - an exact Bash command (`Bash(<the command>)`, no wildcard: that command again, byte for byte, nothing else) of a
-///   program in [`ALWAYS_PROGRAMS`], see [`exact_bash_rule`]. Familiar applies Bash allow rules itself; they never
-///   reach the CLI's own settings ([`settings`]);
-/// - connector tools that clearly only read ([`READ_ONLY_ACTIONS`]): an exact tool name.
-///
-/// Never for actions that always need the owner, any browser tool (a click or a keystroke can post or send as the
-/// owner), connector tools that write or send, file tools (a rule for `Write` would also cover the schedule gate
-/// scripts, `.claude/`, `.mcp.json` and `.git/` that later run without asking), Familiar's own tools, questions or
-/// drafts.
+/// The rule "Always allow this" adds for this call, or None when it must not be offered. Offered only for connector
+/// tools that clearly only read ([`READ_ONLY_ACTIONS`]): the exact tool name, for that teammate. Never for shell
+/// commands (what a command touches can't be judged safely ahead of time: links, option files, recursion, Windows path
+/// forms), file tools (a `Write` rule would also cover gate scripts, `.claude/`, `.mcp.json`, `.git/`), any browser
+/// tool (a click or a keystroke can post or send as the owner), connector tools that write or send, Familiar's own
+/// tools, questions, drafts, or anything that always needs the owner. Owners can still write their own rules knowingly.
 pub fn always_allow_rule(tool: &str, input: &Value) -> Option<String> {
-    if always_human(tool, input).is_some() || tool.is_empty() || tool.contains(['(', ')', '*', ' ']) {
+    if always_human(tool, input).is_some() || !tool.is_ascii() || tool.contains(['(', ')', '*', ' ']) {
         return None;
     }
-    match tool {
-        "Bash" => exact_bash_rule(input["command"].as_str()?),
-        t if t.starts_with("mcp__") && !t.starts_with("mcp__browser__") && !t.starts_with("mcp__familiar__") => {
-            let action = t.splitn(3, "__").nth(2)?;
-            (t.is_ascii() && read_only_action(action)).then(|| t.to_owned())
-        }
-        _ => None,
-    }
-}
-
-/// `Bash(<command>)` for a plain command, or None. Parsed at least as strictly as a shell would: only ASCII letters,
-/// digits, `-._/+,` and single spaces between words (so no quotes, escapes, variables, globs, comments, redirections,
-/// operators, tabs or other characters a shell treats specially); a program from [`ALWAYS_PROGRAMS`]; flags made of
-/// letters, digits and dashes only (`-n5`, not `-o/etc/x`); other arguments relative paths inside the workspace (not
-/// starting with `/`, no `..`).
-pub fn exact_bash_rule(command: &str) -> Option<String> {
-    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '/' | '+' | ',');
-    if command.is_empty() || !command.chars().all(|c| c == ' ' || plain(c)) {
+    let server_tool = tool.strip_prefix("mcp__")?;
+    let (server, action) = server_tool.split_once("__")?;
+    if server.is_empty() || matches!(server, "browser" | "familiar") {
         return None;
     }
-    let words: Vec<&str> = command.split(' ').collect();
-    // `split(' ')` gives an empty word for a leading, trailing or doubled space.
-    if words.iter().any(|w| w.is_empty()) || !ALWAYS_PROGRAMS.contains(&words[0]) {
-        return None;
-    }
-    let ok = words.iter().skip(1).all(|w| match w.strip_prefix('-') {
-        Some(flag) => flag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
-        None => !w.starts_with('/') && !w.contains(".."),
-    });
-    ok.then(|| format!("Bash({command})"))
+    read_only_action(action).then(|| tool.to_owned())
 }
 
 /// `get_issue`, `listRepos`, `search-code`: a read-only verb first and no write word anywhere.
@@ -547,123 +450,31 @@ mod tests {
     }
 
     #[test]
-    fn always_allow_rules_are_exact_plain_commands() {
-        let bash = |c: &str| always_allow_rule("Bash", &json!({ "command": c }));
-        assert_eq!(bash("ls -la").as_deref(), Some("Bash(ls -la)"));
-        assert_eq!(bash("wc -l notes/today.md").as_deref(), Some("Bash(wc -l notes/today.md)"));
-        assert_eq!(bash("grep -n TODO notes.md").as_deref(), Some("Bash(grep -n TODO notes.md)"));
-        assert_eq!(bash("head -n5 out/report.csv").as_deref(), Some("Bash(head -n5 out/report.csv)"));
-        // The rule matches that command byte for byte, nothing else.
-        let rule = bash("ls -la").unwrap();
-        let m = |c: &str| matches(&rule, "Bash", &json!({ "command": c }));
-        assert!(m("ls -la"));
-        for c in ["ls -la /", "ls -la ~/.ssh", "ls -la ", " ls -la", "ls  -la", "ls\t-la", "ls -lah", "ls", "LS -la"] {
-            assert!(!m(c), "{c:?}");
-        }
-        let rules = [Rule { pattern: rule.clone(), decision: "allow".into() }];
-        assert!(owner_allows(&rules, "Bash", &json!({ "command": "ls -la; rm x" })).is_none());
-        // Familiar applies Bash allow rules itself: they never reach the CLI's settings.
-        assert!(!strings(&settings(&rules, false)["allow"]).iter().any(|p| p.starts_with("Bash")));
-
-        // Only allowlisted programs: interpreters (any version suffix), multi-call binaries, archivers with exec hooks,
-        // downloaders, openers, pagers, editors, writers disguised as readers, version control and build tools.
-        for c in [
-            "python report.py", "python3.12 x.py", "perl5.36 x", "node x.js", "busybox ls", "tar -xf a.tar --to-command=sh",
-            "tar --checkpoint-action=exec=sh -cf a.tar x", "zip -TT sh a.zip x", "curl https://example.com", "wget x",
-            "certutil -urlcache -f x", "bitsadmin /transfer x", "openssl s_client", "sqlite3 db .shell", "xdg-open x",
-            "open x", "explorer x", "start x", "man ls", "less notes.md", "code .", "sort -o out.txt in.txt",
-            "uniq in.txt out.txt", "rg --pre sh x", "tree -o out.txt", "cp a b", "mv a b", "git status", "npm test",
-            "make", "find . -name x", "env ls", "xargs ls", "bash x.sh", "sh x", "pwsh x", "./run.sh", "sed -n 1p x",
-        ] {
-            assert_eq!(bash(c), None, "{c}");
-        }
-        // Parsed as strictly as a shell: anything special, any odd spacing, non-ASCII, paths outside the workspace.
-        for c in [
-            "ls\t-la", "ls  -la", " ls -la", "ls -la ", "ls -la\n", "cat n\u{00e9}.md", "cat notes.md # x", "cat a=b",
-            "cat @x", "ls & ls", "ls | cat", "ls; ls", "cat < x", "ls > x", "ls `x`", "echo $HOME", "cat 'x'", "cat \"x\"",
-            "cat x\\y", "ls *.md", "ls x?", "ls [ab]", "ls {a,b}", "cat ~/x", "cat /etc/passwd", "head -n5 /etc/passwd",
-            "ls -C/abs", "cat -o/etc/x", "cat --out=C:/x", "cat -oC:/x", "cat C:x", "cat C:/x", "cat \\\\server\\share\\x",
-            "cat //server/share/x", "cat ../x", "cat a/../../x", "cat %USERPROFILE%", "rm -rf build", "",
-        ] {
-            assert_eq!(bash(c), None, "{c:?}");
-        }
-    }
-
-    #[test]
-    fn always_allow_never_for_files_browser_writes_or_familiar() {
+    fn always_allow_only_for_read_only_connector_tools() {
         for t in ["mcp__github__get_issue", "mcp__github__list_pull_requests", "mcp__notion__search", "mcp__drive__readFile",
                   "mcp__x__describe-table"] {
             assert_eq!(always_allow_rule(t, &json!({})).as_deref(), Some(t), "{t}");
         }
-        for t in ["Write", "Edit", "MultiEdit", "NotebookEdit", "WebFetch",
+        // Never a shell command, however plain (and none of the earlier escapes).
+        for c in [
+            "ls -la", "pwd", "cat notes/today.md", "grep -r TODO .", "ls -R", "du -a", "grep -f patterns.txt x", "cat -",
+            "cat NUL", "cat notes.md.", "git status", "git -c core.fsmonitor=x status", "python3.12 x.py", "busybox ls",
+            "tar -xf a --to-command=sh", "zip -TT sh a.zip x", "curl https://example.com", "sqlite3 db .shell", "rm -rf build",
+            "sudo ls", "ls; rm x", "cat ~/.ssh/id_rsa", "cat /etc/passwd", "cat link/secret.txt", "",
+        ] {
+            assert_eq!(always_allow_rule("Bash", &json!({ "command": c })), None, "{c}");
+        }
+        for t in ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit", "WebFetch", "Read",
                   "mcp__browser__browser_click", "mcp__browser__browser_type", "mcp__browser__browser_fill_form",
                   "mcp__browser__browser_press_key", "mcp__browser__browser_select_option", "mcp__browser__browser_drag",
                   "mcp__browser__browser_hover", "mcp__browser__browser_navigate", "mcp__browser__browser_evaluate",
-                  "mcp__gmail__send_email", "mcp__slack__post_message", "mcp__slack__slack_post_message",
-                  "mcp__github__create_issue", "mcp__github__merge_pull_request", "mcp__github__push_files",
-                  "mcp__github__get_and_delete", "mcp__fetch__fetch", "mcp__postgres__query", "mcp__x__update_get",
-                  "mcp__familiar__propose_draft", "mcp__familiar__remember", "propose_draft", "ask_user",
-                  "Bash(ls)", "mcp__github__getIssue(x)"] {
-            assert_eq!(always_allow_rule(t, &json!({ "file_path": ".claude/settings.json", "url": "https://example.com" })), None, "{t}");
+                  "mcp__browser__browser_snapshot", "mcp__gmail__send_email", "mcp__slack__post_message",
+                  "mcp__slack__slack_post_message", "mcp__github__create_issue", "mcp__github__merge_pull_request",
+                  "mcp__github__push_files", "mcp__github__get_and_delete", "mcp__fetch__fetch", "mcp__postgres__query",
+                  "mcp__x__update_get", "mcp__familiar__propose_draft", "mcp__familiar__remember", "mcp__familiar__get_x",
+                  "propose_draft", "ask_user", "Bash(ls)", "mcp__github__getIssue(x)", "mcp____get_x", "mcp__github"] {
+            assert_eq!(always_allow_rule(t, &json!({ "command": "ls", "file_path": ".claude/settings.json" })), None, "{t}");
         }
-    }
-
-    #[test]
-    fn exact_rules_hold_only_inside_the_workspace() {
-        let ws = std::env::temp_dir().join(format!("familiar-paths-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&ws);
-        std::fs::create_dir_all(ws.join("notes")).unwrap();
-        std::fs::write(ws.join("notes").join("today.md"), "x").unwrap();
-        let outside = std::env::temp_dir().join(format!("familiar-paths-out-{}", std::process::id()));
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("secret.txt"), "s").unwrap();
-        assert!(paths_inside("cat notes/today.md", None, &ws));
-        assert!(paths_inside("wc -l notes/today.md", None, &ws));
-        assert!(paths_inside("mkdir new/deeper", None, &ws), "missing parts can't lead elsewhere");
-        assert!(paths_inside("ls", None, &ws));
-        for c in ["cat ../x", "cat notes/../../x", "cat /etc/passwd"] {
-            assert!(!paths_inside(c, None, &ws), "{c}");
-        }
-        // A working directory outside the workspace (Codex reports one) is refused.
-        assert!(!paths_inside("cat secret.txt", Some(&outside), &ws));
-        assert!(paths_inside("cat today.md", Some(&ws.join("notes")), &ws));
-        let rule = Rule { pattern: "Bash(cat notes/today.md)".into(), decision: "allow".into() };
-        assert!(rule_holds(&rule, "Bash", &json!({ "command": "cat notes/today.md" }), &ws));
-
-        // A link (Windows junction, else a symlink) inside the workspace pointing out: never auto-approved.
-        let link = ws.join("link");
-        let made = if cfg!(windows) {
-            std::process::Command::new("cmd")
-                .args(["/c", "mklink", "/J"])
-                .arg(&link)
-                .arg(&outside)
-                .output()
-                .is_ok_and(|o| o.status.success())
-        } else {
-            #[cfg(unix)]
-            {
-                std::os::unix::fs::symlink(&outside, &link).is_ok()
-            }
-            #[cfg(not(unix))]
-            {
-                false
-            }
-        };
-        if made {
-            for c in ["cat link/secret.txt", "ls link", "mkdir link/new", "touch link/x"] {
-                assert!(!paths_inside(c, None, &ws), "{c}");
-            }
-            let rule = Rule { pattern: "Bash(cat link/secret.txt)".into(), decision: "allow".into() };
-            assert!(!rule_holds(&rule, "Bash", &json!({ "command": "cat link/secret.txt" }), &ws));
-            // Owner-written wildcard rules hold as written.
-            let wide = Rule { pattern: "Bash(cat *)".into(), decision: "allow".into() };
-            assert!(rule_holds(&wide, "Bash", &json!({ "command": "cat link/secret.txt" }), &ws));
-        } else {
-            eprintln!("skipped the link part: could not create a junction/symlink here");
-        }
-        let _ = std::fs::remove_dir(&link);
-        let _ = std::fs::remove_dir_all(&ws);
-        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

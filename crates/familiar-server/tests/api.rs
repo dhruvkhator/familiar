@@ -475,7 +475,7 @@ async fn approvals_edit_note_revise_and_always_allow() {
     let decide = |id: Uuid| format!("/api/approvals/{id}");
 
     // Edit & approve: only the offered field, only with approve, never together with "always".
-    let x = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(ls -la)")).await;
+    let x = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], None).await;
     for bad in [
         json!({ "decision": "approve", "edits": { "description": "x" } }),
         json!({ "decision": "approve", "edits": { "command": " " } }),
@@ -493,18 +493,20 @@ async fn approvals_edit_note_revise_and_always_allow() {
     assert!(v.get("rule").is_none());
 
     // Deny with a note: the note is the response.
-    let y = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(ls -la)")).await;
+    let y = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], None).await;
     let (_, v) = app.post(t, &decide(y), json!({ "decision": "deny", "response": "use the dashboard instead" })).await;
     assert_eq!((v["status"].as_str(), v["response"].as_str()), (Some("denied"), Some("use the dashboard instead")));
     assert!(v["edited_input"].is_null());
 
-    // Always allow: approves and adds the offered rule for this teammate only; the same rule is not added twice.
+    // Always allow (read-only connector tools only): approves and adds the offered rule for this teammate only; the
+    // same rule is not added twice.
+    let read = json!({ "owner": "acme", "repo": "app", "issue_number": 7 });
     for _ in 0..2 {
-        let z = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(ls -la)")).await;
+        let z = offered(&app, &a, r, b, "mcp__github__get_issue", read.clone(), &[], Some("mcp__github__get_issue")).await;
         let (s, v) = app.post(t, &decide(z), json!({ "decision": "approve", "always": true })).await;
         assert_eq!(s, 200, "{v}");
         assert_eq!(v["status"], "approved");
-        assert_eq!((v["rule"]["pattern"].as_str(), v["rule"]["decision"].as_str()), (Some("Bash(ls -la)"), Some("allow")));
+        assert_eq!((v["rule"]["pattern"].as_str(), v["rule"]["decision"].as_str()), (Some("mcp__github__get_issue"), Some("allow")));
         assert_eq!(v["rule"]["bot_id"].as_str(), Some(bot.as_str()));
     }
     let (_, rules) = app.get(t, &format!("/api/rules?bot_id={bot}")).await;
@@ -514,12 +516,15 @@ async fn approvals_edit_note_revise_and_always_allow() {
     assert_eq!(len(&app.get(t, &format!("/api/rules?bot_id={other}")).await.1), 0, "only the teammate that asked");
 
     // The stored rule is re-derived from the stored call: one the checks would not offer is refused.
-    for (input, rule) in [
-        (json!({ "command": "python report.py" }), "Bash(python report.py)"),
-        (json!({ "command": "ls -la" }), "Bash(ls *)"),
-        (json!({ "command": "ls -la" }), "Bash"),
+    for (tool, input, rule) in [
+        ("Bash", json!({ "command": "ls -la" }), "Bash(ls -la)"),
+        ("Bash", json!({ "command": "python report.py" }), "Bash(python report.py)"),
+        ("Bash", json!({ "command": "ls -la" }), "Bash"),
+        ("mcp__github__create_issue", json!({ "title": "x" }), "mcp__github__create_issue"),
+        ("mcp__browser__browser_click", json!({ "ref": "e1" }), "mcp__browser__browser_click"),
+        ("mcp__github__get_issue", read.clone(), "mcp__github__*"),
     ] {
-        let x = offered(&app, &a, r, b, "Bash", input, &["command"], Some(rule)).await;
+        let x = offered(&app, &a, r, b, tool, input, &[], Some(rule)).await;
         assert_eq!(app.post(t, &decide(x), json!({ "decision": "approve", "always": true })).await.0, 400, "{rule}");
         app.exec("update approvals set status = 'denied' where id = $1", &[x]).await;
     }
@@ -539,14 +544,14 @@ async fn approvals_edit_note_revise_and_always_allow() {
 
     // Stale requests: past their expiry, or of a run that is over, they can't be approved (nor add a rule) and are
     // marked expired.
-    let late = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(ls -la)")).await;
+    let late = offered(&app, &a, r, b, "mcp__github__get_issue", read.clone(), &[], Some("mcp__github__get_issue")).await;
     app.exec("update approvals set expires_at = now() - interval '1 minute' where id = $1", &[late]).await;
     let (s, v) = app.post(t, &decide(late), json!({ "decision": "approve", "always": true })).await;
     assert_eq!(s, 409, "{v}");
-    let soon = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(ls -la)")).await;
+    let soon = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], None).await;
     app.exec("update approvals set expires_at = now() + interval '10 minutes' where id = $1", &[soon]).await;
     let (_, gone_run) = app.chat(t, &bot, "another").await;
-    let over = offered(&app, &a, uid(&gone_run), b, "Bash", bash.clone(), &["command"], Some("Bash(ls -la)")).await;
+    let over = offered(&app, &a, uid(&gone_run), b, "Bash", bash.clone(), &["command"], None).await;
     app.exec("update runs set status = 'failed' where id = $1", &[uid(&gone_run)]).await;
     assert_eq!(app.post(t, &decide(over), json!({ "decision": "approve" })).await.0, 409);
     let statuses: Vec<String> = sqlx::query_scalar("select status from approvals where id = any($1) order by created_at")
@@ -560,7 +565,7 @@ async fn approvals_edit_note_revise_and_always_allow() {
     assert_eq!(app.post(t, &decide(soon), json!({ "decision": "deny" })).await.0, 200);
     // The owner sees teammate rules in the full list too, to remove them.
     let (_, all) = app.get(t, "/api/rules?all=1").await;
-    assert!(all.as_array().unwrap().iter().any(|r| r["pattern"] == "Bash(ls -la)" && r["bot_id"].as_str() == Some(bot.as_str())), "{all}");
+    assert!(all.as_array().unwrap().iter().any(|r| r["pattern"] == "mcp__github__get_issue" && r["bot_id"].as_str() == Some(bot.as_str())), "{all}");
 
     // Drafts: edit and approve (the proposal stays as it was), ask for changes, reject with a note.
     let draft = json!({ "kind": "reply", "channel": "X", "to": "https://x.com/a/status/1", "body": "Thanks!" });
