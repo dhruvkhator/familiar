@@ -600,10 +600,19 @@ impl Job<'_> {
     /// Answer a server request (approvals). Decisions run as their own tasks so the event loop keeps draining.
     fn request(&self, rpc: &Rpc, id: Value, method: &str, p: Value, turn: &Turn, scope: &CancellationToken) {
         let ask = |id: Value, tool: String, input: Value, tool_use_id: Option<String>, reason: Option<String>, accept: Value, decline: Value| {
-            let (ctx, run, rules, events, scope, rpc) =
-                (self.ctx.clone(), self.run.clone(), self.rules.to_vec(), self.events.clone(), scope.clone(), rpc.clone());
+            let (ctx, run, rules, events, scope, rpc, cwd) = (
+                self.ctx.clone(),
+                self.run.clone(),
+                self.rules.to_vec(),
+                self.events.clone(),
+                scope.clone(),
+                rpc.clone(),
+                self.cwd.to_path_buf(),
+            );
             tokio::spawn(async move {
-                let allow = decide(&ctx, &run, &tool, &input, tool_use_id.as_deref(), reason.as_deref(), &rules, &events, &scope).await;
+                let allow =
+                    decide(&ctx, &run, &tool, &input, tool_use_id.as_deref(), reason.as_deref(), &rules, &cwd, &events, &scope)
+                        .await;
                 rpc.reply(id, if allow { accept } else { decline });
             });
         };
@@ -656,6 +665,7 @@ async fn decide(
     tool_use_id: Option<&str>,
     reason: Option<&str>,
     rules: &[Rule],
+    workspace: &Path,
     events: &Events,
     cancel: &CancellationToken,
 ) -> bool {
@@ -666,7 +676,7 @@ async fn decide(
             false
         }
         // Codex approvals are accept / decline only: no edited input, no note for the model.
-        None => runner::decide_tool(ctx, run, tool, input, tool_use_id, reason, rules, events, cancel, false).await.allow,
+        None => runner::decide_tool(ctx, run, tool, input, tool_use_id, reason, rules, workspace, events, cancel, false).await.allow,
     }
 }
 

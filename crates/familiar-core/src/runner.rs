@@ -477,6 +477,7 @@ async fn drive(
                     run.clone(),
                     msg,
                     rules.to_vec(),
+                    spec.cwd.to_path_buf(),
                     proc.stdin.clone(),
                     events.clone(),
                     scope.clone(),
@@ -546,11 +547,13 @@ pub(crate) fn list_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Answer one `can_use_tool` request. Runs as its own task so the stdout loop keeps draining.
+#[allow(clippy::too_many_arguments)]
 async fn decide(
     ctx: Ctx,
     run: Run,
     msg: Value,
     rules: Vec<Rule>,
+    workspace: PathBuf,
     stdin: mpsc::UnboundedSender<Value>,
     events: Events,
     cancel: CancellationToken,
@@ -561,7 +564,8 @@ async fn decide(
     let input = req["input"].clone();
     let reason = req["decision_reason"].as_str().or_else(|| req["description"].as_str());
     let verdict =
-        decide_tool(&ctx, &run, &tool, &input, req["tool_use_id"].as_str(), reason, &rules, &events, &cancel, true).await;
+        decide_tool(&ctx, &run, &tool, &input, req["tool_use_id"].as_str(), reason, &rules, &workspace, &events, &cancel, true)
+            .await;
     // An owner's edit replaces the input (`updatedInput`): the tool runs what they approved.
     let input = verdict.input.as_ref().unwrap_or(&input);
     let _ = stdin.send(claude::permission_reply(&request_id, verdict.allow, input, &verdict.message));
@@ -614,9 +618,12 @@ impl Decision {
 }
 
 /// The engine-neutral permission decision for one tool call (Claude's can_use_tool, Codex's approval requests):
-/// research-only → deny; always-human → owner; safe navigation / owner Bash allow rules → allow; `review` rules →
-/// reviewer; everything else → owner. Records an `approval` event. `can_edit`: the engine runs an edited input
-/// (Claude's `updatedInput`; Codex can only accept or decline), so the owner may be offered "Edit & approve".
+/// research-only → deny; owner deny rules → deny; always-human → owner; safe navigation / owner allow rules (that
+/// still hold, [`permissions::rule_holds`]) → allow; `review` rules → reviewer; everything else → owner. The rules are
+/// read again for every decision, so one the owner adds or removes counts at once, also in a running session (`rules`,
+/// the run's copy, is only the fallback when the database can't be reached, minus its allow rules). Records an
+/// `approval` event. `can_edit`: the engine runs an edited input (Claude's `updatedInput`; Codex can only accept or
+/// decline), so the owner may be offered "Edit & approve".
 #[allow(clippy::too_many_arguments)]
 pub async fn decide_tool(
     ctx: &Ctx,
@@ -626,21 +633,35 @@ pub async fn decide_tool(
     tool_use_id: Option<&str>,
     engine_reason: Option<&str>,
     rules: &[Rule],
+    workspace: &Path,
     events: &Events,
     cancel: &CancellationToken,
     can_edit: bool,
 ) -> Verdict {
+    let rules = match ctx.db.rules(run.bot_id).await {
+        Ok(fresh) => fresh,
+        Err(e) => {
+            warn!(run = %run.id, "re-reading rules failed, using the run's without its allow rules: {e:#}");
+            rules.iter().filter(|r| r.decision != "allow").cloned().collect()
+        }
+    };
+    let rules = rules.as_slice();
     let owner = |reason: String| async move {
         human(ctx, run, tool_use_id, tool, input, &reason, rules, can_edit, events, cancel).await
     };
     let (status, by, message, edited) = if run.research() {
         ("denied".to_owned(), "rule", "This is a research-only run: it can look things up but cannot act.".to_owned(), None)
+    } else if let Some(rule) = permissions::owner_denies(rules, tool, input) {
+        // Deny rules win over everything, allow rules included.
+        ("denied".to_owned(), "rule", format!("Blocked by the owner's rule `{}`.", rule.pattern), None)
     } else if let Some(why) = permissions::always_human(tool, input) {
         // Neither owner rules nor the reviewer can unlock these.
         owner(format!("Always needs you: this {why}.")).await
     } else if permissions::safe_navigation(tool, input).await {
         ("approved".to_owned(), "rule", String::new(), None)
-    } else if let Some(rule) = permissions::owner_allows(rules, tool, input) {
+    } else if let Some(rule) =
+        permissions::owner_allows(rules, tool, input).filter(|r| permissions::rule_holds(r, tool, input, workspace))
+    {
         ("approved".to_owned(), "rule", format!("allowed by rule `{}`", rule.pattern), None)
     } else {
         let mut reason = engine_reason.map(str::to_owned);
@@ -749,7 +770,7 @@ pub async fn ask_human(ctx: &Ctx, run: &Run, ask: Ask<'_>, events: &Events, canc
     let Ask { tool_use_id, tool, input, reason, offer, timeout } = ask;
     let id = ctx
         .db
-        .create_approval(run, tool_use_id, tool, input, reason, &offer.editable, offer.allow_rule.as_deref())
+        .create_approval(run, tool_use_id, tool, input, reason, &offer.editable, offer.allow_rule.as_deref(), timeout)
         .await?;
     send(events, "approval", json!({ "approval_id": id, "tool_name": tool, "input": input, "status": "pending", "reason": reason }));
     ctx.db.set_run_waiting(run.id, true).await?;

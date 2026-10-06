@@ -287,11 +287,12 @@ impl Db {
         reason: Option<&str>,
         editable: &[String],
         allow_rule: Option<&str>,
+        timeout: std::time::Duration,
     ) -> Result<Uuid> {
         Ok(sqlx::query_scalar(
             "insert into approvals (run_id, bot_id, owner_id, tool_use_id, tool_name, input, reason, status, editable,
-                                    allow_rule)
-             values ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9) returning id",
+                                    allow_rule, expires_at)
+             values ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, now() + make_interval(secs => $10)) returning id",
         )
         .bind(run.id)
         .bind(run.bot_id)
@@ -302,6 +303,7 @@ impl Db {
         .bind(reason)
         .bind(editable)
         .bind(allow_rule)
+        .bind(timeout.as_secs_f64())
         .fetch_one(&self.pool)
         .await?)
     }

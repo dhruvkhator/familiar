@@ -537,6 +537,31 @@ async fn approvals_edit_note_revise_and_always_allow() {
     assert_eq!(len(&pending), 2, "refused decisions leave the approval pending");
     assert_eq!(pending[0]["editable"], json!([]));
 
+    // Stale requests: past their expiry, or of a run that is over, they can't be approved (nor add a rule) and are
+    // marked expired.
+    let late = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(ls -la)")).await;
+    app.exec("update approvals set expires_at = now() - interval '1 minute' where id = $1", &[late]).await;
+    let (s, v) = app.post(t, &decide(late), json!({ "decision": "approve", "always": true })).await;
+    assert_eq!(s, 409, "{v}");
+    let soon = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(ls -la)")).await;
+    app.exec("update approvals set expires_at = now() + interval '10 minutes' where id = $1", &[soon]).await;
+    let (_, gone_run) = app.chat(t, &bot, "another").await;
+    let over = offered(&app, &a, uid(&gone_run), b, "Bash", bash.clone(), &["command"], Some("Bash(ls -la)")).await;
+    app.exec("update runs set status = 'failed' where id = $1", &[uid(&gone_run)]).await;
+    assert_eq!(app.post(t, &decide(over), json!({ "decision": "approve" })).await.0, 409);
+    let statuses: Vec<String> = sqlx::query_scalar("select status from approvals where id = any($1) order by created_at")
+        .bind(vec![late, over])
+        .fetch_all(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(statuses, ["expired", "expired"]);
+    assert_eq!(len(&app.get(t, &format!("/api/rules?bot_id={bot}")).await.1), 1, "no rule from a stale request");
+    // Not yet expired: fine.
+    assert_eq!(app.post(t, &decide(soon), json!({ "decision": "deny" })).await.0, 200);
+    // The owner sees teammate rules in the full list too, to remove them.
+    let (_, all) = app.get(t, "/api/rules?all=1").await;
+    assert!(all.as_array().unwrap().iter().any(|r| r["pattern"] == "Bash(ls -la)" && r["bot_id"].as_str() == Some(bot.as_str())), "{all}");
+
     // Drafts: edit and approve (the proposal stays as it was), ask for changes, reject with a note.
     let draft = json!({ "kind": "reply", "channel": "X", "to": "https://x.com/a/status/1", "body": "Thanks!" });
     let fields = ["body", "subject", "to"];

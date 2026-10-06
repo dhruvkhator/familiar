@@ -12,8 +12,9 @@ pub const RESEARCH_TOOLS: &[&str] = &["Read", "Glob", "Grep", "WebSearch", "WebF
 pub const FULL_TOOLS: &[&str] = &["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite", "Skill"];
 
 /// Rules → Claude Code `permissions` settings.
-/// Owner `allow` rules for Bash are *not* forwarded: every non-trivial shell command reaches the daemon, which checks
-/// [`always_human`] first and only then applies the owner's allow rules ([`owner_allows`]). `review` rules go in as
+/// Owner `allow` rules are *not* forwarded: every such call reaches the daemon, which re-reads the rules on each
+/// decision (a rule the owner adds or removes counts at once, even in a running session), checks deny rules and
+/// [`always_human`] first, and only then applies the owner's allow rules ([`owner_allows`]). `review` rules go in as
 /// `ask` so they reach us too. Research-only runs may fetch any page (every prompt in them is denied anyway).
 pub fn settings(rules: &[Rule], research: bool) -> Value {
     let mut allow: Vec<&str> = FAMILIAR_ALLOWED.to_vec();
@@ -24,8 +25,7 @@ pub fn settings(rules: &[Rule], research: bool) -> Value {
     }
     for r in rules {
         match r.decision.as_str() {
-            "allow" if is_bash(&r.pattern) => {}
-            "allow" => allow.push(&r.pattern),
+            "allow" => {}
             "deny" => deny.push(&r.pattern),
             _ => ask.push(&r.pattern),
         }
@@ -39,26 +39,89 @@ fn is_bash(pattern: &str) -> bool {
 }
 
 /// For engines without Claude Code's permission settings (Codex): what those settings would decide on their own.
-/// `Some(false)` = an owner `deny` rule; `Some(true)` = pre-allowed (Familiar tools, look-only browser tools, owner
-/// `allow` rules other than Bash); `None` = goes through [`crate::runner::decide_tool`].
+/// `Some(false)` = an owner `deny` rule; `Some(true)` = pre-allowed (Familiar tools, look-only browser tools);
+/// `None` = goes through [`crate::runner::decide_tool`] (which also applies the owner's allow rules).
 pub fn preset(rules: &[Rule], tool: &str, input: &Value) -> Option<bool> {
-    if rules.iter().any(|r| r.decision == "deny" && matches(&r.pattern, tool, input)) {
+    if owner_denies(rules, tool, input).is_some() {
         return Some(false);
     }
-    let allowed = FAMILIAR_ALLOWED.iter().any(|p| matches(p, tool, input))
-        || rules.iter().any(|r| r.decision == "allow" && !is_bash(&r.pattern) && matches(&r.pattern, tool, input));
-    allowed.then_some(true)
+    FAMILIAR_ALLOWED.iter().any(|p| matches(p, tool, input)).then_some(true)
 }
 
-/// An owner `allow` rule the daemon applies itself (Bash rules, see [`settings`]). A rule for some commands
-/// (`Bash(git status *)`) never covers a compound one (`git status; curl … | sh`): only `Bash` or `*` do.
+/// The first owner `deny` rule matching this call.
+pub fn owner_denies<'a>(rules: &'a [Rule], tool: &str, input: &Value) -> Option<&'a Rule> {
+    rules.iter().filter(|r| r.decision == "deny").find(|r| matches(&r.pattern, tool, input))
+}
+
+/// An owner `allow` rule the daemon applies itself (see [`settings`]). A rule for some commands (`Bash(git status *)`)
+/// never covers a compound one (`git status; curl … | sh`): only `Bash` or `*` do.
 pub fn owner_allows<'a>(rules: &'a [Rule], tool: &str, input: &Value) -> Option<&'a Rule> {
     let compound = tool == "Bash" && input["command"].as_str().is_some_and(compound);
     rules
         .iter()
-        .filter(|r| r.decision == "allow" && is_bash(&r.pattern))
-        .filter(|r| !compound || !r.pattern.contains('('))
+        .filter(|r| r.decision == "allow")
+        .filter(|r| !compound || !is_bash(&r.pattern) || !r.pattern.contains('('))
         .find(|r| matches(&r.pattern, tool, input))
+}
+
+/// Whether an allow rule may approve this call without the owner, given what is on disk now. An exact command rule
+/// ("Always allow", `Bash(cat notes/today.md)`) holds only while every path it names resolves inside the workspace
+/// with no symlink or junction on the way: a link created later must not turn an approved read into a read of
+/// `~/.ssh`. Other rules hold as written.
+pub fn rule_holds(rule: &Rule, tool: &str, input: &Value, workspace: &std::path::Path) -> bool {
+    let exact = rule.pattern.starts_with("Bash(") && !rule.pattern.contains('*');
+    if tool != "Bash" || !exact {
+        return true;
+    }
+    let cwd = input["cwd"].as_str().map(std::path::Path::new);
+    input["command"].as_str().is_some_and(|c| paths_inside(c, cwd, workspace))
+}
+
+/// Every argument of `command` (flags aside) resolved from `cwd` (else the workspace) stays inside `workspace`, and no
+/// part of the way is a symlink or a reparse point (a Windows junction). A part that doesn't exist yet ends the walk
+/// (`mkdir new/dir`): nothing there can lead elsewhere.
+pub fn paths_inside(command: &str, cwd: Option<&std::path::Path>, workspace: &std::path::Path) -> bool {
+    use std::path::Component;
+    let Ok(root) = workspace.canonicalize() else { return false };
+    let base = match cwd {
+        Some(c) => match c.canonicalize() {
+            Ok(c) if c.starts_with(&root) => c,
+            _ => return false,
+        },
+        None => root.clone(),
+    };
+    for arg in command.split(' ').skip(1).filter(|w| !w.is_empty() && !w.starts_with('-')) {
+        let mut path = base.clone();
+        let mut existing = base.clone();
+        for part in std::path::Path::new(arg).components() {
+            match part {
+                Component::Normal(p) => path.push(p),
+                Component::CurDir => continue,
+                // Absolute, drive, UNC or `..`: never.
+                _ => return false,
+            }
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_symlink() || reparse_point(&m) => return false,
+                Ok(_) => existing = path.clone(),
+                Err(_) => break,
+            }
+        }
+        if !existing.canonicalize().is_ok_and(|e| e.starts_with(&root)) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(windows)]
+fn reparse_point(m: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    m.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT: symlinks, junctions, mount points
+}
+
+#[cfg(not(windows))]
+fn reparse_point(_: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Shell control operators, substitutions or redirections: more than one plain command.
@@ -457,9 +520,12 @@ mod tests {
         let rule = |p: &str, d: &str| Rule { pattern: p.into(), decision: d.into() };
         let rules = vec![rule("Bash(git push*)", "deny"), rule("Bash(ls*)", "allow"), rule("mcp__github__get_issue", "allow")];
         assert_eq!(preset(&rules, "Bash", &json!({ "command": "git push origin" })), Some(false));
-        // Bash allow rules are applied by decide_tool, after the always-human check.
+        // Owner allow rules are applied by decide_tool (re-read each time), after deny rules and the always-human check.
         assert_eq!(preset(&rules, "Bash", &json!({ "command": "ls -la" })), None);
-        assert_eq!(preset(&rules, "mcp__github__get_issue", &json!({})), Some(true));
+        assert_eq!(preset(&rules, "mcp__github__get_issue", &json!({})), None);
+        assert!(owner_allows(&rules, "mcp__github__get_issue", &json!({})).is_some());
+        // ...and never reach the CLI's own settings.
+        assert!(strings(&settings(&rules, false)["allow"]).iter().all(|p| !p.starts_with("Bash") && *p != "mcp__github__get_issue"));
         assert_eq!(preset(&rules, "mcp__familiar__remember", &json!({})), Some(true));
         assert_eq!(preset(&rules, "mcp__browser__browser_snapshot", &json!({})), Some(true));
         assert_eq!(preset(&rules, "mcp__browser__browser_click", &json!({})), None);
@@ -540,6 +606,64 @@ mod tests {
                   "Bash(ls)", "mcp__github__getIssue(x)"] {
             assert_eq!(always_allow_rule(t, &json!({ "file_path": ".claude/settings.json", "url": "https://example.com" })), None, "{t}");
         }
+    }
+
+    #[test]
+    fn exact_rules_hold_only_inside_the_workspace() {
+        let ws = std::env::temp_dir().join(format!("familiar-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(ws.join("notes")).unwrap();
+        std::fs::write(ws.join("notes").join("today.md"), "x").unwrap();
+        let outside = std::env::temp_dir().join(format!("familiar-paths-out-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "s").unwrap();
+        assert!(paths_inside("cat notes/today.md", None, &ws));
+        assert!(paths_inside("wc -l notes/today.md", None, &ws));
+        assert!(paths_inside("mkdir new/deeper", None, &ws), "missing parts can't lead elsewhere");
+        assert!(paths_inside("ls", None, &ws));
+        for c in ["cat ../x", "cat notes/../../x", "cat /etc/passwd"] {
+            assert!(!paths_inside(c, None, &ws), "{c}");
+        }
+        // A working directory outside the workspace (Codex reports one) is refused.
+        assert!(!paths_inside("cat secret.txt", Some(&outside), &ws));
+        assert!(paths_inside("cat today.md", Some(&ws.join("notes")), &ws));
+        let rule = Rule { pattern: "Bash(cat notes/today.md)".into(), decision: "allow".into() };
+        assert!(rule_holds(&rule, "Bash", &json!({ "command": "cat notes/today.md" }), &ws));
+
+        // A link (Windows junction, else a symlink) inside the workspace pointing out: never auto-approved.
+        let link = ws.join("link");
+        let made = if cfg!(windows) {
+            std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(&link)
+                .arg(&outside)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        } else {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&outside, &link).is_ok()
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+        if made {
+            for c in ["cat link/secret.txt", "ls link", "mkdir link/new", "touch link/x"] {
+                assert!(!paths_inside(c, None, &ws), "{c}");
+            }
+            let rule = Rule { pattern: "Bash(cat link/secret.txt)".into(), decision: "allow".into() };
+            assert!(!rule_holds(&rule, "Bash", &json!({ "command": "cat link/secret.txt" }), &ws));
+            // Owner-written wildcard rules hold as written.
+            let wide = Rule { pattern: "Bash(cat *)".into(), decision: "allow".into() };
+            assert!(rule_holds(&wide, "Bash", &json!({ "command": "cat link/secret.txt" }), &ws));
+        } else {
+            eprintln!("skipped the link part: could not create a junction/symlink here");
+        }
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]

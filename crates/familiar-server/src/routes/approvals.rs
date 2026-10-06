@@ -84,18 +84,35 @@ pub async fn decide(
     }
 
     let mut tx = st.pool.begin().await?;
-    let row: Option<(String, String, Option<sqlx::types::Json<Value>>, Vec<String>, Option<String>, Uuid)> =
-        sqlx::query_as(
-            "select status, tool_name, input, editable, allow_rule, bot_id from approvals
-             where id = $1 and owner_id = $2 for update",
-        )
-        .bind(id)
-        .bind(a.user)
-        .fetch_optional(&mut *tx)
-        .await?;
-    let (current, tool, input, editable, allow_rule, bot) = row.ok_or(ApiError::NotFound)?;
+    // The approval, its teammate (still the owner's) and whether it is still waiting: not past its expiry, and its run
+    // not over (a daemon that stopped mid-wait leaves it pending until its next start).
+    type Pending = (String, String, Option<sqlx::types::Json<Value>>, Vec<String>, Option<String>, Uuid, bool);
+    let row: Option<Pending> = sqlx::query_as(
+        "select a.status, a.tool_name, a.input, a.editable, a.allow_rule, a.bot_id,
+                coalesce(a.expires_at <= now(), false) or r.status in ('succeeded', 'failed', 'cancelled')
+         from approvals a
+         join bots b on b.id = a.bot_id and b.owner_id = a.owner_id
+         join runs r on r.id = a.run_id
+         where a.id = $1 and a.owner_id = $2 for update of a",
+    )
+    .bind(id)
+    .bind(a.user)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let (current, tool, input, editable, allow_rule, bot, stale) = row.ok_or(ApiError::NotFound)?;
     if current != "pending" {
         return Err(ApiError::conflict("approval is no longer pending"));
+    }
+    if stale {
+        sqlx::query(
+            "update approvals set status = 'expired', decided_by = 'rule', decided_at = now()
+             where id = $1 and status = 'pending'",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Err(ApiError::conflict("this request expired before it was decided"));
     }
     if status == "revise" && tool != "propose_draft" {
         return Err(ApiError::bad("only drafts can be sent back for changes"));
