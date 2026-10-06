@@ -6,7 +6,7 @@
 //! look: every component, both themes, the mascot in every state, and the motion primitives.
 //!
 //! Flags (both windows): `--theme light|dark|system`, `--reduce-motion`; gallery only: `--section <name>`; shell only:
-//! `--open needs|new|<teammate name>|first` (opens that page once the data is in), `--hidden` (start in the tray),
+//! `--open needs|schedules|new|<teammate name>|first` (opens that page once the data is in), `--hidden` (start in the tray),
 //! `--quit` (ask the running copy to quit; in host mode its engine drains first).
 
 // Release builds are GUI-subsystem binaries (no console window); debug builds keep the console for logs.
@@ -27,6 +27,7 @@ mod memory;
 mod notify;
 mod prefs;
 mod root;
+mod schedules;
 mod settings;
 mod setup;
 mod shell;

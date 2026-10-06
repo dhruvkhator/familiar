@@ -27,6 +27,7 @@ use uuid::Uuid;
 use crate::approval::ApprovalCards;
 use crate::bot_settings::{BotSettings, CreateEvent};
 use crate::chat::{BotPage, TAB_SETTINGS};
+use crate::schedules::SchedulesPage;
 use crate::settings::AppSettings;
 use crate::data::{AppData, Status, Teammate, ago, excerpt, run_status, tail, until};
 use crate::templates::{Picked, TemplatePicker};
@@ -35,6 +36,7 @@ use crate::templates::{Picked, TemplatePicker};
 pub enum Route {
     Today,
     NeedsYou,
+    Schedules,
     Teammate(SharedString),
     Settings,
     NewTeammate,
@@ -53,6 +55,7 @@ pub struct Shell {
     /// Teammate pages, kept so switching back is instant and keeps the scroll.
     pages: HashMap<Uuid, Entity<BotPage>>,
     settings: Option<Entity<AppSettings>>,
+    schedules: Option<Entity<SchedulesPage>>,
     /// The New teammate flow while it is open (fresh each time): the template picker, then the form.
     picker: Option<Entity<TemplatePicker>>,
     new_bot: Option<Entity<BotSettings>>,
@@ -112,6 +115,7 @@ impl Shell {
             inbox: ApprovalCards::big(),
             pages: HashMap::new(),
             settings: None,
+            schedules: None,
             picker: None,
             new_bot: None,
             form_gen: 0,
@@ -119,7 +123,7 @@ impl Shell {
         }
     }
 
-    /// Open a page by name: `today`, `needs`, `settings`, `first`, a teammate's name or `bot:<id>`, optionally with
+    /// Open a page by name: `today`, `needs`, `schedules`, `settings`, `first`, a teammate's name or `bot:<id>`, optionally with
     /// `/settings` for that teammate's Settings tab. Returns whether it matched.
     pub fn open(&mut self, target: &str, cx: &mut Context<Self>) -> bool {
         let want = target.trim().to_lowercase();
@@ -130,6 +134,7 @@ impl Shell {
         let route = match who.as_str() {
             "today" => Some(Route::Today),
             "needs" => Some(Route::NeedsYou),
+            "schedules" => Some(Route::Schedules),
             "settings" => Some(Route::Settings),
             "new" => Some(Route::NewTeammate),
             _ => {
@@ -289,7 +294,8 @@ impl Shell {
                                 .flex_col()
                                 .gap(px(2.0))
                                 .child(nav("nav-today", "Today", icons::HOME, Route::Today, 0))
-                                .child(nav("nav-needs", "Needs you", icons::BELL, Route::NeedsYou, pending)),
+                                .child(nav("nav-needs", "Needs you", icons::BELL, Route::NeedsYou, pending))
+                                .child(nav("nav-schedules", "Schedules", icons::CALENDAR, Route::Schedules, 0)),
                         )
                         .child(
                             div()
@@ -352,6 +358,11 @@ impl Shell {
             Route::NeedsYou => {
                 let page = self.needs_you(window, cx).into_any_element();
                 self.scrolled(page)
+            }
+            Route::Schedules => {
+                let (data, toasts) = (self.data.clone(), self.toasts.clone());
+                let page = self.schedules.get_or_insert_with(|| cx.new(|cx| SchedulesPage::new(data, toasts, cx))).clone();
+                self.scrolled(page.into_any_element())
             }
             Route::Teammate(id) => self.bot_page(id, window, cx),
             Route::Settings => {
@@ -730,7 +741,7 @@ impl Shell {
                                 .flex_col()
                                 .flex_1()
                                 .min_w_0()
-                                .child(div().truncate().child(excerpt(&s.prompt, 80)))
+                                .child(div().truncate().child(crate::schedules::label_of(s)))
                                 .child(
                                     div()
                                         .text_size(px(text::CAPTION))
@@ -816,10 +827,11 @@ impl Shell {
 
     fn needs_you(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        // Oldest first: the one that has waited longest is at the top.
+        // Drafts first (they are reviewed as a batch), then the rest; oldest first within each.
         let mut pending = self.data.read(cx).pending.clone();
-        pending.sort_by_key(|a| a.created_at);
+        pending.sort_by_key(|a| (!a.is_draft(), a.created_at));
         let n = pending.len();
+        let drafts = pending.iter().filter(|a| a.is_draft()).count();
         let head = div()
             .flex()
             .flex_col()
@@ -830,13 +842,19 @@ impl Shell {
                     .items_center()
                     .gap(px(10.0))
                     .child(div().text_size(px(text::HEADLINE)).font_weight(FontWeight::SEMIBOLD).text_color(theme.ink).child("Needs you"))
-                    .when(n > 0, |el| el.child(chip(Tone::Warn, format!("{n} waiting"), cx))),
+                    .when(n > 0, |el| el.child(chip(Tone::Warn, format!("{n} waiting"), cx)))
+                    .when(drafts > 0, |el| {
+                        el.child(chip(Tone::Accent, format!("{drafts} draft{}", if drafts == 1 { "" } else { "s" }), cx))
+                    }),
             )
             .child(
                 div()
                     .text_size(px(text::LEAD))
                     .text_color(theme.muted)
-                    .child("Teammates pause here until you decide. Requests expire after 30 minutes."),
+                    .child(
+                        "Teammates pause here until you decide. Drafts wait a day for you; other requests expire after \
+                         30 minutes. Approving a draft moves you to the next one.",
+                    ),
             );
         let mut page = div().flex().flex_col().gap(px(24.0)).child(anim::appear("needs-head", head));
         if pending.is_empty() {
@@ -850,11 +868,9 @@ impl Shell {
                     .py(px(48.0))
                     .child(Mascot::new("needs-empty", familiar_ui::mascot::default_avatar("needs"), MascotState::Done, 88.0))
                     .child(div().text_size(px(text::TITLE)).font_weight(FontWeight::SEMIBOLD).child("You're all caught up"))
-                    .child(
-                        div()
-                            .text_color(theme.muted)
-                            .child("When a teammate wants to run something risky or has a question, it shows up here."),
-                    ),
+                    .child(div().text_color(theme.muted).child(
+                        "When a teammate drafts a post or a reply, wants to run something risky or has a question, it shows up here.",
+                    )),
             ));
         } else {
             let data = self.data.clone();
