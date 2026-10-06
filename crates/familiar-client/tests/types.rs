@@ -93,6 +93,31 @@ fn misc_rows() {
 }
 
 #[test]
+fn templates_and_bot_setup() {
+    let t: Template = de(json!({
+        "id": "lead-researcher", "name": "Lead researcher", "category": "Sales", "summary": "s",
+        "avatar": {"shape": 2, "color": "#4fa9cf", "eyes": 3, "mouth": 0, "accessory": "glasses"}, "model": "sonnet",
+        "questions": [{"key": "icp", "label": "Your ideal customer", "placeholder": "B2B", "multiline": true}],
+        "instructions": "Find {{icp}}", "schedules": [{"label": "Find", "cron": "0 8 * * 2,4", "prompt": "p"}],
+        "logins": [{"site": "LinkedIn", "url": "https://www.linkedin.com/login"}], "connectors": ["brave-search"],
+        "first_task": null, "future": 1
+    }));
+    assert_eq!((t.questions[0].key.as_str(), t.questions[0].multiline), ("icp", true));
+    assert_eq!(t.avatar.unwrap().accessory.as_deref(), Some("glasses"));
+    assert_eq!((t.schedules[0].cron.as_str(), t.logins[0].site.as_str(), t.first_task), ("0 8 * * 2,4", "LinkedIn", None));
+    let h: Hired = de(json!({"bot": {"id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "name": "Scout", "setup": {
+        "template": "lead-researcher", "logins": [{"site": "LinkedIn", "url": "https://x", "done": true}],
+        "schedules": ["6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10"], "dismissed": false}}, "first_task": "go"}));
+    let setup = h.bot.setup.unwrap();
+    assert!(setup.logins[0].done && !setup.dismissed && setup.schedules.len() == 1);
+    let plain: Bot = de(json!({"id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "setup": null}));
+    assert!(plain.setup.is_none());
+    let body = FromTemplate { name: Some("Scout".into()), answers: Some([("icp".to_owned(), "SaaS".to_owned())].into()), ..Default::default() };
+    assert_eq!(serde_json::to_value(body).unwrap(), json!({"answers": {"icp": "SaaS"}, "name": "Scout"}));
+    assert_eq!(serde_json::to_value(SetupPatch { dismissed: Some(true), ..Default::default() }).unwrap(), json!({"dismissed": true}));
+}
+
+#[test]
 fn request_bodies_skip_unset() {
     assert_eq!(serde_json::to_value(NewBot { name: Some("x".into()), ..Default::default() }).unwrap(), json!({"name": "x"}));
     assert_eq!(serde_json::to_value(BotPatch { avatar: Some(serde_json::Value::Null), ..Default::default() }).unwrap(), json!({"avatar": null}));

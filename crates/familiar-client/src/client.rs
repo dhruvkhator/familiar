@@ -297,6 +297,22 @@ impl Client {
         self.mutate::<Value>(Method::DELETE, &format!("/api/bots/{id}"), None, true).await.map(|_| ())
     }
 
+    /// Tick a template login or hide the Set up checklist.
+    pub async fn update_bot_setup(&self, id: Uuid, p: &SetupPatch) -> Result<Bot, ApiError> {
+        self.mutate(Method::PATCH, &format!("/api/bots/{id}/setup"), Some(body(p)), true).await
+    }
+
+    // ---- templates ------------------------------------------------------
+
+    pub async fn templates(&self) -> Result<Vec<Template>, ApiError> {
+        self.get("/api/templates").await
+    }
+    /// Hire a teammate from a template: the bot, its schedules (off) and its Set up checklist, in one go.
+    pub async fn create_from_template(&self, id: &str, b: &FromTemplate) -> Result<Hired, ApiError> {
+        let id = url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>();
+        self.mutate(Method::POST, &format!("/api/templates/{id}/create"), Some(body(b)), true).await
+    }
+
     // ---- threads & messages ---------------------------------------------
 
     pub async fn threads(&self, bot: Uuid) -> Result<Vec<Thread>, ApiError> {

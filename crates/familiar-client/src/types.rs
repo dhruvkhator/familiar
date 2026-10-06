@@ -75,6 +75,27 @@ pub struct Bot {
     pub last_run_at: Option<DateTime<Utc>>,
     pub last_dreamed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// What the template it was hired from set up (`None` for a teammate made from scratch).
+    pub setup: Option<BotSetup>,
+}
+
+/// `bots.setup`: the template's sign-ins (ticked off by the owner) and the schedules it created (off at first).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BotSetup {
+    pub template: Option<String>,
+    pub logins: Vec<SetupLogin>,
+    pub schedules: Vec<Uuid>,
+    /// The owner hid the Set up checklist.
+    pub dismissed: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SetupLogin {
+    pub site: String,
+    pub url: String,
+    pub done: bool,
 }
 
 impl Bot {
@@ -363,6 +384,60 @@ pub struct ConnectorPreset {
     pub verify: bool,
 }
 
+/// A ready-made teammate from `GET /api/templates`. Answers to `questions` fill the `{{key}}` placeholders in
+/// `instructions`, the schedule prompts and `first_task`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Template {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub summary: String,
+    pub avatar: Option<Avatar>,
+    /// A Claude alias (`sonnet`, ...).
+    pub model: String,
+    pub questions: Vec<TemplateQuestion>,
+    pub instructions: String,
+    pub schedules: Vec<TemplateSchedule>,
+    pub logins: Vec<TemplateLogin>,
+    /// Connector preset ids it benefits from.
+    pub connectors: Vec<String>,
+    pub first_task: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TemplateQuestion {
+    pub key: String,
+    pub label: String,
+    pub placeholder: String,
+    pub multiline: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TemplateSchedule {
+    pub label: String,
+    /// 5-field cron in the owner's local time.
+    pub cron: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TemplateLogin {
+    pub site: String,
+    pub url: String,
+}
+
+/// Response of `POST /api/templates/{id}/create`: the new teammate and its first task, filled in.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Hired {
+    pub bot: Bot,
+    pub first_task: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Connector {
@@ -533,6 +608,17 @@ body!(TriggerPatch { name: String, prompt: String, kind: String, enabled: bool }
 body!(NewChannel { kind: String, token: String, default_bot_id: Uuid });
 body!(ChannelPatch { token: String, default_bot_id: Uuid, enabled: bool });
 body!(AccountUpdate { current_password: String, email: String, new_password: String });
+body!(
+    /// Hire from a template; unset fields take the template's.
+    FromTemplate {
+        answers: std::collections::BTreeMap<String, String>, name: String, instructions: String, engine: String,
+        model: String, avatar: Avatar,
+    }
+);
+body!(
+    /// Tick a template login (`done` defaults to true) and/or hide the Set up checklist.
+    SetupPatch { login: String, done: bool, dismissed: bool }
+);
 
 /// Secrets for a connector: env vars (stdio) and/or headers (http). Write-only.
 #[derive(Debug, Clone, Default, Serialize)]

@@ -92,6 +92,26 @@ async fn setup_bot_message_notice() {
     client.cached_get::<Overview>("/api/overview", |_| hit = true).await.unwrap();
     assert!(hit);
 
+    // templates: hire one, its schedules start off, tick a sign-in on its Set up checklist
+    let templates = client.templates().await.unwrap();
+    assert!(templates.len() >= 9);
+    let t = templates.iter().find(|t| t.id == "social-media-manager").expect("in the catalog");
+    assert!(!t.questions.is_empty() && t.avatar.is_some());
+    let answers = [("product".to_owned(), "Familiar".to_owned())].into_iter().collect();
+    let hired = client
+        .create_from_template(&t.id, &FromTemplate { answers: Some(answers), name: Some("Poster".into()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(hired.bot.name, "Poster");
+    assert!(hired.bot.persona.as_deref().unwrap_or_default().contains("social media for Familiar"));
+    assert!(hired.first_task.is_some());
+    let setup = hired.bot.setup.clone().expect("template setup");
+    assert_eq!((setup.logins.len(), setup.schedules.len()), (t.logins.len(), t.schedules.len()));
+    assert!(client.schedules(hired.bot.id).await.unwrap().iter().all(|s| !s.enabled && setup.schedules.contains(&s.id)));
+    let site = setup.logins[0].site.clone();
+    let bot = client.update_bot_setup(hired.bot.id, &SetupPatch { login: Some(site), ..Default::default() }).await.unwrap();
+    assert!(bot.setup.unwrap().logins[0].done);
+
     client.logout().await.unwrap();
     assert!(client.token().is_none());
 
