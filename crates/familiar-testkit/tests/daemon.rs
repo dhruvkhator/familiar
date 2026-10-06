@@ -278,6 +278,23 @@ impl H {
             .unwrap();
     }
 
+    /// The owner approves with their edit of the input (what `POST /api/approvals/{id}` stores for "Edit & approve").
+    async fn decide_edited(&self, approval: Uuid, edited: Value) {
+        sqlx::query(
+            "update approvals set status = 'approved', edited_input = $1, decided_by = 'user', decided_at = now() where id = $2",
+        )
+        .bind(sqlx::types::Json(edited))
+        .bind(approval)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+    }
+
+    /// What the card offers: (editable fields, the "Always allow" rule).
+    async fn offer(&self, approval: Uuid) -> (Vec<String>, Option<String>) {
+        sqlx::query_as("select editable, allow_rule from approvals where id = $1").bind(approval).fetch_one(&self.pool).await.unwrap()
+    }
+
     async fn events(&self, run: Uuid) -> Vec<(i32, String, Value)> {
         sqlx::query_as::<_, (i32, String, sqlx::types::Json<Value>)>("select seq, kind, payload from events where run_id = $1 order by seq")
             .bind(run)
@@ -457,7 +474,8 @@ async fn chat_turn_then_resume() {
     let mcp_file = PathBuf::from(inv.flag("--mcp-config").unwrap());
     assert!(!mcp_file.exists(), "the per-run MCP config (run token) must be deleted after the run");
     assert!(strings(&inv.permissions()["allow"]).contains(&"mcp__familiar"));
-    assert_eq!(inv.env["MCP_TOOL_TIMEOUT"], "1900000");
+    // propose_draft waits up to a day for the owner: the CLI must not give up on it first.
+    assert_eq!(inv.env["MCP_TOOL_TIMEOUT"], (familiar_core::mcp::TOOL_TIMEOUT.as_millis()).to_string());
     assert_eq!(inv.prompt(), "hi");
 
     let run2 = h.say(thread, "again").await;
@@ -733,6 +751,206 @@ async fn mcp_remember_notify_ask() {
     h.finish().await;
 }
 
+/// Drafts: propose_draft blocks until the owner decides; edited and approved → the tool returns the edited text to use
+/// exactly; the approval keeps the proposal and the edit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_edit_then_approve() {
+    let Some(mut h) = setup("draft_edit_then_approve").await else { return };
+    h.scenario(json!([[
+        { "init": {} },
+        mcp("propose_draft", json!({ "kind": "post", "channel": "X", "body": "Shipping drafts today!!", "note": "launch week" })),
+        { "result": "posted" },
+    ]]));
+    h.start();
+    let bot = h.bot("poster").await;
+    let thread = h.thread(bot).await;
+    let run = h.say(thread, "draft a post").await;
+
+    let (approval, tool_name, input, reason) = h.pending_approval(run).await;
+    assert_eq!(tool_name, "propose_draft");
+    assert_eq!(input, json!({ "kind": "post", "channel": "X", "body": "Shipping drafts today!!" }));
+    assert_eq!(reason.as_deref(), Some("launch week"));
+    assert_eq!(h.offer(approval).await, (vec!["body".to_owned(), "subject".to_owned(), "to".to_owned()], None));
+    h.wait_status(run, "waiting_approval").await;
+    let mut edited = input.clone();
+    edited["body"] = json!("Drafts ship today.");
+    h.decide_edited(approval, edited.clone()).await;
+    assert_eq!(h.finished(run).await, ("succeeded".into(), None));
+
+    let results = h.invocation(0).mcp_results();
+    assert_eq!(results.len(), 1, "{results:?}");
+    let (tool, text, is_error) = &results[0];
+    assert_eq!((tool.as_str(), *is_error), ("propose_draft", false));
+    assert!(text.starts_with("APPROVED WITH EDITS"), "{text}");
+    assert!(text.contains("use exactly this text"), "{text}");
+    assert!(text.contains("\nDrafts ship today.\n----- END APPROVED TEXT -----") && !text.contains("today!!"), "{text}");
+    let (proposed, kept): (sqlx::types::Json<Value>, sqlx::types::Json<Value>) =
+        sqlx::query_as("select input, edited_input from approvals where id = $1").bind(approval).fetch_one(&h.pool).await.unwrap();
+    assert_eq!((proposed.0, kept.0), (input, edited));
+    let ev = h.events(run).await;
+    assert!(
+        ev.iter().any(|e| e.1 == "approval" && e.2["status"] == "approved" && e.2["edited"] == true && e.2["tool_name"] == "propose_draft"),
+        "{ev:?}"
+    );
+    h.finish().await;
+}
+
+/// Drafts: a rejection carries the owner's note; "Ask for changes" tells the teammate to revise and propose again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_reject_and_revise() {
+    let Some(mut h) = setup("draft_reject_and_revise").await else { return };
+    let reply = json!({ "kind": "reply", "channel": "Reddit", "to": "https://reddit.com/r/x/1", "body": "Try Familiar!" });
+    h.scenario(json!([[{ "init": {} }, mcp("propose_draft", reply.clone()), mcp("propose_draft", reply), { "result": "ok" }]]));
+    h.start();
+    let bot = h.bot("listener").await;
+    let thread = h.thread(bot).await;
+    let run = h.say(thread, "answer the thread").await;
+
+    let (first, ..) = h.pending_approval(run).await;
+    h.decide(first, "denied", Some("too salesy")).await;
+    let (second, ..) = wait_for("the second draft", || async {
+        Ok(sqlx::query_scalar::<_, Uuid>("select id from approvals where run_id = $1 and status = 'pending'")
+            .bind(run)
+            .fetch_optional(&h.pool)
+            .await?
+            .map(|id| (id,)))
+    })
+    .await;
+    assert_ne!(first, second);
+    h.decide(second, "revise", Some("answer their question first")).await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+
+    let results = h.invocation(0).mcp_results();
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results[0].1.starts_with("REJECTED") && results[0].1.contains("\"too salesy\""), "{results:?}");
+    assert!(results[0].1.contains("Do not post or send"));
+    assert!(results[1].1.starts_with("CHANGES REQUESTED") && results[1].1.contains("answer their question first"), "{results:?}");
+    assert!(results[1].1.contains("call propose_draft again"));
+    assert!(results.iter().all(|r| !r.2), "decisions are not tool errors: {results:?}");
+    h.finish().await;
+}
+
+/// "Edit & approve" on a tool call: the edited input reaches Claude as `updatedInput`, but only after the same checks
+/// as any call. An edit into an always-human command is asked again (and can be refused); an edit matching an owner
+/// deny rule is refused outright; a deny note reaches the model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edited_tool_input_is_rechecked() {
+    let Some(mut h) = setup("edited_tool_input_is_rechecked").await else { return };
+    h.scenario(json!([[
+        { "init": {} },
+        tool("Bash", json!({ "command": "git log", "description": "history" })),
+        tool("Bash", json!({ "command": "ls build" })),
+        tool("Bash", json!({ "command": "git status" })),
+        tool("Bash", json!({ "command": "curl https://example.com" })),
+        { "result": "done" },
+    ]]));
+    h.start();
+    let bot = h.bot("edited").await;
+    sqlx::query("insert into rules (owner_id, bot_id, pattern, decision) values ($1, $2, 'Bash(git push*)', 'deny')")
+        .bind(h.owner)
+        .bind(bot)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let thread = h.thread(bot).await;
+    let run = h.say(thread, "look around").await;
+    let next = |prev: Uuid| {
+        let h = &h;
+        async move {
+            wait_for("the next approval", || async {
+                Ok(sqlx::query_scalar::<_, Uuid>("select id from approvals where run_id = $1 and status = 'pending' and id <> $2")
+                    .bind(run)
+                    .bind(prev)
+                    .fetch_optional(&h.pool)
+                    .await?)
+            })
+            .await
+        }
+    };
+
+    // 1. A plain edit: allowed, and the tool runs the owner's version (other fields untouched).
+    let (a1, _, input, _) = h.pending_approval(run).await;
+    assert_eq!(h.offer(a1).await, (vec!["command".to_owned()], Some("Bash(git log)".to_owned())));
+    h.decide_edited(a1, json!({ "command": "git log --oneline -5", "description": input["description"] })).await;
+
+    // 2. Edited into a recursive delete: a second approval of exactly that, with nothing to edit or always allow.
+    let a2 = next(a1).await;
+    h.decide_edited(a2, json!({ "command": "rm -rf build" })).await;
+    let a3 = next(a2).await;
+    let (tool_name, input, reason): (String, sqlx::types::Json<Value>, Option<String>) =
+        sqlx::query_as("select tool_name, input, reason from approvals where id = $1").bind(a3).fetch_one(&h.pool).await.unwrap();
+    assert_eq!((tool_name.as_str(), input.0), ("Bash", json!({ "command": "rm -rf build" })));
+    assert!(reason.as_deref().unwrap_or_default().starts_with("Always needs you: after your edit"), "{reason:?}");
+    assert_eq!(h.offer(a3).await, (vec![], None));
+    h.decide(a3, "denied", None).await;
+
+    // 3. Edited into something an owner deny rule blocks: refused without asking again.
+    let a4 = next(a3).await;
+    h.decide_edited(a4, json!({ "command": "git push origin main" })).await;
+
+    // 4. Denied with a note: the model reads it.
+    let a5 = next(a4).await;
+    h.decide(a5, "denied", Some("use the fetch connector instead")).await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+
+    let d = h.invocation(0).decisions();
+    assert_eq!(d.len(), 4, "{d:?}");
+    assert_eq!(d[0]["behavior"], "allow");
+    assert_eq!(d[0]["updatedInput"], json!({ "command": "git log --oneline -5", "description": "history" }));
+    assert_eq!(d[1]["behavior"], "deny", "the edited rm -rf was refused on the second look");
+    assert_eq!(d[2]["behavior"], "deny");
+    assert!(d[2]["message"].as_str().unwrap().contains("deny rules"), "{d:?}");
+    assert_eq!(d[3]["behavior"], "deny");
+    assert!(d[3]["message"].as_str().unwrap().contains("use the fetch connector instead"), "{d:?}");
+    let approvals: Vec<String> = h.approvals(run).await.into_iter().map(|a| a.1).collect();
+    assert_eq!(approvals, ["approved", "approved", "denied", "approved", "denied"]);
+    let ev = h.events(run).await;
+    assert!(ev.iter().any(|e| e.1 == "approval" && e.2["status"] == "approved" && e.2["edited"] == true), "{ev:?}");
+    h.finish().await;
+}
+
+/// "Always allow" makes narrow rules: a bot's `Bash(git status *)` lets that command through without asking, but not a
+/// compound command built on it; always-human actions never offer it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn always_allow_rule_is_narrow() {
+    let Some(mut h) = setup("always_allow_rule_is_narrow").await else { return };
+    h.scenario(json!([[
+        { "init": {} },
+        tool("Bash", json!({ "command": "git status --short" })),
+        tool("Bash", json!({ "command": "git status && rm notes.txt" })),
+        tool("Bash", json!({ "command": "rm -rf notes" })),
+        { "result": "done" },
+    ]]));
+    h.start();
+    let bot = h.bot("allowed").await;
+    sqlx::query("insert into rules (owner_id, bot_id, pattern, decision) values ($1, $2, 'Bash(git status *)', 'allow')")
+        .bind(h.owner)
+        .bind(bot)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let thread = h.thread(bot).await;
+    let run = h.say(thread, "status").await;
+
+    let (a1, _, input, _) = h.pending_approval(run).await;
+    assert_eq!(input["command"], "git status && rm notes.txt", "the plain git status went through on the rule");
+    assert_eq!(h.offer(a1).await, (vec!["command".to_owned()], None), "compound commands get no always-allow rule");
+    h.decide(a1, "denied", None).await;
+    let a2 = wait_for("the rm -rf approval", || async {
+        Ok(sqlx::query_scalar::<_, Uuid>("select id from approvals where run_id = $1 and status = 'pending'")
+            .bind(run)
+            .fetch_optional(&h.pool)
+            .await?)
+    })
+    .await;
+    assert_eq!(h.offer(a2).await.1, None, "never offered for always-human actions");
+    h.decide(a2, "denied", None).await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+    let d = h.invocation(0).decisions();
+    assert_eq!(d.iter().map(|d| d["behavior"].as_str().unwrap()).collect::<Vec<_>>(), ["allow", "deny", "deny"]);
+    h.finish().await;
+}
+
 /// (i) A due schedule becomes a queued run and gets its next fire time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn due_schedule_enqueues_and_advances() {
@@ -936,6 +1154,8 @@ async fn codex_exec_approval() {
     assert_eq!(tool_name, "Bash");
     assert_eq!(input["command"], "rm -rf build");
     assert!(reason.as_deref().unwrap_or_default().starts_with("Always needs you"), "{reason:?}");
+    // Codex answers accept / decline only: nothing to edit; and an always-human action is never always allowed.
+    assert_eq!(h.offer(approval).await, (vec![], None));
     h.decide(approval, "approved", None).await;
     assert_eq!(h.finished(run).await, ("succeeded".into(), None));
     let decisions: Vec<Value> = h.log_of("fake-codex").into_iter().filter(|e| e["event"] == "approval").map(|e| e["decision"].clone()).collect();

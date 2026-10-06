@@ -275,6 +275,9 @@ impl Db {
         Ok(())
     }
 
+    /// A pending approval. `editable` / `allow_rule`: what the owner may do besides approve and deny (see
+    /// [`crate::runner::Offer`]).
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_approval(
         &self,
         run: &Run,
@@ -282,10 +285,13 @@ impl Db {
         tool_name: &str,
         input: &Value,
         reason: Option<&str>,
+        editable: &[String],
+        allow_rule: Option<&str>,
     ) -> Result<Uuid> {
         Ok(sqlx::query_scalar(
-            "insert into approvals (run_id, bot_id, owner_id, tool_use_id, tool_name, input, reason, status)
-             values ($1, $2, $3, $4, $5, $6, $7, 'pending') returning id",
+            "insert into approvals (run_id, bot_id, owner_id, tool_use_id, tool_name, input, reason, status, editable,
+                                    allow_rule)
+             values ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9) returning id",
         )
         .bind(run.id)
         .bind(run.bot_id)
@@ -294,16 +300,21 @@ impl Db {
         .bind(tool_name)
         .bind(Json(input))
         .bind(reason)
+        .bind(editable)
+        .bind(allow_rule)
         .fetch_one(&self.pool)
         .await?)
     }
 
-    pub async fn approval_status(&self, id: Uuid) -> Result<(String, Option<String>)> {
-        Ok(sqlx::query_as("select status, response from approvals where id = $1 and owner_id = $2")
-            .bind(id)
-            .bind(self.owner)
-            .fetch_one(&self.pool)
-            .await?)
+    /// (status, the owner's answer or note, the input as the owner edited it).
+    pub async fn approval_status(&self, id: Uuid) -> Result<(String, Option<String>, Option<Value>)> {
+        let (status, response, edited): (String, Option<String>, Option<Json<Value>>) =
+            sqlx::query_as("select status, response, edited_input from approvals where id = $1 and owner_id = $2")
+                .bind(id)
+                .bind(self.owner)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok((status, response, edited.map(|j| j.0)))
     }
 
     /// Resolve a still-pending approval (expiry, or the run ending while it waited).

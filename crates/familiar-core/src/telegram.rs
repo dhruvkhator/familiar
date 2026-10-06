@@ -360,11 +360,21 @@ impl Telegram {
             ("pending", None) => {
                 let what = describe(&tool, &input);
                 let why = reason.filter(|r| !r.is_empty()).map(|r| format!("\n\n{r}")).unwrap_or_default();
-                let text = format!("🔐 {bot} wants to {what}{why}");
-                let buttons = json!({ "reply_markup": { "inline_keyboard": [[
-                    { "text": "✅ Approve", "callback_data": format!("y:{id}") },
-                    { "text": "❌ Deny", "callback_data": format!("n:{id}") },
-                ]] } });
+                // A draft too long to show whole here is only reviewed in the app: nothing is approved unseen.
+                let partial = tool == "propose_draft" && input["body"].as_str().is_some_and(|b| b.chars().count() > 3000);
+                let text = if partial {
+                    format!("🔐 {bot} wants to {what}{why}\n\nToo long to show in full here: review it in Familiar.")
+                } else {
+                    format!("🔐 {bot} wants to {what}{why}")
+                };
+                let buttons = if partial {
+                    json!({})
+                } else {
+                    json!({ "reply_markup": { "inline_keyboard": [[
+                        { "text": "✅ Approve", "callback_data": format!("y:{id}") },
+                        { "text": "❌ Deny", "callback_data": format!("n:{id}") },
+                    ]] } })
+                };
                 if let Some(mid) = self.send(&text, buttons).await {
                     self.approval_msgs.insert(id, mid);
                 }
@@ -475,6 +485,13 @@ impl Telegram {
 
 /// Human-readable "wants to …" for an approval.
 fn describe(tool: &str, input: &Value) -> String {
+    if tool == "propose_draft" {
+        // Approving here sends the draft as written; editing it or asking for changes happens in the app.
+        let s = |k: &str| input[k].as_str().unwrap_or_default();
+        let to = if s("to").is_empty() { String::new() } else { format!(" to {}", s("to")) };
+        let subject = if s("subject").is_empty() { String::new() } else { format!("\nSubject: {}", s("subject")) };
+        return format!("send this {} on {}{to}:{subject}\n\n{}", s("kind"), s("channel"), clip(s("body"), 3000));
+    }
     let arg = ["command", "file_path", "url", "path", "element"]
         .iter()
         .find_map(|k| input.get(*k).and_then(Value::as_str));

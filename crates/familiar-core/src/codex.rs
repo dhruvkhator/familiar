@@ -665,7 +665,8 @@ async fn decide(
             send(events, "approval", json!({ "tool_name": tool, "status": "denied", "decided_by": "rule", "reason": "blocked by an owner rule" }));
             false
         }
-        None => runner::decide_tool(ctx, run, tool, input, tool_use_id, reason, rules, events, cancel).await.0,
+        // Codex approvals are accept / decline only: no edited input, no note for the model.
+        None => runner::decide_tool(ctx, run, tool, input, tool_use_id, reason, rules, events, cancel, false).await.allow,
     }
 }
 
@@ -722,9 +723,10 @@ fn mcp_servers(mcp: &Value) -> Map<String, Value> {
                 o.insert("http_headers".into(), s["headers"].clone());
             }
         }
-        // npx downloads on first use; ask_user / handoff(wait) / human approvals block for up to 30 minutes.
+        // npx downloads on first use; ask_user / handoff(wait) / human approvals block for up to 30 minutes, and
+        // Familiar's propose_draft for up to a day.
         o.insert("startup_timeout_sec".into(), json!(120));
-        o.insert("tool_timeout_sec".into(), json!(1900));
+        o.insert("tool_timeout_sec".into(), json!(if name == "familiar" { crate::mcp::TOOL_TIMEOUT.as_secs() } else { 1900 }));
         // Familiar's own tools are pre-allowed (they enforce research-only limits themselves); everything else asks us.
         o.insert("default_tools_approval_mode".into(), json!(if name == "familiar" { "approve" } else { "prompt" }));
         out.insert(key, Value::Object(o));

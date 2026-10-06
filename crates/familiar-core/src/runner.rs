@@ -18,7 +18,8 @@ use crate::db::{Bot, Rule, Run};
 use crate::{mcp, permissions, reviewer, skills, storage, workspace};
 
 const MAX_PAYLOAD_STR: usize = 32 * 1024;
-const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// How long a tool call or question waits for the owner before it expires.
+pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const INTERRUPT_GRACE: Duration = Duration::from_secs(10);
 const DELTA_FLUSH: Duration = Duration::from_millis(150);
 /// Characters per NOTIFY: worst case (4-byte chars, JSON escaping) stays under Postgres' 8000-byte payload limit.
@@ -559,14 +560,63 @@ async fn decide(
     let tool = req["tool_name"].as_str().unwrap_or_default().to_owned();
     let input = req["input"].clone();
     let reason = req["decision_reason"].as_str().or_else(|| req["description"].as_str());
-    let (allow, message) =
-        decide_tool(&ctx, &run, &tool, &input, req["tool_use_id"].as_str(), reason, &rules, &events, &cancel).await;
-    let _ = stdin.send(claude::permission_reply(&request_id, allow, &input, &message));
+    let verdict =
+        decide_tool(&ctx, &run, &tool, &input, req["tool_use_id"].as_str(), reason, &rules, &events, &cancel, true).await;
+    // An owner's edit replaces the input (`updatedInput`): the tool runs what they approved.
+    let input = verdict.input.as_ref().unwrap_or(&input);
+    let _ = stdin.send(claude::permission_reply(&request_id, verdict.allow, input, &verdict.message));
+}
+
+/// The outcome of [`decide_tool`].
+pub struct Verdict {
+    pub allow: bool,
+    /// For the model when denied (empty when allowed).
+    pub message: String,
+    /// The input as the owner edited it, already re-checked; None = run the call as proposed.
+    pub input: Option<Value>,
+}
+
+/// What an approval card offers besides approve and deny.
+#[derive(Debug, Clone, Default)]
+pub struct Offer {
+    /// Input fields the owner may rewrite before approving.
+    pub editable: Vec<String>,
+    /// The owner rule "Always allow this" adds ([`permissions::always_allow_rule`]); None = not offered.
+    pub allow_rule: Option<String>,
+}
+
+/// One question for the owner: a tool call, an `ask_user` question or a draft.
+pub struct Ask<'a> {
+    pub tool_use_id: Option<&'a str>,
+    pub tool: &'a str,
+    pub input: &'a Value,
+    pub reason: Option<&'a str>,
+    pub offer: Offer,
+    pub timeout: Duration,
+}
+
+/// The owner's decision on an [`Ask`].
+#[derive(Debug, Clone)]
+pub struct Decision {
+    /// approved | denied | revise | expired
+    pub status: String,
+    /// Their answer (`ask_user`) or note (deny, ask for changes).
+    pub response: Option<String>,
+    /// The input as they edited it before approving.
+    pub edited: Option<Value>,
+}
+
+impl Decision {
+    /// The owner's note, if they wrote one.
+    pub fn note(&self) -> Option<&str> {
+        self.response.as_deref().map(str::trim).filter(|n| !n.is_empty())
+    }
 }
 
 /// The engine-neutral permission decision for one tool call (Claude's can_use_tool, Codex's approval requests):
 /// research-only → deny; always-human → owner; safe navigation / owner Bash allow rules → allow; `review` rules →
-/// reviewer; everything else → owner. Records an `approval` event. Returns (allowed, message for the model).
+/// reviewer; everything else → owner. Records an `approval` event. `can_edit`: the engine runs an edited input
+/// (Claude's `updatedInput`; Codex can only accept or decline), so the owner may be offered "Edit & approve".
 #[allow(clippy::too_many_arguments)]
 pub async fn decide_tool(
     ctx: &Ctx,
@@ -578,40 +628,45 @@ pub async fn decide_tool(
     rules: &[Rule],
     events: &Events,
     cancel: &CancellationToken,
-) -> (bool, String) {
-    let (ctx, run, tool, events, cancel) = (ctx.clone(), run.clone(), tool.to_owned(), events.clone(), cancel.clone());
-    let input = input.clone();
-    let (status, by, message) = if run.research() {
-        ("denied".to_owned(), "rule", "This is a research-only run: it can look things up but cannot act.".to_owned())
-    } else if let Some(why) = permissions::always_human(&tool, &input) {
+    can_edit: bool,
+) -> Verdict {
+    let owner = |reason: String| async move {
+        human(ctx, run, tool_use_id, tool, input, &reason, rules, can_edit, events, cancel).await
+    };
+    let (status, by, message, edited) = if run.research() {
+        ("denied".to_owned(), "rule", "This is a research-only run: it can look things up but cannot act.".to_owned(), None)
+    } else if let Some(why) = permissions::always_human(tool, input) {
         // Neither owner rules nor the reviewer can unlock these.
-        let reason = format!("Always needs you: this {why}.");
-        human(&ctx, &run, tool_use_id, &tool, &input, &reason, &events, &cancel).await
-    } else if permissions::safe_navigation(&tool, &input).await {
-        ("approved".to_owned(), "rule", String::new())
-    } else if let Some(rule) = permissions::owner_allows(&rules, &tool, &input) {
-        ("approved".to_owned(), "rule", format!("allowed by rule `{}`", rule.pattern))
+        owner(format!("Always needs you: this {why}.")).await
+    } else if permissions::safe_navigation(tool, input).await {
+        ("approved".to_owned(), "rule", String::new(), None)
+    } else if let Some(rule) = permissions::owner_allows(rules, tool, input) {
+        ("approved".to_owned(), "rule", format!("allowed by rule `{}`", rule.pattern), None)
     } else {
         let mut reason = engine_reason.map(str::to_owned);
         let mut verdict = None;
-        if let Some(rule) = permissions::review_rule(rules, &tool, &input) {
-            match reviewer::review(&ctx, &run, &tool, &input, rules).await {
-                Ok((true, why)) => verdict = Some(("approved".to_owned(), "reviewer", why)),
+        if let Some(rule) = permissions::review_rule(rules, tool, input) {
+            match reviewer::review(ctx, run, tool, input, rules).await {
+                Ok((true, why)) => verdict = Some(("approved".to_owned(), "reviewer", why, None)),
                 Ok((false, why)) => reason = Some(format!("Auto-review escalated (rule `{}`): {why}", rule.pattern)),
                 Err(e) => reason = Some(format!("Auto-review unavailable ({e:#}); rule `{}`", rule.pattern)),
             }
         }
         match verdict {
             Some(v) => v,
-            None => human(&ctx, &run, tool_use_id, &tool, &input, reason.as_deref().unwrap_or(""), &events, &cancel).await,
+            None => owner(reason.unwrap_or_default()).await,
         }
     };
     let allow = status == "approved";
-    send(&events, "approval", json!({ "tool_name": tool, "status": status, "decided_by": by, "reason": message }));
-    (allow, if allow { String::new() } else { message })
+    send(
+        events,
+        "approval",
+        json!({ "tool_name": tool, "status": status, "decided_by": by, "reason": message, "edited": edited.is_some() }),
+    );
+    Verdict { allow, message: if allow { String::new() } else { message }, input: edited.filter(|_| allow) }
 }
 
-/// Owner decision as (status, decided_by, message for Claude).
+/// Owner decision as (status, decided_by, message for the model, the input as the owner edited it).
 #[allow(clippy::too_many_arguments)]
 async fn human(
     ctx: &Ctx,
@@ -620,56 +675,105 @@ async fn human(
     tool: &str,
     input: &Value,
     reason: &str,
+    rules: &[Rule],
+    can_edit: bool,
     events: &Events,
     cancel: &CancellationToken,
-) -> (String, &'static str, String) {
-    let reason = (!reason.is_empty()).then_some(reason);
-    match ask_human(ctx, run, tool_use_id, tool, input, reason, events, cancel).await {
-        Ok((s, _)) if s == "approved" => (s, "user", String::new()),
-        Ok((s, _)) => {
-            let msg = format!("The owner {s} this action. Do not retry it another way.");
-            (s, "user", msg)
+) -> (String, &'static str, String, Option<Value>) {
+    let offer = Offer {
+        editable: permissions::editable_field(tool, input).filter(|_| can_edit).map(|f| vec![f.to_owned()]).unwrap_or_default(),
+        allow_rule: permissions::always_allow_rule(tool, input),
+    };
+    let ask = Ask { tool_use_id, tool, input, reason: (!reason.is_empty()).then_some(reason), offer, timeout: APPROVAL_TIMEOUT };
+    match ask_human(ctx, run, ask, events, cancel).await {
+        Ok(d) if d.status == "approved" => match d.edited {
+            Some(edited) if &edited != input => recheck(ctx, run, tool_use_id, tool, edited, rules, events, cancel).await,
+            _ => ("approved".to_owned(), "user", String::new(), None),
+        },
+        Ok(d) => {
+            let msg = match d.note() {
+                Some(note) => format!(
+                    "The owner {} this action and wrote: \"{note}\". Do not retry it another way; follow their note.",
+                    d.status
+                ),
+                None => format!("The owner {} this action. Do not retry it another way.", d.status),
+            };
+            (d.status, "user", msg, None)
         }
-        Err(e) => ("denied".to_owned(), "rule", format!("approval failed: {e:#}")),
+        Err(e) => ("denied".to_owned(), "rule", format!("approval failed: {e:#}"), None),
     }
 }
 
-/// Create a pending approval and wait for the owner. Returns its final status and the owner's text answer.
+/// An owner's edit makes a new action, so it passes the same checks before it runs: an owner deny rule refuses it, and
+/// an action that always needs the owner (or an address the browser may not open on its own) is asked again, exactly
+/// as edited, with nothing left to edit. Otherwise the owner's approval of their own edit stands.
 #[allow(clippy::too_many_arguments)]
-pub async fn ask_human(
+async fn recheck(
     ctx: &Ctx,
     run: &Run,
     tool_use_id: Option<&str>,
     tool: &str,
-    input: &Value,
-    reason: Option<&str>,
+    edited: Value,
+    rules: &[Rule],
     events: &Events,
     cancel: &CancellationToken,
-) -> Result<(String, Option<String>)> {
+) -> (String, &'static str, String, Option<Value>) {
+    if permissions::preset(rules, tool, &edited) == Some(false) {
+        let msg = "The owner's edit of this action matches one of their deny rules, so it was not run.".to_owned();
+        return ("denied".to_owned(), "rule", msg, None);
+    }
+    let again = match permissions::always_human(tool, &edited) {
+        Some(why) => Some(format!("Always needs you: after your edit, this {why}. Approve it exactly as shown.")),
+        None if tool == "mcp__browser__browser_navigate" && !permissions::safe_navigation(tool, &edited).await => {
+            Some("After your edit this opens an address the browser may not open on its own.".to_owned())
+        }
+        None => None,
+    };
+    let Some(reason) = again else {
+        return ("approved".to_owned(), "user", String::new(), Some(edited));
+    };
+    let ask = Ask { tool_use_id, tool, input: &edited, reason: Some(&reason), offer: Offer::default(), timeout: APPROVAL_TIMEOUT };
+    match ask_human(ctx, run, ask, events, cancel).await {
+        Ok(d) if d.status == "approved" => ("approved".to_owned(), "user", String::new(), Some(edited)),
+        Ok(d) => {
+            let msg = format!("The owner {} this action. Do not retry it another way.", d.status);
+            (d.status, "user", msg, None)
+        }
+        Err(e) => ("denied".to_owned(), "rule", format!("approval failed: {e:#}"), None),
+    }
+}
+
+/// Create a pending approval and wait for the owner (until `ask.timeout`, or the run ends: then it expires).
+pub async fn ask_human(ctx: &Ctx, run: &Run, ask: Ask<'_>, events: &Events, cancel: &CancellationToken) -> Result<Decision> {
     let mut notices = ctx.notices.subscribe(); // before insert, so the decision can't slip past us
-    let id = ctx.db.create_approval(run, tool_use_id, tool, input, reason).await?;
+    let Ask { tool_use_id, tool, input, reason, offer, timeout } = ask;
+    let id = ctx
+        .db
+        .create_approval(run, tool_use_id, tool, input, reason, &offer.editable, offer.allow_rule.as_deref())
+        .await?;
     send(events, "approval", json!({ "approval_id": id, "tool_name": tool, "input": input, "status": "pending", "reason": reason }));
     ctx.db.set_run_waiting(run.id, true).await?;
     if let Ok(bot) = ctx.db.bot(run.bot_id).await {
         ctx.signal(Signal::ApprovalPending { bot: bot.name, tool: tool.into() });
     }
 
-    let deadline = tokio::time::Instant::now() + APPROVAL_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let expired = || Decision { status: "expired".into(), response: None, edited: None };
     let decided = loop {
-        let (status, response) = ctx.db.approval_status(id).await?;
+        let (status, response, edited) = ctx.db.approval_status(id).await?;
         if status != "pending" {
-            break (status, response);
+            break Decision { status, response, edited };
         }
         tokio::select! {
             _ = wait_for(&mut notices, "approvals", id) => {}
             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
             _ = cancel.cancelled() => {
                 ctx.db.close_approval(id, "expired", "rule").await?;
-                break ("expired".into(), None);
+                break expired();
             }
             _ = tokio::time::sleep_until(deadline) => {
                 ctx.db.close_approval(id, "expired", "rule").await?;
-                break ("expired".into(), None);
+                break expired();
             }
         }
     };

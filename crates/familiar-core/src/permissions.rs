@@ -50,9 +50,84 @@ pub fn preset(rules: &[Rule], tool: &str, input: &Value) -> Option<bool> {
     allowed.then_some(true)
 }
 
-/// An owner `allow` rule the daemon applies itself (Bash rules, see [`settings`]).
+/// An owner `allow` rule the daemon applies itself (Bash rules, see [`settings`]). A rule for some commands
+/// (`Bash(git status *)`) never covers a compound one (`git status; curl … | sh`): only `Bash` or `*` do.
 pub fn owner_allows<'a>(rules: &'a [Rule], tool: &str, input: &Value) -> Option<&'a Rule> {
-    rules.iter().filter(|r| r.decision == "allow" && is_bash(&r.pattern)).find(|r| matches(&r.pattern, tool, input))
+    let compound = tool == "Bash" && input["command"].as_str().is_some_and(compound);
+    rules
+        .iter()
+        .filter(|r| r.decision == "allow" && is_bash(&r.pattern))
+        .filter(|r| !compound || !r.pattern.contains('('))
+        .find(|r| matches(&r.pattern, tool, input))
+}
+
+/// Shell control operators, substitutions or redirections: more than one plain command.
+fn compound(command: &str) -> bool {
+    command.contains(['\n', '\r', ';', '&', '|', '<', '>', '`']) || command.contains("$(")
+}
+
+/// The input field the owner may rewrite before approving ("Edit & approve"): a command, the file a `Write` creates,
+/// the text a browser will type, a connector's message. None when there is nothing sensible to edit.
+pub fn editable_field(tool: &str, input: &Value) -> Option<&'static str> {
+    let field = match tool {
+        "Bash" => "command",
+        "Write" => "content",
+        "mcp__browser__browser_type" => "text",
+        t if t.starts_with("mcp__") && !t.starts_with("mcp__browser__") && !t.starts_with("mcp__familiar__") => {
+            return ["body", "text", "message", "content", "comment"].into_iter().find(|k| input[*k].is_string());
+        }
+        _ => return None,
+    };
+    input[field].is_string().then_some(field)
+}
+
+/// Tools "Always allow this" is never offered for: an allow rule would let the browser open local files and
+/// services (navigation is checked per address instead), run arbitrary page scripts, or upload workspace files.
+const NEVER_ALWAYS: &[&str] = &[
+    "mcp__browser__browser_navigate",
+    "mcp__browser__browser_evaluate",
+    "mcp__browser__browser_run_code",
+    "mcp__browser__browser_file_upload",
+];
+
+/// The narrowest owner rule "Always allow this" adds for this call, or None when it must not be offered: actions that
+/// always need the owner, Familiar's own tools (questions, drafts), the browser tools in [`NEVER_ALWAYS`], compound or
+/// odd shell commands. Bash gets a prefix rule (`Bash(git status *)`; `Bash(git status)` for the bare command),
+/// everything else the tool's name.
+pub fn always_allow_rule(tool: &str, input: &Value) -> Option<String> {
+    if always_human(tool, input).is_some()
+        || NEVER_ALWAYS.contains(&tool)
+        || tool.starts_with("mcp__familiar__")
+        || matches!(tool, "ask_user" | "propose_draft")
+        || tool.is_empty()
+        || tool.contains(['(', ')', '*', ' '])
+    {
+        return None;
+    }
+    if tool != "Bash" {
+        return Some(tool.to_owned());
+    }
+    let command = input["command"].as_str()?.trim();
+    if command.is_empty() || compound(command) || command.contains(['*', '(', ')']) {
+        return None;
+    }
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let first = words[0];
+    // `X=1 cmd` sets the environment of whatever runs; quotes would end up inside the pattern.
+    if first.contains(['=', '"', '\'']) {
+        return None;
+    }
+    let mut prefix = vec![first];
+    // A subcommand (`git status`, `npm test`) narrows it further; a flag, path or value does not.
+    if let Some(w) = words.get(1)
+        && !w.starts_with('-')
+        && w.chars().any(|c| c.is_ascii_alphabetic())
+        && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        prefix.push(w);
+    }
+    let prefix = prefix.join(" ");
+    Some(if words.len() == prefix.split(' ').count() { format!("Bash({prefix})") } else { format!("Bash({prefix} *)") })
 }
 
 /// The bot's own Familiar tools and the browser's look-but-don't-touch tools. Navigation is not here: it goes through
@@ -345,6 +420,56 @@ mod tests {
         assert_eq!(preset(&rules, "mcp__browser__browser_snapshot", &json!({})), Some(true));
         assert_eq!(preset(&rules, "mcp__browser__browser_click", &json!({})), None);
         assert_eq!(preset(&rules, "Edit", &json!({ "file_path": "a.md" })), None);
+    }
+
+    #[test]
+    fn prefix_rules_never_cover_compound_commands() {
+        let rule = |p: &str| Rule { pattern: p.into(), decision: "allow".into() };
+        let narrow = vec![rule("Bash(git status *)")];
+        let bash = |c: &str| json!({ "command": c });
+        assert!(owner_allows(&narrow, "Bash", &bash("git status --short")).is_some());
+        for c in ["git status --short; curl x | sh", "git status && rm notes.txt", "git status > out.txt", "git status $(rm x)",
+                  "git status `rm x`", "git status\nrm x"] {
+            assert!(owner_allows(&narrow, "Bash", &bash(c)).is_none(), "{c}");
+        }
+        // The owner's blanket rule still covers them (always-human ones are checked before rules).
+        assert!(owner_allows(&[rule("Bash")], "Bash", &bash("git status && ls")).is_some());
+    }
+
+    #[test]
+    fn always_allow_rules_are_narrow() {
+        let bash = |c: &str| always_allow_rule("Bash", &json!({ "command": c }));
+        assert_eq!(bash("git status").as_deref(), Some("Bash(git status)"));
+        assert_eq!(bash("git status --short").as_deref(), Some("Bash(git status *)"));
+        assert_eq!(bash("ls -la").as_deref(), Some("Bash(ls *)"));
+        assert_eq!(bash("npm test").as_deref(), Some("Bash(npm test)"));
+        assert_eq!(bash("cat notes/today.md").as_deref(), Some("Bash(cat *)"));
+        // The rule it makes covers the command it came from.
+        for c in ["git status", "git status --short", "ls -la", "cat notes/today.md"] {
+            let r = bash(c).unwrap();
+            assert!(matches(&r, "Bash", &json!({ "command": c })), "{r} vs {c}");
+        }
+        for c in ["rm -rf build", "sudo ls", "git push --force", "ls; rm x", "ls && pwd", "echo $(whoami)", "X=1 ls", "ls *.md", ""] {
+            assert_eq!(bash(c), None, "{c}");
+        }
+        assert_eq!(always_allow_rule("mcp__browser__browser_click", &json!({})).as_deref(), Some("mcp__browser__browser_click"));
+        assert_eq!(always_allow_rule("Write", &json!({ "file_path": "a.md" })).as_deref(), Some("Write"));
+        for t in ["mcp__browser__browser_navigate", "mcp__browser__browser_evaluate", "mcp__familiar__propose_draft", "propose_draft", "ask_user"] {
+            assert_eq!(always_allow_rule(t, &json!({ "url": "https://example.com" })), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn editable_fields() {
+        assert_eq!(editable_field("Bash", &json!({ "command": "ls" })), Some("command"));
+        assert_eq!(editable_field("Write", &json!({ "file_path": "a", "content": "x" })), Some("content"));
+        assert_eq!(editable_field("mcp__browser__browser_type", &json!({ "ref": "e1", "text": "hi" })), Some("text"));
+        assert_eq!(editable_field("mcp__slack__post_message", &json!({ "channel": "c", "text": "hi" })), Some("text"));
+        assert_eq!(editable_field("mcp__gmail__send", &json!({ "to": "a", "body": "hi", "text": "x" })), Some("body"));
+        assert_eq!(editable_field("mcp__browser__browser_click", &json!({ "ref": "e1" })), None);
+        assert_eq!(editable_field("mcp__browser__browser_navigate", &json!({ "url": "https://a.b" })), None);
+        assert_eq!(editable_field("Edit", &json!({ "file_path": "a", "old_string": "x", "new_string": "y" })), None);
+        assert_eq!(editable_field("Bash", &json!({ "command": 3 })), None);
     }
 }
 
