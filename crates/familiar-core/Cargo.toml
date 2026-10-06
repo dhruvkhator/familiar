@@ -25,6 +25,8 @@ tokio = { version = "1.53.1", features = ["full"] }
 tokio-tungstenite = "0.30.0"
 tokio-util = "0.7.19"
 toml = "1.1.6"
+# Telegram approvals write out hidden characters by Unicode general category, like the app's approval cards.
+unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
 tracing = "0.1.44"
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
 familiar-crypto = { version = "0.1.0", path = "../familiar-crypto" }

@@ -81,53 +81,110 @@ pub fn editable_field(tool: &str, input: &Value) -> Option<&'static str> {
     input[field].is_string().then_some(field)
 }
 
-/// Tools "Always allow this" is never offered for: an allow rule would let the browser open local files and
-/// services (navigation is checked per address instead), run arbitrary page scripts, or upload workspace files.
-const NEVER_ALWAYS: &[&str] = &[
-    "mcp__browser__browser_navigate",
-    "mcp__browser__browser_evaluate",
-    "mcp__browser__browser_run_code",
-    "mcp__browser__browser_file_upload",
+/// Programs "Always allow" is never offered for, even as an exact command: interpreters and shells, wrappers that run
+/// another program, package runners and build tools (they run scripts and config the teammate can write: a Makefile,
+/// package.json, .git/config hooks and fsmonitor), and tools that reach other machines or the system.
+const NEVER_ALWAYS_PROGRAMS: &[&str] = &[
+    // interpreters and shells
+    "python", "python3", "py", "pythonw", "node", "deno", "bun", "ruby", "perl", "php", "lua", "java", "dotnet", "go",
+    "bash", "sh", "zsh", "dash", "fish", "ksh", "csh", "cmd", "powershell", "pwsh", "wsl", "osascript", "wscript",
+    "cscript", "mshta", "rundll32", "regsvr32",
+    // wrappers: whatever they run is the real command
+    "env", "xargs", "nice", "nohup", "time", "timeout", "exec", "command", "builtin", "eval", "source", ".", "call",
+    "start", "start-process", "invoke-item", "watch", "parallel", "su", "sudo", "doas", "runas",
+    // package runners and build tools
+    "npm", "npx", "pnpm", "pnpx", "yarn", "corepack", "uv", "uvx", "pip", "pip3", "pipx", "poetry", "conda", "cargo",
+    "rustup", "make", "cmake", "ninja", "msbuild", "gradle", "gradlew", "mvn", "ant", "rake", "bundle", "gem",
+    "composer", "dotnet", "pytest", "tox", "nox", "jest", "vitest", "tsx", "ts-node", "just", "task",
+    // version control (repo config can run commands), containers, remote shells, file finders that act
+    "git", "gh", "hg", "svn", "docker", "docker-compose", "podman", "kubectl", "helm", "ssh", "scp", "sftp", "rsync",
+    "find", "forfiles", "awk", "gawk", "sed", "vim", "vi", "nvim", "emacs", "less", "more", "crontab", "schtasks",
+    "systemctl", "service", "launchctl", "reg", "setx",
 ];
 
-/// The narrowest owner rule "Always allow this" adds for this call, or None when it must not be offered: actions that
-/// always need the owner, Familiar's own tools (questions, drafts), the browser tools in [`NEVER_ALWAYS`], compound or
-/// odd shell commands. Bash gets a prefix rule (`Bash(git status *)`; `Bash(git status)` for the bare command),
-/// everything else the tool's name.
+/// Action words of a connector tool that only read (`get_issue`, `listRepos`, `search_code`). Anything else, and any
+/// tool whose name also carries a write word, gets no "Always allow". `fetch` and `query` are left out on purpose: a
+/// fetch can carry data out in its URL, and a SQL "query" tool may write.
+const READ_ONLY_ACTIONS: &[&str] = &["get", "list", "search", "read", "find", "describe", "view"];
+const WRITE_WORDS: &[&str] = &[
+    "send", "post", "create", "update", "delete", "merge", "push", "write", "put", "set", "add", "remove", "edit",
+    "run", "exec", "execute", "publish", "reply", "comment", "upload", "move", "rename", "patch", "insert", "invite",
+    "approve", "close", "archive", "draft", "submit", "share", "transfer", "pay", "buy", "order", "modify", "save",
+];
+
+/// The rule "Always allow this" adds for this call, or None when it must not be offered. Offered only for:
+/// - an exact, plain Bash command (`Bash(<the command>)`, no wildcard: the same command again, nothing else) whose
+///   program is not in [`NEVER_ALWAYS_PROGRAMS`] and that names no path outside the workspace;
+/// - the workspace file tools (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`; `--restricted` keeps them inside it);
+/// - connector tools that clearly only read ([`READ_ONLY_ACTIONS`]).
+///
+/// Never for actions that always need the owner, any browser tool (a click or a keystroke can post or send as the
+/// owner), connector tools that write or send, Familiar's own tools, questions or drafts.
 pub fn always_allow_rule(tool: &str, input: &Value) -> Option<String> {
-    if always_human(tool, input).is_some()
-        || NEVER_ALWAYS.contains(&tool)
-        || tool.starts_with("mcp__familiar__")
-        || matches!(tool, "ask_user" | "propose_draft")
-        || tool.is_empty()
-        || tool.contains(['(', ')', '*', ' '])
-    {
+    if always_human(tool, input).is_some() || tool.is_empty() || tool.contains(['(', ')', '*', ' ']) {
         return None;
     }
-    if tool != "Bash" {
-        return Some(tool.to_owned());
+    match tool {
+        "Bash" => exact_bash_rule(input["command"].as_str()?),
+        "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => Some(tool.to_owned()),
+        t if t.starts_with("mcp__") && !t.starts_with("mcp__browser__") && !t.starts_with("mcp__familiar__") => {
+            let action = t.splitn(3, "__").nth(2)?;
+            read_only_action(action).then(|| t.to_owned())
+        }
+        _ => None,
     }
-    let command = input["command"].as_str()?.trim();
-    if command.is_empty() || compound(command) || command.contains(['*', '(', ')']) {
+}
+
+/// `Bash(<command>)` for a plain command the owner can see whole, or None.
+fn exact_bash_rule(command: &str) -> Option<String> {
+    // Exact means exact: no surrounding space, no glob or pattern syntax, one plain command, no variables.
+    if command.is_empty()
+        || command != command.trim()
+        || compound(command)
+        || command.contains(['*', '?', '(', ')', '[', ']', '{', '}', '$', '%', '"', '\'', '\\', '~', '^', '!'])
+    {
         return None;
     }
     let words: Vec<&str> = command.split_whitespace().collect();
-    let first = words[0];
-    // `X=1 cmd` sets the environment of whatever runs; quotes would end up inside the pattern.
-    if first.contains(['=', '"', '\'']) {
+    let program = words[0].to_ascii_lowercase();
+    let program = program.strip_suffix(".exe").unwrap_or(&program);
+    // A script or a path as the program runs whatever that file says; `X=1 cmd` sets another program's environment.
+    let script = [".sh", ".ps1", ".bat", ".cmd", ".py", ".js", ".ts", ".rb", ".pl", ".vbs"].iter().any(|e| program.ends_with(e));
+    if program.contains(['/', '=', ':']) || script || NEVER_ALWAYS_PROGRAMS.contains(&program) {
         return None;
     }
-    let mut prefix = vec![first];
-    // A subcommand (`git status`, `npm test`) narrows it further; a flag, path or value does not.
-    if let Some(w) = words.get(1)
-        && !w.starts_with('-')
-        && w.chars().any(|c| c.is_ascii_alphabetic())
-        && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        prefix.push(w);
+    // Paths outside the workspace: absolute (`/etc`, `C:x`), home (`~`, handled above) or parent (`..`).
+    if words.iter().skip(1).any(|w| {
+        let v = w.split_once('=').map_or(*w, |(_, v)| v);
+        v.starts_with('/') || v.contains("..") || v.as_bytes().get(1) == Some(&b':')
+    }) {
+        return None;
     }
-    let prefix = prefix.join(" ");
-    Some(if words.len() == prefix.split(' ').count() { format!("Bash({prefix})") } else { format!("Bash({prefix} *)") })
+    Some(format!("Bash({command})"))
+}
+
+/// `get_issue`, `listRepos`, `search-code`: a read-only verb first and no write word anywhere.
+fn read_only_action(action: &str) -> bool {
+    // Split snake, kebab and camel case into lowercase words.
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for c in action.chars() {
+        if c == '_' || c == '-' || c == '.' {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+        } else if c.is_ascii_uppercase() && !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+            cur.push(c.to_ascii_lowercase());
+        } else {
+            cur.push(c.to_ascii_lowercase());
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words.first().is_some_and(|w| READ_ONLY_ACTIONS.contains(&w.as_str()))
+        && !words.iter().any(|w| WRITE_WORDS.contains(&w.as_str()))
 }
 
 /// The bot's own Familiar tools and the browser's look-but-don't-touch tools. Navigation is not here: it goes through
@@ -437,24 +494,52 @@ mod tests {
     }
 
     #[test]
-    fn always_allow_rules_are_narrow() {
+    fn always_allow_rules_are_exact_bash_commands() {
         let bash = |c: &str| always_allow_rule("Bash", &json!({ "command": c }));
-        assert_eq!(bash("git status").as_deref(), Some("Bash(git status)"));
-        assert_eq!(bash("git status --short").as_deref(), Some("Bash(git status *)"));
-        assert_eq!(bash("ls -la").as_deref(), Some("Bash(ls *)"));
-        assert_eq!(bash("npm test").as_deref(), Some("Bash(npm test)"));
-        assert_eq!(bash("cat notes/today.md").as_deref(), Some("Bash(cat *)"));
-        // The rule it makes covers the command it came from.
-        for c in ["git status", "git status --short", "ls -la", "cat notes/today.md"] {
-            let r = bash(c).unwrap();
-            assert!(matches(&r, "Bash", &json!({ "command": c })), "{r} vs {c}");
+        assert_eq!(bash("ls -la").as_deref(), Some("Bash(ls -la)"));
+        assert_eq!(bash("wc -l notes/today.md").as_deref(), Some("Bash(wc -l notes/today.md)"));
+        // The rule covers that command and nothing else: not more arguments, not trailing space, not a chain.
+        let rule = bash("ls -la").unwrap();
+        let m = |c: &str| matches(&rule, "Bash", &json!({ "command": c }));
+        assert!(m("ls -la"));
+        for c in ["ls -la /", "ls -la ~/.ssh", "ls -la ", " ls -la", "ls -lah", "ls"] {
+            assert!(!m(c), "{c}");
         }
-        for c in ["rm -rf build", "sudo ls", "git push --force", "ls; rm x", "ls && pwd", "echo $(whoami)", "X=1 ls", "ls *.md", ""] {
+        assert!(owner_allows(&[Rule { pattern: rule.clone(), decision: "allow".into() }], "Bash", &json!({ "command": "ls -la; rm x" })).is_none());
+        // Escapes: programs that run other code (repo config, scripts, package scripts), wrappers, interpreters.
+        for c in [
+            "git status", "git --version", "git -c core.fsmonitor=x status", "python report.py", "python3 -m http.server",
+            "node build.js", "npx prettier .", "npm test", "npm run build", "pnpm exec x", "bash run.sh", "sh -c ls",
+            "cmd /c dir", "powershell Get-ChildItem", "pwsh -File x.ps1", "env ls", "xargs ls", "nice ls", "timeout 5 ls",
+            "find . -name x", "make", "cargo run", "uv run x", "uvx ruff", "pip list", "./deploy.sh", "scripts/run",
+            "deploy.ps1", "docker compose up", "ssh host", "sed -i s/a/b/ x", "awk 1 x",
+        ] {
             assert_eq!(bash(c), None, "{c}");
         }
-        assert_eq!(always_allow_rule("mcp__browser__browser_click", &json!({})).as_deref(), Some("mcp__browser__browser_click"));
+        // Paths outside the workspace, variables, globs, odd spacing, always-human commands.
+        for c in ["cat /etc/passwd", "cat ~/.ssh/id_rsa", "cat ../../.familiar/config.toml", "type C:\\x", "cat C:/x",
+                  "echo $HOME", "cat %USERPROFILE%", "ls *.md", "ls  -la ", "rm -rf build", "sudo ls", "ls && pwd",
+                  "echo \"hi\"", ""] {
+            assert_eq!(bash(c), None, "{c}");
+        }
+    }
+
+    #[test]
+    fn always_allow_never_for_browser_writes_or_familiar() {
         assert_eq!(always_allow_rule("Write", &json!({ "file_path": "a.md" })).as_deref(), Some("Write"));
-        for t in ["mcp__browser__browser_navigate", "mcp__browser__browser_evaluate", "mcp__familiar__propose_draft", "propose_draft", "ask_user"] {
+        assert_eq!(always_allow_rule("Edit", &json!({ "file_path": "a.md" })).as_deref(), Some("Edit"));
+        for t in ["mcp__github__get_issue", "mcp__github__list_pull_requests", "mcp__notion__search", "mcp__drive__readFile",
+                  "mcp__x__describe-table"] {
+            assert_eq!(always_allow_rule(t, &json!({})).as_deref(), Some(t), "{t}");
+        }
+        for t in ["mcp__browser__browser_click", "mcp__browser__browser_type", "mcp__browser__browser_fill_form",
+                  "mcp__browser__browser_press_key", "mcp__browser__browser_select_option", "mcp__browser__browser_drag",
+                  "mcp__browser__browser_hover", "mcp__browser__browser_navigate", "mcp__browser__browser_evaluate",
+                  "mcp__gmail__send_email", "mcp__slack__post_message", "mcp__slack__slack_post_message",
+                  "mcp__github__create_issue", "mcp__github__merge_pull_request", "mcp__github__push_files",
+                  "mcp__github__get_and_delete", "mcp__fetch__fetch", "mcp__postgres__query", "mcp__x__update_get",
+                  "mcp__familiar__propose_draft", "mcp__familiar__remember", "propose_draft", "ask_user", "WebFetch",
+                  "Bash(ls)", "mcp__github__getIssue(x)"] {
             assert_eq!(always_allow_rule(t, &json!({ "url": "https://example.com" })), None, "{t}");
         }
     }

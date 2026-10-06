@@ -838,7 +838,7 @@ async fn edited_tool_input_is_rechecked() {
     let Some(mut h) = setup("edited_tool_input_is_rechecked").await else { return };
     h.scenario(json!([[
         { "init": {} },
-        tool("Bash", json!({ "command": "git log", "description": "history" })),
+        tool("Bash", json!({ "command": "wc -l notes.md", "description": "count" })),
         tool("Bash", json!({ "command": "ls build" })),
         tool("Bash", json!({ "command": "git status" })),
         tool("Bash", json!({ "command": "curl https://example.com" })),
@@ -870,8 +870,9 @@ async fn edited_tool_input_is_rechecked() {
 
     // 1. A plain edit: allowed, and the tool runs the owner's version (other fields untouched).
     let (a1, _, input, _) = h.pending_approval(run).await;
-    assert_eq!(h.offer(a1).await, (vec!["command".to_owned()], Some("Bash(git log)".to_owned())));
-    h.decide_edited(a1, json!({ "command": "git log --oneline -5", "description": input["description"] })).await;
+    // "Always allow" would cover exactly this command, nothing more.
+    assert_eq!(h.offer(a1).await, (vec!["command".to_owned()], Some("Bash(wc -l notes.md)".to_owned())));
+    h.decide_edited(a1, json!({ "command": "wc -l notes.md todo.md", "description": input["description"] })).await;
 
     // 2. Edited into a recursive delete: a second approval of exactly that, with nothing to edit or always allow.
     let a2 = next(a1).await;
@@ -896,7 +897,7 @@ async fn edited_tool_input_is_rechecked() {
     let d = h.invocation(0).decisions();
     assert_eq!(d.len(), 4, "{d:?}");
     assert_eq!(d[0]["behavior"], "allow");
-    assert_eq!(d[0]["updatedInput"], json!({ "command": "git log --oneline -5", "description": "history" }));
+    assert_eq!(d[0]["updatedInput"], json!({ "command": "wc -l notes.md todo.md", "description": "count" }));
     assert_eq!(d[1]["behavior"], "deny", "the edited rm -rf was refused on the second look");
     assert_eq!(d[2]["behavior"], "deny");
     assert!(d[2]["message"].as_str().unwrap().contains("deny rules"), "{d:?}");
@@ -909,8 +910,8 @@ async fn edited_tool_input_is_rechecked() {
     h.finish().await;
 }
 
-/// "Always allow" makes narrow rules: a bot's `Bash(git status *)` lets that command through without asking, but not a
-/// compound command built on it; always-human actions never offer it.
+/// Owner prefix rules stay narrow: a bot's `Bash(git status *)` lets that command through without asking, but not a
+/// compound command built on it; compound and always-human commands never offer "Always allow".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn always_allow_rule_is_narrow() {
     let Some(mut h) = setup("always_allow_rule_is_narrow").await else { return };

@@ -317,10 +317,28 @@ impl Telegram {
         }
         let Some((action, id)) = data.split_once(':') else { return Ok(()) };
         let Ok(id) = id.parse::<Uuid>() else { return Ok(()) };
+        // Approve only what this chat could show whole (the button is only offered then; a stale or forged one is not).
+        if action == "y" && !self.approvable(id).await? {
+            self.call("answerCallbackQuery", answer("Review it in Familiar.")).await.ok();
+            return Ok(());
+        }
         let decided = self.decide(id, action == "y", None).await?;
         let text = if !decided { "Already decided." } else if action == "y" { "Approved" } else { "Denied" };
         self.call("answerCallbackQuery", answer(text)).await.ok();
         Ok(())
+    }
+
+    /// Can this approval be approved from Telegram (see [`approval_message`])?
+    async fn approvable(&self, id: Uuid) -> Result<bool> {
+        let row: Option<(String, Value, Option<String>, String)> = sqlx::query_as(
+            "select a.tool_name, coalesce(a.input, '{}'::jsonb), a.reason, b.name
+             from approvals a join bots b on b.id = a.bot_id where a.id = $1 and a.owner_id = $2",
+        )
+        .bind(id)
+        .bind(self.ctx.db.owner)
+        .fetch_optional(&self.ctx.db.pool)
+        .await?;
+        Ok(row.is_some_and(|(tool, input, reason, bot)| approval_message(&bot, &tool, &input, reason.as_deref()).1))
     }
 
     /// Returns false if the approval was no longer pending.
@@ -358,23 +376,13 @@ impl Telegram {
                 }
             }
             ("pending", None) => {
-                let what = describe(&tool, &input);
-                let why = reason.filter(|r| !r.is_empty()).map(|r| format!("\n\n{r}")).unwrap_or_default();
-                // A draft too long to show whole here is only reviewed in the app: nothing is approved unseen.
-                let partial = tool == "propose_draft" && input["body"].as_str().is_some_and(|b| b.chars().count() > 3000);
-                let text = if partial {
-                    format!("🔐 {bot} wants to {what}{why}\n\nToo long to show in full here: review it in Familiar.")
-                } else {
-                    format!("🔐 {bot} wants to {what}{why}")
-                };
-                let buttons = if partial {
-                    json!({})
-                } else {
-                    json!({ "reply_markup": { "inline_keyboard": [[
-                        { "text": "✅ Approve", "callback_data": format!("y:{id}") },
-                        { "text": "❌ Deny", "callback_data": format!("n:{id}") },
-                    ]] } })
-                };
+                // Nothing is approved unseen: without everything shown whole, only Deny is offered here.
+                let (text, approvable) = approval_message(&bot, &tool, &input, reason.as_deref());
+                let mut row = vec![json!({ "text": "❌ Deny", "callback_data": format!("n:{id}") })];
+                if approvable {
+                    row.insert(0, json!({ "text": "✅ Approve", "callback_data": format!("y:{id}") }));
+                }
+                let buttons = json!({ "reply_markup": { "inline_keyboard": [row] } });
                 if let Some(mid) = self.send(&text, buttons).await {
                     self.approval_msgs.insert(id, mid);
                 }
@@ -483,22 +491,115 @@ impl Telegram {
     }
 }
 
-/// Human-readable "wants to …" for an approval.
-fn describe(tool: &str, input: &Value) -> String {
+/// The longest approval message that still shows whole (Telegram allows 4096 characters).
+const MESSAGE_MAX: usize = 3800;
+
+/// The Telegram message for a pending approval, and whether it may offer Approve. Like the app's approval cards,
+/// every field the action would use is shown (a draft's kind, channel, recipient, subject, media and text; every input
+/// field of a tool call) with hidden characters written out as `⟨U+202E⟩`, single-line fields on one line. If anything
+/// had hidden characters or had to be cut, Approve is not offered: the owner reviews it in the app.
+fn approval_message(bot: &str, tool: &str, input: &Value, reason: Option<&str>) -> (String, bool) {
+    let mut whole = true;
+    let mut show = |s: &str, multiline: bool, max: usize| -> String {
+        let (t, hidden) = reveal(s, multiline);
+        whole &= !hidden;
+        if t.chars().count() > max {
+            whole = false;
+            clip(&t, max)
+        } else {
+            t
+        }
+    };
+    let bot = show(bot, false, 100);
+    let mut text;
+    let mut shown: Vec<&str> = Vec::new();
     if tool == "propose_draft" {
-        // Approving here sends the draft as written; editing it or asking for changes happens in the app.
-        let s = |k: &str| input[k].as_str().unwrap_or_default();
-        let to = if s("to").is_empty() { String::new() } else { format!(" to {}", s("to")) };
-        let subject = if s("subject").is_empty() { String::new() } else { format!("\nSubject: {}", s("subject")) };
-        return format!("send this {} on {}{to}:{subject}\n\n{}", s("kind"), s("channel"), clip(s("body"), 3000));
+        text = format!("🔐 {bot} wants to send this draft:\n");
+        for (label, key) in [("Kind", "kind"), ("Channel", "channel"), ("To", "to"), ("Subject", "subject")] {
+            if let Some(v) = input[key].as_str() {
+                text.push_str(&format!("{label}: {}\n", show(v, false, 500)));
+            }
+            shown.push(key);
+        }
+        if let Some(media) = input["media"].as_array().filter(|m| !m.is_empty()) {
+            let names: Vec<String> = media.iter().map(|m| m.as_str().map(str::to_owned).unwrap_or_else(|| m.to_string())).collect();
+            text.push_str(&format!("Media: {}\n", show(&names.join(", "), false, 1000)));
+        }
+        shown.extend(["media", "body"]);
+        text.push_str(&format!("Text:\n{}", show(input["body"].as_str().unwrap_or_default(), true, 3000)));
+    } else {
+        text = format!("🔐 {bot} wants to use {}:", show(short_tool(tool), false, 200));
+        if let Some((key, v)) = ["command", "file_path", "url", "path", "element"]
+            .into_iter()
+            .find_map(|k| input.get(k).and_then(Value::as_str).map(|v| (k, v)))
+        {
+            text.push_str(&format!("\n{}", show(v, key == "command", 3000)));
+            shown.push(key);
+        }
     }
-    let arg = ["command", "file_path", "url", "path", "element"]
-        .iter()
-        .find_map(|k| input.get(*k).and_then(Value::as_str));
-    match arg {
-        Some(a) => format!("use {}:\n{}", short_tool(tool), clip(a, 1500)),
-        None => format!("use {}:\n{}", short_tool(tool), clip(&input.to_string(), 1500)),
+    // Every other field, so nothing the action receives is left out.
+    match input {
+        Value::Object(m) => {
+            for (k, v) in m.iter().filter(|(k, _)| !shown.contains(&k.as_str())) {
+                let v = v.as_str().map(str::to_owned).unwrap_or_else(|| serde_json::to_string_pretty(v).unwrap_or_default());
+                text.push_str(&format!("\n{}: {}", show(k, false, 100), show(&v, true, 1500)));
+            }
+        }
+        Value::Null => {}
+        other => text.push_str(&format!("\n{}", show(&other.to_string(), true, 1500))),
     }
+    if let Some(r) = reason.map(str::trim).filter(|r| !r.is_empty()) {
+        let r = show(r, true, 1000);
+        // A draft's note is the teammate's own words.
+        text.push_str(&if tool == "propose_draft" { format!("\n\nBot says: “{r}”") } else { format!("\n\n{r}") });
+    }
+    if text.chars().count() > MESSAGE_MAX {
+        whole = false;
+        text = clip(&text, MESSAGE_MAX);
+    }
+    if !whole {
+        text.push_str("\n\nNot all of it can be shown safely here: review it in Familiar.");
+    }
+    (text, whole)
+}
+
+/// Characters that don't show, or change how the rest reads (the app's approval cards use the same set): Cc, Cf
+/// (bidi overrides, zero-width, tags), Zl/Zp, Co, Cn, plus blank-looking fillers and variation selectors. `\n` and
+/// `\t` count only on single-line fields.
+fn hidden_char(c: char, multiline: bool) -> bool {
+    use unicode_properties::{GeneralCategory as G, UnicodeGeneralCategory as _};
+    if multiline && (c == '\n' || c == '\t') {
+        return false;
+    }
+    matches!(
+        c.general_category(),
+        G::Control | G::Format | G::LineSeparator | G::ParagraphSeparator | G::PrivateUse | G::Unassigned | G::Surrogate
+    ) || matches!(
+        c,
+        '\u{034F}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{180B}'..='\u{180D}'
+            | '\u{3164}'
+            | '\u{FFA0}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{E0100}'..='\u{E01EF}'
+    )
+}
+
+/// `s` with every hidden character written out as `⟨U+202E⟩`, and whether there were any.
+fn reveal(s: &str, multiline: bool) -> (String, bool) {
+    let mut out = String::with_capacity(s.len());
+    let mut hidden = false;
+    for c in s.chars() {
+        if hidden_char(c, multiline) {
+            hidden = true;
+            out.push_str(&format!("⟨U+{:04X}⟩", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    (out, hidden)
 }
 
 fn short_tool(tool: &str) -> &str {
@@ -510,4 +611,59 @@ fn clip(s: &str, max: usize) -> String {
         return s.to_owned();
     }
     s.chars().take(max).collect::<String>() + "…"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drafts_show_every_field_and_approve_only_when_whole() {
+        let draft = json!({ "kind": "email", "channel": "Gmail", "to": "sam@example.com", "subject": "Hello",
+                            "media": ["media/a.png", "b.pdf"], "body": "Hi Sam,\nquick question." });
+        let (text, ok) = approval_message("Outbound", "propose_draft", &draft, Some("follow-up to Tuesday"));
+        assert!(ok, "{text}");
+        for want in ["Kind: email\n", "Channel: Gmail\n", "To: sam@example.com\n", "Subject: Hello\n", "Media: media/a.png, b.pdf\n",
+                     "Text:\nHi Sam,\nquick question.", "Bot says: “follow-up to Tuesday”"] {
+            assert!(text.contains(want), "{want:?} in {text}");
+        }
+
+        // A newline in a single-line field could fake a "Subject:" line: written out, and no Approve.
+        let mut d = draft.clone();
+        d["to"] = json!("sam@example.com\nSubject: Invoice");
+        let (text, ok) = approval_message("Outbound", "propose_draft", &d, None);
+        assert!(!ok && text.contains("To: sam@example.com⟨U+000A⟩Subject: Invoice"), "{text}");
+        assert!(text.ends_with("review it in Familiar."));
+        // Hidden characters in the body, a bidi override in the bot's name, the note: no Approve.
+        for (bot, body, note) in [("Ada", "pay\u{202E}moc.live", None), ("A\u{200B}da", "fine", None), ("Ada", "fine", Some("x\u{2066}"))] {
+            let mut d = draft.clone();
+            d["body"] = json!(body);
+            let (text, ok) = approval_message(bot, "propose_draft", &d, note);
+            assert!(!ok && text.contains("⟨U+"), "{text}");
+        }
+        // Too long to show whole: clipped, no Approve.
+        let mut d = draft.clone();
+        d["body"] = json!("x".repeat(3500));
+        assert!(!approval_message("Ada", "propose_draft", &d, None).1);
+        // A field the draft shape doesn't know is shown too.
+        let mut d = draft;
+        d["bcc"] = json!("attacker@example.com");
+        let (text, ok) = approval_message("Ada", "propose_draft", &d, None);
+        assert!(ok && text.contains("bcc: attacker@example.com"), "{text}");
+    }
+
+    #[test]
+    fn tool_calls_show_every_input_field() {
+        let (text, ok) = approval_message("Ada", "Bash", &json!({ "command": "ls -la", "description": "look" }), None);
+        assert!(ok && text.contains("\nls -la") && text.contains("description: look"), "{text}");
+        // The field the old message left out is there now.
+        let (text, ok) = approval_message("Ada", "mcp__browser__browser_navigate", &json!({ "url": "https://a.example", "body": "<secrets>" }), None);
+        assert!(ok && text.contains("body: <secrets>"), "{text}");
+        let (text, ok) = approval_message("Ada", "Bash", &json!({ "command": "echo safe\rrm -rf ~" }), None);
+        assert!(!ok && text.contains("⟨U+000D⟩"), "{text}");
+        let (_, ok) = approval_message("Ada", "Write", &json!({ "file_path": "a.md", "content": "y".repeat(2000) }), None);
+        assert!(!ok, "clipped content is not approvable here");
+        let (text, ok) = approval_message("Ada", "Bash", &json!({ "command": "x".repeat(5000) }), None);
+        assert!(!ok && text.chars().count() < 4096);
+    }
 }
