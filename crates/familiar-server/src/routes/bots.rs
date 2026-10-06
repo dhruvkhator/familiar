@@ -16,7 +16,7 @@ pub const MODELS: [&str; 4] = ["sonnet", "opus", "haiku", "fable"];
 pub const BOT: &str = "select (to_jsonb(b) - 'owner_id') || jsonb_build_object('status', s.status, 'last_run_at', s.last_run_at)
     from bots b join bot_status s on s.id = b.id";
 
-async fn bot_json(pool: &PgPool, owner: Uuid, id: Uuid) -> R<Json<Row>> {
+pub(super) async fn bot_json(pool: &PgPool, owner: Uuid, id: Uuid) -> R<Json<Row>> {
     let row = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "{BOT} where b.id = $1 and b.owner_id = $2"
     )))
@@ -35,7 +35,7 @@ fn valid_slug(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
 }
 
-fn slugify(name: &str) -> String {
+pub(super) fn slugify(name: &str) -> String {
     let mut out = String::new();
     for c in name.to_lowercase().chars() {
         if c.is_ascii_alphanumeric() {
@@ -63,7 +63,7 @@ pub async fn get(State(st): State<S>, a: Auth, Id(id): Id) -> R<Json<Row>> {
     bot_json(&st.pool, a.user, id).await
 }
 
-const ENGINES: [&str; 2] = ["claude", "codex"];
+pub(super) const ENGINES: [&str; 2] = ["claude", "codex"];
 const AVATAR_KEYS: [&str; 5] = ["shape", "color", "eyes", "mouth", "accessory"];
 
 /// `"avatar": null` clears (Some(None)); absent leaves it alone (None).
@@ -74,7 +74,7 @@ fn nullable<'de, D: serde::Deserializer<'de>>(
 }
 
 /// claude: an alias (`sonnet`, ...) or an exact version id (`claude-opus-5-5`); codex: any sane model id.
-fn check_model(engine: &str, model: &str) -> R<String> {
+pub(super) fn check_model(engine: &str, model: &str) -> R<String> {
     if engine == "codex" {
         let ok = !model.is_empty()
             && model.len() <= 64
@@ -105,7 +105,7 @@ fn exact_claude(model: &str) -> bool {
     })
 }
 
-fn check_avatar(v: &serde_json::Value) -> R<()> {
+pub(super) fn check_avatar(v: &serde_json::Value) -> R<()> {
     let obj = v
         .as_object()
         .ok_or_else(|| ApiError::bad("avatar must be an object or null"))?;

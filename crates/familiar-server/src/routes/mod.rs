@@ -23,6 +23,7 @@ pub mod runs;
 pub mod schedules;
 pub mod skills;
 pub mod stream;
+pub mod templates;
 pub mod threads;
 pub mod triggers;
 

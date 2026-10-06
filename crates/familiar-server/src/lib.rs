@@ -22,7 +22,7 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use routes::{
     approvals, artifacts, bots, channels, connectors, live, memories, models, overview, rules, runs,
-    schedules, skills, stream, threads, triggers,
+    schedules, skills, stream, templates, threads, triggers,
 };
 
 pub struct AppState {
@@ -114,6 +114,9 @@ fn router(state: S, web_origins: &[String]) -> Router {
             "/api/memories/{id}",
             patch(memories::update).delete(memories::remove),
         )
+        .route("/api/bots/{id}/setup", patch(templates::setup))
+        .route("/api/templates", get(templates::list))
+        .route("/api/templates/{id}/create", post(templates::create))
         .route("/api/bots/{id}/dream", post(live::dream))
         .route("/api/bots/{id}/live", get(live::info))
         .route("/api/bots/{id}/live.jpg", get(live::frame))

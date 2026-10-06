@@ -566,6 +566,85 @@ async fn memories_and_dream() {
 // ------------------------------------------------------------------ connectors
 
 #[tokio::test(flavor = "multi_thread")]
+async fn templates_hire_a_teammate() {
+    let app = app!();
+    let a = app.owner().await;
+    let t = &a.tok;
+
+    let (s, list) = app.get(t, "/api/templates").await;
+    assert_eq!(s, 200);
+    let tpl = list.as_array().unwrap().iter().find(|x| x["id"] == "social-media-manager").expect("catalog has it").clone();
+    assert!(tpl["questions"].is_array() && tpl["logins"].is_array());
+    assert_eq!(app.call(Method::GET, "/api/templates", None, None).await.0, 401);
+    assert_eq!(app.post(t, "/api/templates/nope/create", json!({})).await.0, 404);
+    assert_eq!(app.post(t, "/api/templates/social-media-manager/create", json!({"engine": "codex"})).await.0, 400, "codex needs a model");
+    assert_eq!(app.post(t, "/api/templates/social-media-manager/create", json!({"model": "gpt-9"})).await.0, 400);
+    assert_eq!(app.post(t, "/api/templates/social-media-manager/create", json!({"avatar": {"shape": "x".repeat(40)}})).await.0, 400);
+    assert_eq!(app.post(t, "/api/bots", json!({"name": "x"})).await.0, 201, "nothing half-made by the failures above");
+    assert_eq!(len(&app.get(t, "/api/bots").await.1), 1);
+
+    // a connector the owner already has from a suggested preset gets linked; others don't
+    sqlx::query("insert into connectors (owner_id, name, preset, transport, command) values ($1, 'search', 'brave-search', 'stdio', 'npx'), ($1, 'gh', 'github', 'stdio', 'npx')")
+        .bind(a.id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+
+    let v = app
+        .ok_post(t, "/api/templates/community-listener/create", json!({"answers": {"product": "Familiar", "keywords": " ai teammate "}, "name": "Scout"}), 201)
+        .await;
+    let bot = &v["bot"];
+    let bid = id(bot);
+    assert_eq!((bot["name"].as_str(), bot["slug"].as_str(), bot["model"].as_str(), bot["engine"].as_str()), (Some("Scout"), Some("scout"), Some("sonnet"), Some("claude")));
+    let persona = bot["persona"].as_str().unwrap();
+    assert!(persona.contains("problems Familiar solves") && persona.contains("Listen for: ai teammate."), "{persona}");
+    assert!(persona.contains("(not set yet)") && !persona.contains("{{"), "unanswered questions are marked");
+    assert_eq!(bot["avatar"]["accessory"], "headphones");
+    assert!(v["first_task"].as_str().unwrap().contains("ai teammate"));
+    let setup = &bot["setup"];
+    assert_eq!(setup["template"], "community-listener");
+    assert_eq!(setup["dismissed"], false);
+    assert_eq!(setup["logins"][0], json!({"site": "Reddit", "url": "https://www.reddit.com/login/", "done": false}));
+
+    // schedules exist, are off, have their own labelled threads and filled prompts
+    let (_, scheds) = app.get(t, &format!("/api/bots/{bid}/schedules")).await;
+    assert_eq!(len(&scheds), 2);
+    assert!(scheds.as_array().unwrap().iter().all(|s| s["enabled"] == false && !s["prompt"].as_str().unwrap().contains("{{")));
+    let mut ids: Vec<&str> = scheds.as_array().unwrap().iter().map(|s| s["id"].as_str().unwrap()).collect();
+    let mut setup_ids: Vec<&str> = setup["schedules"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+    ids.sort();
+    setup_ids.sort();
+    assert_eq!(ids, setup_ids);
+    let (_, threads) = app.get(t, &format!("/api/bots/{bid}/threads")).await;
+    let titles: Vec<&str> = threads.as_array().unwrap().iter().map(|t| t["title"].as_str().unwrap()).collect();
+    assert!(titles.contains(&"Morning sweep") && threads.as_array().unwrap().iter().all(|t| t["source"] == "schedule"), "{titles:?}");
+    let (_, linked) = app.get(t, &format!("/api/bots/{bid}/connectors")).await;
+    assert_eq!(linked.as_array().unwrap().iter().map(|c| c["name"].as_str().unwrap()).collect::<Vec<_>>(), ["search"]);
+
+    // hiring the same template twice gets a fresh slug; edited instructions still get their placeholders filled
+    let v2 = app
+        .ok_post(t, "/api/templates/community-listener/create", json!({"name": "Scout", "instructions": "Watch {{communities}} only.", "answers": {"communities": "r/rust"}}), 201)
+        .await;
+    assert!(v2["bot"]["slug"].as_str().unwrap().starts_with("scout-"));
+    assert_eq!(v2["bot"]["persona"], "Watch r/rust only.");
+
+    // the Set up checklist
+    let sp = format!("/api/bots/{bid}/setup");
+    let (s, b) = app.patch(t, &sp, json!({"login": "Reddit"})).await;
+    assert_eq!((s, b["setup"]["logins"][0]["done"].clone(), b["setup"]["logins"][1]["done"].clone()), (200, json!(true), json!(false)));
+    let (_, b) = app.patch(t, &sp, json!({"login": "Reddit", "done": false})).await;
+    assert_eq!(b["setup"]["logins"][0]["done"], false);
+    assert_eq!(app.patch(t, &sp, json!({"login": "MySpace"})).await.0, 400);
+    let (_, b) = app.patch(t, &sp, json!({"dismissed": true})).await;
+    assert_eq!(b["setup"]["dismissed"], true);
+    let plain = app.bot(t, "Plain").await;
+    assert_eq!(app.patch(t, &format!("/api/bots/{plain}/setup"), json!({"dismissed": true})).await.0, 400);
+    assert_eq!(app.patch(t, &format!("/api/bots/{}/setup", Uuid::new_v4()), json!({"dismissed": true})).await.0, 404);
+    let b2 = app.second().await;
+    assert_eq!(app.patch(&b2.tok, &sp, json!({"dismissed": false})).await.0, 404, "owner-scoped");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn connectors_secrets_and_presets() {
     let app = app!(true);
     let a = app.owner().await;

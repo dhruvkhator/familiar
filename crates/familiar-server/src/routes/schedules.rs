@@ -12,7 +12,7 @@ use crate::{
 const KINDS: [&str; 2] = ["scheduled", "proactive"];
 
 /// Standard 5-field cron (minute hour day-of-month month day-of-week); returns it whitespace-normalised.
-fn cron(s: &str) -> R<String> {
+pub(super) fn cron(s: &str) -> R<String> {
     let fields: Vec<&str> = s.split_whitespace().collect();
     if fields.len() != 5 {
         return Err(ApiError::bad(
