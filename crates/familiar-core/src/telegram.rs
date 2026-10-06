@@ -12,6 +12,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::daemon::{Ctx, Signal};
+use crate::text::reveal;
 
 #[derive(Debug, Clone, FromRow)]
 struct Channel {
@@ -563,44 +564,6 @@ fn approval_message(bot: &str, tool: &str, input: &Value, reason: Option<&str>) 
     (text, whole)
 }
 
-/// Characters that don't show, or change how the rest reads (the app's approval cards use the same set): Cc, Cf
-/// (bidi overrides, zero-width, tags), Zl/Zp, Co, Cn, plus blank-looking fillers and variation selectors. `\n` and
-/// `\t` count only on single-line fields.
-fn hidden_char(c: char, multiline: bool) -> bool {
-    use unicode_properties::{GeneralCategory as G, UnicodeGeneralCategory as _};
-    if multiline && (c == '\n' || c == '\t') {
-        return false;
-    }
-    matches!(
-        c.general_category(),
-        G::Control | G::Format | G::LineSeparator | G::ParagraphSeparator | G::PrivateUse | G::Unassigned | G::Surrogate
-    ) || matches!(
-        c,
-        '\u{034F}'
-            | '\u{115F}'
-            | '\u{1160}'
-            | '\u{180B}'..='\u{180D}'
-            | '\u{3164}'
-            | '\u{FFA0}'
-            | '\u{FE00}'..='\u{FE0F}'
-            | '\u{E0100}'..='\u{E01EF}'
-    )
-}
-
-/// `s` with every hidden character written out as `⟨U+202E⟩`, and whether there were any.
-fn reveal(s: &str, multiline: bool) -> (String, bool) {
-    let mut out = String::with_capacity(s.len());
-    let mut hidden = false;
-    for c in s.chars() {
-        if hidden_char(c, multiline) {
-            hidden = true;
-            out.push_str(&format!("⟨U+{:04X}⟩", c as u32));
-        } else {
-            out.push(c);
-        }
-    }
-    (out, hidden)
-}
 
 fn short_tool(tool: &str) -> &str {
     tool.strip_prefix("mcp__").unwrap_or(tool)

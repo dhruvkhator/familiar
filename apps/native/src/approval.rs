@@ -71,7 +71,8 @@ pub struct CardState {
     /// The fields the owner may edit, with their boxes: a draft's to / subject / body (always shown), or the field of a
     /// tool call that "Edit & approve" offers.
     pub fields: Vec<(String, Entity<TextareaState>)>,
-    /// What each field started as (a draft's without hidden characters), to tell an edit.
+    /// Each field as proposed (hidden characters included), to tell an edit: what the owner approves is what the box
+    /// shows.
     pub start: Vec<String>,
     pub note: Entity<TextareaState>,
     pub panel: Rc<Cell<Panel>>,
@@ -859,14 +860,17 @@ impl ApprovalCards {
             let (mut fields, mut start) = (Vec::new(), Vec::new());
             if a.is_draft() {
                 for k in draft_keys(a) {
-                    let v = strip_hidden(draft_field(a, k).unwrap_or_default(), k == "body");
+                    // The box shows the text without hidden characters; the baseline is the text as proposed, so a
+                    // field whose hidden characters were taken out counts as edited and goes out as shown.
+                    let raw = draft_field(a, k).unwrap_or_default();
+                    let v = strip_hidden(raw, k == "body");
                     let (placeholder, rows) = match k {
                         "body" => ("The text", if big { 18 } else { 8 }),
                         "subject" => ("Subject", 2),
                         _ => ("Who it goes to", 2),
                     };
                     fields.push((k.to_owned(), new_box(placeholder, rows, &v, window, cx)));
-                    start.push(v);
+                    start.push(raw.to_owned());
                 }
             } else if !is_ask(a) {
                 // A field with hidden characters is reviewed as shown, not edited blind.
@@ -1163,8 +1167,12 @@ mod tests {
         let e = changed_fields(&values, &start);
         assert_eq!(e.into_iter().collect::<Vec<_>>(), vec![("body".to_owned(), "Hello there".to_owned())]);
         assert!(changed_fields(&[("body".to_owned(), "Hello ".to_owned())], &["Hello".to_owned()]).is_empty());
-        // Hidden characters are taken out of what the owner approves.
+        // Hidden characters are taken out of what the owner approves: against the raw proposal, the cleaned text
+        // shown in the box is an edit even when the owner typed nothing.
         assert_eq!(strip_hidden("pay\u{202E}moc.live\u{200B}", true), "paymoc.live");
+        let raw = "pay\u{202E}moc.live".to_owned();
+        let shown = vec![("body".to_owned(), strip_hidden(&raw, true))];
+        assert_eq!(changed_fields(&shown, &[raw]).get("body").map(String::as_str), Some("paymoc.live"));
         assert_eq!(strip_hidden("line one\nline two", true), "line one\nline two");
         assert_eq!(strip_hidden("a\nb", false), "ab");
     }

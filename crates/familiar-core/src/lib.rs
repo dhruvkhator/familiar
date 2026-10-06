@@ -14,6 +14,7 @@ pub mod runner;
 pub mod skills;
 pub mod storage;
 pub mod telegram;
+pub mod text;
 pub mod tools;
 pub mod workspace;
 

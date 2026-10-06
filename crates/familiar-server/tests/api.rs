@@ -580,6 +580,15 @@ async fn approvals_edit_note_revise_and_always_allow() {
     let (_, v) = app.post(t, &decide(d2), json!({ "decision": "revise", "response": "shorter, no exclamation mark" })).await;
     assert_eq!((v["status"].as_str(), v["response"].as_str()), (Some("revise"), Some("shorter, no exclamation mark")));
     assert_eq!(len(&app.get(t, "/api/approvals?status=revise").await.1), 1);
+    // A draft with hidden characters is never approved as is; its cleaned-up text is.
+    let sneaky = json!({ "kind": "post", "channel": "X", "body": "Pay at moc.live\u{202E} now" });
+    let d4 = offered(&app, &a, r, b, "propose_draft", sneaky, &fields, None).await;
+    let (s, v) = app.post(t, &decide(d4), json!({ "decision": "approve" })).await;
+    assert_eq!(s, 400, "{v}");
+    assert_eq!(len(&app.get(t, "/api/approvals?status=pending").await.1), 3, "still pending after the refusal");
+    let (s, v) = app.post(t, &decide(d4), json!({ "decision": "approve", "edits": { "body": "Pay at moc.live now" } })).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["edited_input"]["body"], "Pay at moc.live now");
     let d3 = offered(&app, &a, r, b, "propose_draft", draft, &fields, None).await;
     let (_, v) = app.post(t, &decide(d3), json!({ "decision": "deny", "response": "not this one" })).await;
     assert_eq!(v["status"], "denied");

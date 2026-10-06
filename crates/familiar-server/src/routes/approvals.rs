@@ -119,6 +119,11 @@ pub async fn decide(
     }
     let input = input.map(|j| j.0).unwrap_or_else(|| json!({}));
     let edited = edited_input(&tool, &input, &editable, &edits)?;
+    if status == "approved" && tool == "propose_draft" && draft_has_hidden(edited.as_ref().unwrap_or(&input)) {
+        return Err(ApiError::bad(
+            "this draft contains hidden characters; review it in the app (approving its cleaned-up text is fine)",
+        ));
+    }
 
     let mut rule = None;
     if always {
@@ -174,6 +179,17 @@ pub async fn decide(
         out["rule"] = r.0;
     }
     Ok(Json(out))
+}
+
+/// A draft whose text (as it would go out) still has characters that don't show or change how the rest reads: never
+/// approved as is (the app shows them written out and takes them out of what the owner approves).
+fn draft_has_hidden(draft: &Value) -> bool {
+    use familiar_core::text::has_hidden;
+    let fields = ["kind", "channel", "to", "subject", "body"]
+        .iter()
+        .filter_map(|k| draft[*k].as_str().map(|v| (v, *k == "body")))
+        .chain(draft["media"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|m| (m, false)));
+    fields.into_iter().any(|(v, multiline)| has_hidden(v, multiline))
 }
 
 /// The input with the owner's edits applied, or None when they changed nothing. Only fields the approval lists as
@@ -233,6 +249,14 @@ mod tests {
         assert!(edited_input("Bash", &input, &editable, &edits(&[("command", "  ")])).is_err());
         // Unchanged = no edit.
         assert_eq!(edited_input("Bash", &input, &editable, &edits(&[("command", "git status")])).unwrap(), None);
+    }
+
+    #[test]
+    fn hidden_characters_in_drafts() {
+        assert!(!draft_has_hidden(&json!({ "kind": "post", "channel": "X", "body": "two\nlines" })));
+        assert!(draft_has_hidden(&json!({ "kind": "post", "channel": "X", "body": "pay\u{202E}moc.live" })));
+        assert!(draft_has_hidden(&json!({ "kind": "email", "channel": "Gmail", "to": "a@b.c\nBcc: x", "body": "hi" })));
+        assert!(draft_has_hidden(&json!({ "kind": "post", "channel": "X", "body": "hi", "media": ["a\u{200B}.png"] })));
     }
 
     #[test]

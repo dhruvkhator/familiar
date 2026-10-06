@@ -795,6 +795,29 @@ async fn draft_edit_then_approve() {
     h.finish().await;
 }
 
+/// A draft with hidden characters approved in its cleaned-up form: the teammate gets the clean text to use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_hidden_characters_are_cleaned() {
+    let Some(mut h) = setup("draft_hidden_characters_are_cleaned").await else { return };
+    h.scenario(json!([[
+        { "init": {} },
+        mcp("propose_draft", json!({ "kind": "post", "channel": "X", "body": "Pay at moc.live\u{202E} now" })),
+        { "result": "ok" },
+    ]]));
+    h.start();
+    let bot = h.bot("sneaky").await;
+    let thread = h.thread(bot).await;
+    let run = h.say(thread, "draft").await;
+    let (approval, _, input, _) = h.pending_approval(run).await;
+    let mut clean = input.clone();
+    clean["body"] = json!("Pay at moc.live now");
+    h.decide_edited(approval, clean).await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+    let results = h.invocation(0).mcp_results();
+    assert!(results[0].1.contains("\nPay at moc.live now\n") && !results[0].1.contains('\u{202E}'), "{results:?}");
+    h.finish().await;
+}
+
 /// Drafts: a rejection carries the owner's note; "Ask for changes" tells the teammate to revise and propose again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn draft_reject_and_revise() {
