@@ -290,6 +290,10 @@ mod tests {
             }
             assert!(CATEGORIES.contains(&str_of(t, "category", id)), "{id}: unknown category");
             assert!(bots::MODELS.contains(&str_of(t, "model", id)), "{id}: model must be a Claude alias");
+            // Every outward action is proposed as a draft first, and the approved text is used as it comes back.
+            let rules = str_of(t, "instructions", id);
+            assert!(rules.contains("through `propose_draft` first") && rules.contains("EXACTLY the text"), "{id}: drafts rule");
+            assert!(!rules.contains("approved that exact action through `ask_user`"), "{id}: old approval rule");
 
             let a = &t["avatar"];
             bots::check_avatar(a).unwrap_or_else(|_| panic!("{id}: avatar rejected by the API"));
