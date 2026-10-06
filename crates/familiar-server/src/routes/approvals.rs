@@ -105,8 +105,11 @@ pub async fn decide(
 
     let mut rule = None;
     if always {
+        // The rule is the one the daemon offered for exactly this call, re-derived here from the stored tool and
+        // input: never text a client chose, and never anything the current checks would not offer.
         let pattern = allow_rule
             .filter(|_| !NOT_TOOLS.contains(&tool.as_str()))
+            .filter(|r| familiar_core::permissions::always_allow_rule(&tool, &input).as_ref() == Some(r))
             .ok_or_else(|| ApiError::bad("this action can't be always allowed"))?;
         // The same rule twice adds nothing; the existing one is reported.
         let existing: Option<Row> = sqlx::query_scalar(

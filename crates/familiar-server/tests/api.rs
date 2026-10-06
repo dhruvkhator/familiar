@@ -471,11 +471,11 @@ async fn approvals_edit_note_revise_and_always_allow() {
     let bot = app.bot(t, "Editor").await;
     let (_, run) = app.chat(t, &bot, "do it").await;
     let (b, r) = (bot.parse::<Uuid>().unwrap(), uid(&run));
-    let bash = json!({ "command": "git status", "description": "look around" });
+    let bash = json!({ "command": "ls -la", "description": "look around" });
     let decide = |id: Uuid| format!("/api/approvals/{id}");
 
     // Edit & approve: only the offered field, only with approve, never together with "always".
-    let x = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(git status)")).await;
+    let x = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(ls -la)")).await;
     for bad in [
         json!({ "decision": "approve", "edits": { "description": "x" } }),
         json!({ "decision": "approve", "edits": { "command": " " } }),
@@ -485,31 +485,47 @@ async fn approvals_edit_note_revise_and_always_allow() {
     ] {
         assert_eq!(app.post(t, &decide(x), bad.clone()).await.0, 400, "{bad}");
     }
-    let (s, v) = app.post(t, &decide(x), json!({ "decision": "approve", "edits": { "command": "git status --short" } })).await;
+    let (s, v) = app.post(t, &decide(x), json!({ "decision": "approve", "edits": { "command": "ls -la notes" } })).await;
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["status"], "approved");
-    assert_eq!(v["edited_input"], json!({ "command": "git status --short", "description": "look around" }));
+    assert_eq!(v["edited_input"], json!({ "command": "ls -la notes", "description": "look around" }));
     assert_eq!(v["input"], bash, "the proposal is kept as it was");
     assert!(v.get("rule").is_none());
 
     // Deny with a note: the note is the response.
-    let y = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(git status)")).await;
+    let y = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(ls -la)")).await;
     let (_, v) = app.post(t, &decide(y), json!({ "decision": "deny", "response": "use the dashboard instead" })).await;
     assert_eq!((v["status"].as_str(), v["response"].as_str()), (Some("denied"), Some("use the dashboard instead")));
     assert!(v["edited_input"].is_null());
 
     // Always allow: approves and adds the offered rule for this teammate only; the same rule is not added twice.
     for _ in 0..2 {
-        let z = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(git status)")).await;
+        let z = offered(&app, &a, r, b, "Bash", bash.clone(), &["command"], Some("Bash(ls -la)")).await;
         let (s, v) = app.post(t, &decide(z), json!({ "decision": "approve", "always": true })).await;
         assert_eq!(s, 200, "{v}");
         assert_eq!(v["status"], "approved");
-        assert_eq!((v["rule"]["pattern"].as_str(), v["rule"]["decision"].as_str()), (Some("Bash(git status)"), Some("allow")));
+        assert_eq!((v["rule"]["pattern"].as_str(), v["rule"]["decision"].as_str()), (Some("Bash(ls -la)"), Some("allow")));
         assert_eq!(v["rule"]["bot_id"].as_str(), Some(bot.as_str()));
     }
     let (_, rules) = app.get(t, &format!("/api/rules?bot_id={bot}")).await;
     assert_eq!(len(&rules), 1, "{rules}");
     assert_eq!(len(&app.get(t, "/api/rules").await.1), 0, "no global rule");
+    let other = app.bot(t, "Other").await;
+    assert_eq!(len(&app.get(t, &format!("/api/rules?bot_id={other}")).await.1), 0, "only the teammate that asked");
+
+    // The stored rule is re-derived from the stored call: one the checks would not offer is refused.
+    for (input, rule) in [
+        (json!({ "command": "python report.py" }), "Bash(python report.py)"),
+        (json!({ "command": "ls -la" }), "Bash(ls *)"),
+        (json!({ "command": "ls -la" }), "Bash"),
+    ] {
+        let x = offered(&app, &a, r, b, "Bash", input, &["command"], Some(rule)).await;
+        assert_eq!(app.post(t, &decide(x), json!({ "decision": "approve", "always": true })).await.0, 400, "{rule}");
+        app.exec("update approvals set status = 'denied' where id = $1", &[x]).await;
+    }
+    let w = offered(&app, &a, r, b, "Write", json!({ "file_path": ".claude/settings.json", "content": "{}" }), &["content"], Some("Write")).await;
+    assert_eq!(app.post(t, &decide(w), json!({ "decision": "approve", "always": true })).await.0, 400, "no file tools");
+    app.exec("update approvals set status = 'denied' where id = $1", &[w]).await;
 
     // Never for what the daemon didn't offer (always-human actions), nor for questions and drafts.
     let h = offered(&app, &a, r, b, "Bash", json!({ "command": "rm -rf build" }), &["command"], None).await;

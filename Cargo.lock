@@ -1495,6 +1495,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "croner",
+ "familiar-core",
  "familiar-crypto",
  "hex",
  "rand 0.10.3",
