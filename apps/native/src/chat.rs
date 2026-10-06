@@ -1,6 +1,7 @@
 //! A teammate's page (the web's `pages/Chat.tsx`): a hero header with the mascot's live state, the thread list, the
 //! selected thread's transcript (messages oldest → newest, the pending optimistic bubble, then the latest run's card
-//! with its live events, streamed text and approvals) and the composer.
+//! with its live events, streamed text and approvals) and the composer. A teammate hired from a template shows its
+//! Set up checklist above the chat until that is done.
 
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,7 @@ use crate::bot_settings::BotSettings;
 use crate::computer::{Browsing, ComputerPanel};
 use crate::events::EventRows;
 use crate::memory::MemoryTab;
+use crate::setup::{OpenLogin, SetupCard};
 use crate::data::{self, AppData, DataEvent, ago, excerpt, run_status, swr};
 use crate::markdown;
 use crate::shell::state_tone;
@@ -77,6 +79,7 @@ pub struct BotPage {
     computer_open: bool,
     /// You closed the computer: it doesn't open by itself again on this page.
     computer_dismissed: bool,
+    setup: Entity<SetupCard>,
 }
 
 pub const TAB_SETTINGS: usize = 3;
@@ -106,6 +109,9 @@ impl BotPage {
             }
         })
         .detach();
+        let setup = cx.new(|cx| SetupCard::new(data.clone(), toasts.clone(), bot, cx));
+        cx.subscribe_in(&setup, window, |this: &mut Self, _, ev: &OpenLogin, window, cx| this.open_login(ev.0.clone(), window, cx))
+            .detach();
         let mut this = Self {
             data,
             toasts,
@@ -135,6 +141,7 @@ impl BotPage {
             computer,
             computer_open: false,
             computer_dismissed: false,
+            setup,
         };
         this.reload_threads(cx);
         // Opening a teammate puts the cursor in the composer.
@@ -471,7 +478,8 @@ impl BotPage {
                             .truncate()
                             .child(status_line),
                     )
-                    .when_some(bot.persona.clone().filter(|p| !p.trim().is_empty()), |el, p| {
+                    // The persona's prose, without markdown headings (a template's instructions start with one).
+                    .when_some(bot.persona.as_deref().map(prose).filter(|p| !p.is_empty()), |el, p| {
                         el.child(
                             div().text_size(px(text::SMALL)).text_color(theme.muted).line_clamp(1).child(excerpt(&p, 160)),
                         )
@@ -530,6 +538,13 @@ impl BotPage {
             self.computer.update(cx, |c, cx| c.set_shown(open, cx));
             cx.notify();
         }
+    }
+
+    /// The Set up checklist's "Log in to …": show the computer on that page, with you in control.
+    fn open_login(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.computer_dismissed = false;
+        self.set_computer(true, cx);
+        self.computer.update(cx, |c, cx| c.take_over_at(url, window, cx));
     }
 
     pub fn set_tab(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1016,6 +1031,11 @@ impl BotPage {
     }
 }
 
+/// Text lines without markdown headings, joined.
+fn prose(s: &str) -> String {
+    s.lines().filter(|l| !l.trim_start().starts_with('#')).collect::<Vec<_>>().join(" ").trim().to_owned()
+}
+
 impl Render for BotPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let header = self.header(cx);
@@ -1083,6 +1103,7 @@ impl Render for BotPage {
                         .h_full()
                         .flex()
                         .flex_col()
+                        .child(self.setup.clone())
                         .child(div().relative().flex_1().min_h_0().child(transcript).when_some(jump, |el, j| el.child(j)))
                         .child(composer),
                 )

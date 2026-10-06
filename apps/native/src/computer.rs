@@ -55,6 +55,8 @@ pub struct ComputerPanel {
     /// The address bar (Enter goes there); follows the page while you aren't editing it.
     address: Entity<InputState>,
     shown_url: String,
+    /// A page you asked for before its browser showed anything (the Set up checklist's "Log in").
+    opening: Option<String>,
 }
 
 impl EventEmitter<Browsing> for ComputerPanel {}
@@ -107,6 +109,7 @@ impl ComputerPanel {
             input: tx,
             address,
             shown_url: String::new(),
+            opening: None,
         };
         this.refresh(cx);
         this
@@ -192,6 +195,9 @@ impl ComputerPanel {
                     self.stale.push(old);
                 }
             }
+            if self.info.is_some() {
+                self.opening = None;
+            }
             let browsing = self.info.as_ref().is_some_and(real_page);
             if browsing && !self.browsing {
                 cx.emit(Browsing);
@@ -214,6 +220,15 @@ impl ComputerPanel {
         self.address.update(cx, |s, cx| s.set_value(url.clone(), window, cx));
         self.send(LiveInput::navigate(url));
         self.focus.focus(window, cx);
+    }
+
+    /// Open `url` in the teammate's browser (the daemon starts it if needed) and hand you the controls, so you can
+    /// sign in yourself.
+    pub fn take_over_at(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.address.update(cx, |s, cx| s.set_value(url.clone(), window, cx));
+        self.send(LiveInput::navigate(url.clone()));
+        self.opening = Some(url);
+        self.set_control(true, window, cx);
     }
 
     fn send(&self, input: LiveInput) {
@@ -369,7 +384,24 @@ impl Render for ComputerPanel {
 
         let Some(info) = self.info.clone() else {
             // No session yet (or still loading).
-            let body = if self.loaded {
+            let body = if let Some(url) = self.opening.clone() {
+                let host = reqwest::Url::parse(&url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or(url);
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(24.0))
+                    .child(Mascot::new(format!("computer-opening-{}", self.bot), avatar, MascotState::Working, 88.0))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(format!("Opening {host}…")))
+                    .child(
+                        div()
+                            .text_size(px(text::SMALL))
+                            .text_color(theme.muted)
+                            .text_center()
+                            .child(format!("Starting {name}'s browser. You'll have the controls as soon as the page shows.")),
+                    )
+            } else if self.loaded {
                 div()
                     .flex()
                     .flex_col()

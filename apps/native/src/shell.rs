@@ -25,10 +25,11 @@ use gpui::{
 use uuid::Uuid;
 
 use crate::approval::ApprovalCards;
-use crate::bot_settings::{BotSettings, CreateEvent, INTRO};
+use crate::bot_settings::{BotSettings, CreateEvent};
 use crate::chat::{BotPage, TAB_SETTINGS};
 use crate::settings::AppSettings;
 use crate::data::{AppData, Status, Teammate, ago, excerpt, run_status, tail, until};
+use crate::templates::{Picked, TemplatePicker};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Route {
@@ -52,8 +53,11 @@ pub struct Shell {
     /// Teammate pages, kept so switching back is instant and keeps the scroll.
     pages: HashMap<Uuid, Entity<BotPage>>,
     settings: Option<Entity<AppSettings>>,
-    /// The New teammate form while it is open (fresh each time).
+    /// The New teammate flow while it is open (fresh each time): the template picker, then the form.
+    picker: Option<Entity<TemplatePicker>>,
     new_bot: Option<Entity<BotSettings>>,
+    /// Bumped per form so each one plays its entrance.
+    form_gen: usize,
     /// Open this teammate's page on its Settings tab (from `--open <name>/settings`).
     open_tab: Option<Uuid>,
 }
@@ -108,7 +112,9 @@ impl Shell {
             inbox: ApprovalCards::big(),
             pages: HashMap::new(),
             settings: None,
+            picker: None,
             new_bot: None,
+            form_gen: 0,
             open_tab: None,
         }
     }
@@ -148,6 +154,7 @@ impl Shell {
     pub fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
         if route != Route::NewTeammate {
             self.new_bot = None;
+            self.picker = None;
         }
         if let Some(s) = self.settings.clone() {
             let shown = route == Route::Settings;
@@ -353,32 +360,52 @@ impl Shell {
                 self.scrolled(page.into_any_element())
             }
             Route::NewTeammate => {
-                let form = match self.new_bot.clone() {
-                    Some(f) => f,
+                if let Some(form) = self.new_bot.clone() {
+                    let id = SharedString::from(format!("new-teammate-form-{}", self.form_gen));
+                    return self.scrolled(anim::appear(id, div().child(form)).into_any_element());
+                }
+                let picker = match self.picker.clone() {
+                    Some(p) => p,
                     None => {
-                        let (data, toasts) = (self.data.clone(), self.toasts.clone());
-                        let f = cx.new(|cx| BotSettings::create(data, toasts, window, cx));
-                        cx.subscribe_in(&f, window, Self::on_create).detach();
-                        self.new_bot = Some(f.clone());
-                        f
+                        let data = self.data.clone();
+                        let p = cx.new(|cx| TemplatePicker::new(data, cx));
+                        cx.subscribe_in(&p, window, Self::on_pick).detach();
+                        self.picker = Some(p.clone());
+                        p
                     }
                 };
-                self.scrolled(anim::appear("new-teammate", div().child(form)).into_any_element())
+                self.scrolled(anim::appear("new-teammate", div().child(picker)).into_any_element())
             }
         }
     }
 
-    /// The New teammate form finished: show the teammate, and (if asked) have it introduce itself.
+    /// A template (or a blank teammate) was picked: open the form for it.
+    fn on_pick(&mut self, _: &Entity<TemplatePicker>, ev: &Picked, window: &mut Window, cx: &mut Context<Self>) {
+        let (data, toasts, template) = (self.data.clone(), self.toasts.clone(), ev.0.clone());
+        let form = cx.new(|cx| BotSettings::create(data, toasts, template, window, cx));
+        cx.subscribe_in(&form, window, Self::on_create).detach();
+        self.new_bot = Some(form);
+        self.form_gen += 1;
+        self.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        cx.notify();
+    }
+
+    /// The New teammate form finished: show the teammate, and (if asked) send its first message.
     fn on_create(&mut self, _: &Entity<BotSettings>, ev: &CreateEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
             CreateEvent::Cancelled => self.navigate(Route::Today, cx),
-            CreateEvent::Created { bot, intro } => {
+            CreateEvent::Back => {
+                self.new_bot = None;
+                self.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+                cx.notify();
+            }
+            CreateEvent::Created { bot, post } => {
                 let id = bot.id;
                 self.data.update(cx, |d, cx| d.add_bot(bot.clone(), cx));
                 let (data, toasts) = (self.data.clone(), self.toasts.clone());
                 let page = cx.new(|cx| BotPage::new(data, toasts, id, window, cx));
-                if *intro {
-                    page.update(cx, |p, cx| p.post(INTRO.to_owned(), window, cx));
+                if let Some(text) = post.clone() {
+                    page.update(cx, |p, cx| p.post(text, window, cx));
                 }
                 self.pages.insert(id, page);
                 self.navigate(Route::Teammate(id.to_string().into()), cx);

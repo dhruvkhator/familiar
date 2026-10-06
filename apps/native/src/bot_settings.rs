@@ -1,8 +1,10 @@
 //! A teammate's Settings tab (the web's `pages/Settings.tsx`): name, look (the avatar builder), persona, engine and
 //! model, paused, and delete. The same form, in create mode, is the New teammate flow (the web's `CreateBotDialog`):
-//! name, a randomised look, what it should do, engine and a plan-checked model, and an optional hello.
+//! name, a randomised look, what it should do, engine and a plan-checked model, and an optional hello. Hired from a
+//! template ([`crate::templates`]), it starts with the template's questions, look, instructions and model, shows what
+//! the template sets up, and offers its first task instead of the hello.
 
-use familiar_client::{Bot, BotEngine, BotPatch, NewBot};
+use familiar_client::{Bot, BotEngine, BotPatch, ConnectorPreset, FromTemplate, NewBot, Template};
 use familiar_ui::anim;
 use familiar_ui::components::{Button, ButtonSize, Segmented, Switch, card};
 use familiar_ui::icons;
@@ -10,7 +12,7 @@ use familiar_ui::mascot::{Accessory, Avatar, EYE_COUNT, MOUTH_COUNT, Mascot, Mas
 use familiar_ui::theme::{RADIUS_CARD, RADIUS_CONTROL, Theme, Tone, hex, text};
 use familiar_ui::toast::ToastStack;
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _, IntoElement,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
@@ -18,7 +20,8 @@ use gpui_base::input::{InputEvent, InputState, TextareaState};
 use gpui_tokio::Tokio;
 use uuid::Uuid;
 
-use crate::data::{AppData, avatar_of};
+use crate::data::{AppData, avatar_of, excerpt};
+use crate::templates;
 use crate::text_input;
 
 /// The Claude aliases (always available, they run the newest version) and the version each runs today; shown until
@@ -36,9 +39,26 @@ struct Choice {
 
 /// What the create form tells the shell.
 pub enum CreateEvent {
-    /// The teammate exists; `intro`: ask it to introduce itself.
-    Created { bot: Bot, intro: bool },
+    /// The teammate exists; `post`: a first message to send it (the hello, or the template's first task).
+    Created { bot: Bot, post: Option<String> },
     Cancelled,
+    /// Back to the template picker.
+    Back,
+}
+
+/// A template question's field.
+enum Answer {
+    Line(Entity<InputState>),
+    Area(Entity<TextareaState>),
+}
+
+impl Answer {
+    fn value(&self, cx: &App) -> String {
+        match self {
+            Self::Line(s) => s.read(cx).value().to_string(),
+            Self::Area(s) => s.read(cx).value().to_string(),
+        }
+    }
 }
 
 /// The hello a new teammate gets when the owner asks for one.
@@ -67,6 +87,11 @@ pub struct BotSettings {
     busy: bool,
     error: Option<String>,
     confirm_delete: bool,
+    /// Create mode: the template it is hired from, with its questions' fields (key, label, field).
+    template: Option<Template>,
+    answers: Vec<(String, String, Answer)>,
+    /// Connector names for the template's suggestions.
+    presets: Vec<ConnectorPreset>,
 }
 
 impl EventEmitter<CreateEvent> for BotSettings {}
@@ -77,13 +102,62 @@ impl BotSettings {
         Self::build(data, toasts, b, false, window, cx)
     }
 
-    /// The New teammate form: a random look, Claude on Sonnet.
-    pub fn create(data: Entity<AppData>, toasts: Entity<ToastStack>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let b = Bot { model: "sonnet".into(), engine: BotEngine::Claude, ..Default::default() };
+    /// The New teammate form: a random look, Claude on Sonnet; or, from a template, its name, look, instructions
+    /// and model, with its questions on top.
+    pub fn create(
+        data: Entity<AppData>,
+        toasts: Entity<ToastStack>,
+        template: Option<Template>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let Some(t) = template else {
+            let b = Bot { model: "sonnet".into(), engine: BotEngine::Claude, ..Default::default() };
+            let mut this = Self::build(data, toasts, b, true, window, cx);
+            this.randomize(cx);
+            cx.defer_in(window, |this, window, cx| this.name.update(cx, |s, cx| s.focus(window, cx)));
+            return this;
+        };
+        let b = Bot {
+            name: t.name.clone(),
+            persona: Some(t.instructions.clone()),
+            model: t.model.clone(),
+            engine: BotEngine::Claude,
+            ..Default::default()
+        };
         let mut this = Self::build(data, toasts, b, true, window, cx);
-        this.randomize(cx);
-        cx.defer_in(window, |this, window, cx| this.name.update(cx, |s, cx| s.focus(window, cx)));
+        this.avatar = templates::template_avatar(&t);
+        for q in &t.questions {
+            // "e.g." so a sample answer never reads as one already given.
+            let placeholder = format!("e.g. {}", q.placeholder);
+            let field = if q.multiline {
+                Answer::Area(cx.new(|cx| TextareaState::new(window, cx).placeholder(placeholder).auto_grow(2, 6)))
+            } else {
+                Answer::Line(text_input::new_line(placeholder, false, window, cx))
+            };
+            match &field {
+                Answer::Line(s) => cx.subscribe_in(s, window, Self::on_answer).detach(),
+                Answer::Area(s) => cx.subscribe_in(s, window, Self::on_answer).detach(),
+            }
+            this.answers.push((q.key.clone(), q.label.clone(), field));
+        }
+        let client = this.data.read(cx).client.clone();
+        crate::data::swr(&mut this, &client, "/api/connectors/presets".into(), cx, |this, p: Vec<ConnectorPreset>, _| {
+            this.presets = p
+        });
+        this.template = Some(t);
+        cx.defer_in(window, |this, window, cx| match this.answers.first() {
+            Some((_, _, Answer::Line(s))) => s.update(cx, |s, cx| s.focus(window, cx)),
+            Some((_, _, Answer::Area(s))) => s.update(cx, |s, cx| s.focus(window, cx)),
+            None => this.name.update(cx, |s, cx| s.focus(window, cx)),
+        });
         this
+    }
+
+    fn on_answer<E>(&mut self, _: &Entity<E>, ev: &InputEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if matches!(ev, InputEvent::Change) {
+            cx.notify()
+        }
     }
 
     fn build(data: Entity<AppData>, toasts: Entity<ToastStack>, b: Bot, create: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -144,6 +218,9 @@ impl BotSettings {
             busy: false,
             error: None,
             confirm_delete: false,
+            template: None,
+            answers: Vec::new(),
+            presets: Vec::new(),
         };
         this.load_catalog(cx);
         // The plan check reports through the computer's minute heartbeat: look again while it is still running.
@@ -237,6 +314,9 @@ impl BotSettings {
     /// Create mode: make the teammate (the server picks the slug; a taken one gets a short suffix).
     fn create_bot(&mut self, name: String, model: String, cx: &mut Context<Self>) {
         let avatar = serde_json::from_value(self.avatar.to_json()).ok();
+        if let Some(t) = self.template.clone() {
+            return self.hire(t, name, model, avatar, cx);
+        }
         let new = NewBot {
             name: Some(name.clone()),
             slug: None,
@@ -268,7 +348,7 @@ impl BotSettings {
                 match r {
                     Ok(bot) => {
                         this.toasts.update(cx, |t, cx| t.push(Tone::Ok, format!("{} is ready", bot.name), None, cx));
-                        cx.emit(CreateEvent::Created { bot, intro });
+                        cx.emit(CreateEvent::Created { bot, post: intro.then(|| INTRO.to_owned()) });
                     }
                     Err(e) => {
                         this.error = Some(e.clone());
@@ -279,6 +359,82 @@ impl BotSettings {
             });
         })
         .detach();
+    }
+
+    /// Create mode from a template: one call makes the teammate, its schedules (off) and its Set up checklist.
+    fn hire(&mut self, t: Template, name: String, model: String, avatar: Option<familiar_client::Avatar>, cx: &mut Context<Self>) {
+        let hire = FromTemplate {
+            answers: Some(self.answers.iter().map(|(k, _, f)| (k.clone(), f.value(cx))).collect()),
+            name: Some(name),
+            instructions: Some(self.persona.read(cx).value().trim().to_string()),
+            engine: Some(if self.codex { "codex" } else { "claude" }.into()),
+            model: Some(model),
+            avatar,
+        };
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+        let client = self.data.read(cx).client.clone();
+        let first = self.intro;
+        let task = Tokio::spawn(cx, async move { client.create_from_template(&t.id, &hire).await });
+        cx.spawn(async move |this, cx| {
+            let r = task.await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.message()));
+            let _ = this.update(cx, |this, cx| {
+                this.busy = false;
+                match r {
+                    Ok(hired) => {
+                        this.toasts.update(cx, |t, cx| t.push(Tone::Ok, format!("{} is ready", hired.bot.name), None, cx));
+                        let post = hired.first_task.filter(|_| first);
+                        cx.emit(CreateEvent::Created { bot: hired.bot, post });
+                    }
+                    Err(e) => {
+                        this.error = Some(e.clone());
+                        this.toasts.update(cx, |t, cx| t.push(Tone::Bad, "Couldn't create it", Some(e.into()), cx));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// The template's questions, each with its own field.
+    fn questions(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.answers.is_empty() {
+            return None;
+        }
+        let theme = Theme::of(cx).clone();
+        let mut col = div().flex().flex_col().gap(px(14.0));
+        for (i, (key, label, field)) in self.answers.iter().enumerate() {
+            let id = SharedString::from(format!("bs-q-{key}"));
+            let input = match field {
+                Answer::Line(s) => text_input::field(id, s, 38.0, window, cx).into_any_element(),
+                Answer::Area(s) => text_input::field(id, s, 60.0, window, cx).into_any_element(),
+            };
+            col = col.child(anim::stagger(
+                SharedString::from(format!("bs-q-in-{key}")),
+                i,
+                div().flex().flex_col().gap(px(6.0)).child(div().text_size(px(text::SMALL)).font_weight(FontWeight::MEDIUM).child(label.clone())).child(input),
+            ));
+        }
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(div().text_size(px(text::TITLE)).font_weight(FontWeight::SEMIBOLD).child("A few questions"))
+                        .child(div().text_size(px(text::SMALL)).text_color(theme.muted).child(
+                            "Your answers go into its instructions. Skip any you like: it will ask you when it matters.",
+                        )),
+                )
+                .child(col)
+                .into_any_element(),
+        )
     }
 
     fn load_catalog(&mut self, cx: &mut Context<Self>) {
@@ -624,7 +780,7 @@ fn kebab(s: &str) -> String {
 }
 
 /// A checkbox square (the row around it takes the click).
-fn checkbox(on: bool, theme: &Theme) -> gpui::Div {
+pub(crate) fn checkbox(on: bool, theme: &Theme) -> gpui::Div {
     div()
         .flex_none()
         .mt(px(2.0))
@@ -683,6 +839,18 @@ impl Render for BotSettings {
             }))
         };
         let create = self.create;
+        let template = self.template.clone();
+        let questions = self.questions(window, cx);
+        let summary = template.as_ref().map(|t| templates::setup_summary(t, &self.presets, cx));
+        let answers: Vec<(String, String)> = self.answers.iter().map(|(k, _, f)| (k.clone(), f.value(cx))).collect();
+        let (intro_title, intro_caption) = match template.as_ref().and_then(|t| t.first_task.clone()) {
+            Some(task) => (
+                "Start on its first task when it's ready".to_owned(),
+                format!("Opens its chat and asks: “{}” Uses a little of your plan.", excerpt(&templates::preview(&task, &answers), 160)),
+            ),
+            None => ("Say hello when it's ready".to_owned(), format!("Opens its chat and asks: “{INTRO}” Uses a little of your plan.")),
+        };
+        let back_this = cx.entity();
         let intro_this = cx.entity();
         let cancel_this = cx.entity();
         let create_this = cx.entity();
@@ -692,20 +860,55 @@ impl Render for BotSettings {
             .flex_col()
             .gap(px(22.0))
             .when(create, |el| {
+                let (title, lead) = match &template {
+                    Some(t) => (t.name.clone(), t.summary.clone()),
+                    None => ("New teammate".to_owned(), "Name it, give it a look and a job. You can change all of this later.".to_owned()),
+                };
                 el.child(
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(4.0))
-                        .child(div().text_size(px(text::HEADLINE)).font_weight(FontWeight::SEMIBOLD).child("New teammate"))
+                        .gap(px(10.0))
                         .child(
                             div()
-                                .text_size(px(text::LEAD))
+                                .id("bs-back")
+                                .flex()
+                                .items_center()
+                                .gap(px(4.0))
+                                .cursor_pointer()
+                                .text_size(px(text::SMALL))
                                 .text_color(theme.muted)
-                                .child("Name it, give it a look and a job. You can change all of this later."),
+                                .hover(|s| s.text_color(theme.ink))
+                                .on_click(move |_, _, cx| back_this.update(cx, |_, cx| cx.emit(CreateEvent::Back)))
+                                .child(
+                                    icons::icon(icons::ALT_ARROW_RIGHT)
+                                        .size(px(14.0))
+                                        .text_color(theme.muted)
+                                        .with_transformation(gpui::Transformation::rotate(gpui::radians(std::f32::consts::PI))),
+                                )
+                                .child("All templates"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(14.0))
+                                .when_some(template.as_ref(), |el, t| {
+                                    el.child(templates::mascot_tile(format!("bs-tpl-{}", t.id), self.avatar, 56.0, &theme))
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.0))
+                                        .min_w_0()
+                                        .child(div().text_size(px(text::HEADLINE)).font_weight(FontWeight::SEMIBOLD).child(title))
+                                        .child(div().text_size(px(text::LEAD)).text_color(theme.muted).child(lead)),
+                                ),
                         ),
                 )
             })
+            .children(questions)
             .child(div().flex().flex_col().gap(px(6.0)).child(label("Name")).child(text_input::field("bs-name", &self.name, 38.0, window, cx)))
             .child(div().flex().flex_col().gap(px(6.0)).child(label("Look")).child(builder))
             .child(
@@ -713,9 +916,11 @@ impl Render for BotSettings {
                     .flex()
                     .flex_col()
                     .gap(px(6.0))
-                    .child(label(if create { "What it should do" } else { "Persona" }))
+                    .child(label(if template.is_some() { "Instructions" } else if create { "What it should do" } else { "Persona" }))
                     .child(text_input::field("bs-persona", &self.persona, 110.0, window, cx))
-                    .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(if create {
+                    .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(if template.is_some() {
+                        "Its standing instructions; edit freely. The {{…}} bits are filled in from your answers above."
+                    } else if create {
                         "Who it is and how it should work. Becomes the start of its instructions."
                     } else {
                         "Written at the top of its instructions."
@@ -767,6 +972,9 @@ impl Render for BotSettings {
                     )
                     .child(div().flex().flex_col().gap(px(6.0)).child(label("Model")).child(model_control)),
             )
+            .when_some(summary, |el, summary| {
+                el.child(div().flex().flex_col().gap(px(6.0)).child(label("What it sets up")).child(summary))
+            })
             .when_some(self.error.clone().filter(|_| create), |el, e| el.child(div().text_size(px(text::SMALL)).text_color(theme.bad).child(e)))
             .when(create, |el| {
                 el.child(
@@ -787,10 +995,10 @@ impl Render for BotSettings {
                             div()
                                 .flex()
                                 .flex_col()
-                                .child(div().font_weight(FontWeight::MEDIUM).child("Say hello when it's ready"))
-                                .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(format!(
-                                    "Opens its chat and asks: “{INTRO}” Uses a little of your plan."
-                                ))),
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().font_weight(FontWeight::MEDIUM).child(intro_title))
+                                .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(intro_caption)),
                         ),
                 )
                 .child(
@@ -799,7 +1007,11 @@ impl Render for BotSettings {
                         .items_center()
                         .gap(px(10.0))
                         .child(
-                            Button::new("bs-create", if self.busy { "Creating…" } else { "Create teammate" })
+                            Button::new("bs-create", match (self.busy, template.is_some()) {
+                                (true, _) => "Creating…",
+                                (false, true) => "Hire teammate",
+                                (false, false) => "Create teammate",
+                            })
                                 .primary()
                                 .icon(icons::PLUS)
                                 .disabled(self.busy || name.is_empty())

@@ -146,6 +146,15 @@ impl AppData {
         cx.notify();
     }
 
+    /// A fresh row of a known teammate (an API answer): shown at once, ahead of the overview reload.
+    pub fn put_bot(&mut self, bot: Bot, cx: &mut Context<Self>) {
+        if let Some(b) = self.overview.as_mut().and_then(|o| o.bots.iter_mut().find(|b| b.id == bot.id)) {
+            *b = bot;
+            self.client.invalidate("/api/overview");
+            cx.notify();
+        }
+    }
+
     /// The web's `stateOf(bot)`.
     pub fn state_of(&self, bot: &Bot) -> MascotState {
         if bot.effective_status() == BotStatus::Paused {
