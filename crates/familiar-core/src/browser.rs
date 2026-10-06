@@ -62,8 +62,13 @@ impl Manager {
         // A Chrome left over from a crash still holds this profile; a new one would just hand off to it and exit.
         kill_leftover(&profile).await;
         let mut cmd = tokio::process::Command::new(&exe);
-        cmd.arg("--headless=new")
-            .arg(format!("--remote-debugging-port={port}"))
+        cmd.arg("--headless=new");
+        // Headless Chrome says "HeadlessChrome" in its user agent, and sites such as x.com refuse it outright (HTTP 403),
+        // so the teammate could never sign in. Send what a normal Chrome of the same version sends.
+        if let Some(ua) = normal_user_agent(&exe).await {
+            cmd.arg(format!("--user-agent={ua}"));
+        }
+        cmd.arg(format!("--remote-debugging-port={port}"))
             .arg("--remote-debugging-address=127.0.0.1")
             .arg(format!("--user-data-dir={}", profile.display()))
             .args(["--window-size=1280,800", "--no-first-run", "--no-default-browser-check", "--disable-sync"])
@@ -372,6 +377,51 @@ fn find_chrome() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+/// The user agent a regular (not headless) Chrome or Edge of this binary's version sends, in Chrome's reduced form
+/// (`Chrome/<major>.0.0.0`). None when the version can't be found; the browser then keeps its own.
+async fn normal_user_agent(exe: &std::path::Path) -> Option<String> {
+    let major = browser_major_version(exe).await?;
+    let platform = if cfg!(windows) {
+        "Windows NT 10.0; Win64; x64"
+    } else if cfg!(target_os = "macos") {
+        "Macintosh; Intel Mac OS X 10_15_7"
+    } else {
+        "X11; Linux x86_64"
+    };
+    let edge = exe.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().contains("edge"));
+    Some(user_agent(platform, major, edge))
+}
+
+fn user_agent(platform: &str, major: u32, edge: bool) -> String {
+    let mut ua =
+        format!("Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36");
+    if edge {
+        ua.push_str(&format!(" Edg/{major}.0.0.0"));
+    }
+    ua
+}
+
+/// Windows installs keep a folder named after the full version next to the exe (`Application\154.0.8037.98\`), and
+/// `chrome.exe --version` prints nothing there; elsewhere `--version` prints e.g. "Google Chrome 154.0.8037.98".
+async fn browser_major_version(exe: &std::path::Path) -> Option<u32> {
+    fn major(s: &str) -> Option<u32> {
+        let mut parts = s.trim().split('.');
+        let m = parts.next()?.parse().ok()?;
+        (parts.count() == 3).then_some(m)
+    }
+    if cfg!(windows) {
+        std::fs::read_dir(exe.parent()?)
+            .ok()?
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| major(&e.file_name().to_string_lossy()))
+            .max()
+    } else {
+        let out = tokio::process::Command::new(exe).arg("--version").output().await.ok()?;
+        String::from_utf8_lossy(&out.stdout).split_whitespace().find_map(major)
+    }
+}
+
 const PID_FILE: &str = "familiar-chrome.pid";
 
 /// Kill the browser a previous daemon started on this profile, if it is still running. Checks the process really is a
@@ -402,6 +452,29 @@ async fn kill_leftover(profile: &std::path::Path) {
         if String::from_utf8_lossy(&out.stdout).contains(&profile.display().to_string()) {
             let _ = tokio::process::Command::new("kill").arg(pid.to_string()).output().await;
             tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_agent_looks_like_a_normal_browser() {
+        let chrome = user_agent("Windows NT 10.0; Win64; x64", 154, false);
+        assert_eq!(
+            chrome,
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+        );
+        assert!(!chrome.contains("Headless"));
+        assert!(user_agent("X11; Linux x86_64", 154, true).ends_with(" Edg/154.0.0.0"));
+    }
+
+    #[tokio::test]
+    async fn finds_the_installed_version() {
+        if let Some(exe) = find_chrome() {
+            assert!(browser_major_version(&exe).await.is_some_and(|m| m >= 100), "no version for {}", exe.display());
         }
     }
 }
