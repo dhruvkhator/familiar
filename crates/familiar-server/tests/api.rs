@@ -929,6 +929,7 @@ async fn connectors_secrets_and_presets() {
         json!({"name": "Bad Name", "transport": "stdio", "command": "x"}),
         json!({"name": "familiar", "transport": "stdio", "command": "x"}),
         json!({"name": "browser", "transport": "stdio", "command": "x"}),
+        json!({"name": "desktop", "transport": "stdio", "command": "x"}),
         json!({"name": "a", "transport": "ws", "command": "x"}),
         json!({"name": "a", "transport": "stdio"}),
         json!({"name": "a", "transport": "http"}),

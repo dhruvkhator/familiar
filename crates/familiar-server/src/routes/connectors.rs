@@ -37,9 +37,9 @@ fn valid_name(n: &str) -> R<String> {
         && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
         && b.iter()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_' || *c == b'-');
-    if !ok || n == "familiar" || n == "browser" {
+    if !ok || n == "familiar" || n == "browser" || n == "desktop" {
         return Err(ApiError::bad(
-            "name must match ^[a-z0-9][a-z0-9_-]{0,31}$ and not be 'familiar' or 'browser'",
+            "name must match ^[a-z0-9][a-z0-9_-]{0,31}$ and not be 'familiar', 'browser' or 'desktop'",
         ));
     }
     Ok(n.to_string())
