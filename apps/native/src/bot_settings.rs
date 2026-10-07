@@ -94,6 +94,8 @@ pub struct BotSettings {
     presets: Vec<ConnectorPreset>,
     /// Edit mode: this teammate's own allow rules ("Always allow" on an approval adds them), to see and remove.
     allowed: Option<Vec<familiar_client::Rule>>,
+    /// Edit mode: the folders on this PC shared with it (`None` until loaded).
+    folders: Option<Vec<familiar_client::Folder>>,
 }
 
 impl EventEmitter<CreateEvent> for BotSettings {}
@@ -224,10 +226,19 @@ impl BotSettings {
             answers: Vec::new(),
             presets: Vec::new(),
             allowed: None,
+            folders: None,
         };
         this.load_catalog(cx);
         if !create {
             this.load_allowed(cx);
+            this.load_folders(cx);
+            let data = this.data.clone();
+            cx.subscribe(&data, |this: &mut Self, _, ev: &crate::data::DataEvent, cx| match ev {
+                crate::data::DataEvent::Changed(None) => this.load_folders(cx),
+                crate::data::DataEvent::Changed(Some(n)) if n.t == "bot_folders" => this.load_folders(cx),
+                _ => {}
+            })
+            .detach();
         }
         // The plan check reports through the computer's minute heartbeat: look again while it is still running.
         cx.spawn(async move |this, cx| {
@@ -880,6 +891,169 @@ impl BotSettings {
     }
 }
 
+impl BotSettings {
+    fn load_folders(&mut self, cx: &mut Context<Self>) {
+        let client = self.data.read(cx).client.clone();
+        crate::data::swr(self, &client, format!("/api/bots/{}/folders", self.bot), cx, |this, list: Vec<familiar_client::Folder>, _| {
+            this.folders = Some(list)
+        });
+    }
+
+    fn folders_changed(&mut self, cx: &mut Context<Self>) {
+        self.data.read(cx).client.invalidate(&format!("/api/bots/{}/folders", self.bot));
+        self.load_folders(cx);
+    }
+
+    /// "Add folder": the system picker, then share it read only.
+    fn add_folder(&mut self, cx: &mut Context<Self>) {
+        crate::folders::pick(cx, |this: &mut Self, path, cx| {
+            let client = this.data.read(cx).client.clone();
+            crate::folders::share(client, this.bot, path, cx, |this: &mut Self, r, cx| {
+                match r {
+                    Ok(f) => this.toasts.update(cx, |t, cx| {
+                        t.push(Tone::Ok, format!("Shared {} (read only)", crate::folders::short_name(&f)), None, cx)
+                    }),
+                    Err(e) => this.toasts.update(cx, |t, cx| t.push(Tone::Bad, "Couldn't share that folder", Some(e.into()), cx)),
+                }
+                this.folders_changed(cx);
+            });
+        });
+    }
+
+    fn set_folder_mode(&mut self, id: Uuid, write: bool, cx: &mut Context<Self>) {
+        if let Some(f) = self.folders.as_mut().and_then(|l| l.iter_mut().find(|f| f.id == id)) {
+            f.mode = if write { "write" } else { "read" }.into();
+        }
+        cx.notify();
+        let client = self.data.read(cx).client.clone();
+        let task = Tokio::spawn(cx, async move { client.set_folder_mode(id, if write { "write" } else { "read" }).await });
+        cx.spawn(async move |this, cx| {
+            let r = task.await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.message()));
+            let _ = this.update(cx, |this, cx| {
+                if let Err(e) = r {
+                    this.toasts.update(cx, |t, cx| t.push(Tone::Bad, "Couldn't change that", Some(e.into()), cx));
+                }
+                this.folders_changed(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn remove_folder(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if let Some(list) = self.folders.as_mut() {
+            list.retain(|f| f.id != id);
+        }
+        cx.notify();
+        let client = self.data.read(cx).client.clone();
+        let task = Tokio::spawn(cx, async move { client.delete_folder(id).await });
+        cx.spawn(async move |this, cx| {
+            let r = task.await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.message()));
+            let _ = this.update(cx, |this, cx| {
+                match r {
+                    Ok(()) => this.toasts.update(cx, |t, cx| t.push(Tone::Ok, "It can't use that folder any more", None, cx)),
+                    Err(e) => this.toasts.update(cx, |t, cx| t.push(Tone::Bad, "Couldn't remove that", Some(e.into()), cx)),
+                }
+                this.folders_changed(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// "Folders on this PC": each shared folder with its mode (read only / read & write) and Remove, plus Add folder.
+    fn folders_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let caption = |s: &'static str| div().text_size(px(text::CAPTION)).text_color(theme.muted).child(s);
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(label("Folders on this PC"))
+            .child(caption(
+                "Let it work with files outside its own workspace. Folders are read only unless you say otherwise; \
+                 every change it makes still asks you first. Your home folder, app data, system folders and other \
+                 teammates' workspaces can't be shared.",
+            ));
+        if self.codex {
+            col = col.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(8.0))
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(theme.warn_soft)
+                    .child(icons::icon(icons::DANGER_TRIANGLE).size(px(14.0)).mt(px(2.0)).text_color(theme.warn))
+                    .child(div().text_size(px(text::CAPTION)).text_color(theme.ink).child(
+                        "On Codex, Familiar can't limit what it reads: Codex can read files anywhere on this PC, shared \
+                         or not. Read only still stops it changing anything in a folder; changes anywhere else are \
+                         refused or ask you.",
+                    )),
+            );
+        }
+        let list = self.folders.clone().unwrap_or_default();
+        for f in list {
+            let id = f.id;
+            let mode_this = cx.entity();
+            let rm_this = cx.entity();
+            col = col.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(theme.sunken)
+                    .child(icons::icon(icons::FOLDER).size(px(16.0)).text_color(theme.muted))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().text_size(px(text::SMALL)).text_color(theme.ink).truncate().child(crate::folders::short_name(&f)))
+                            .child(
+                                div()
+                                    .font_family(theme.font_mono.clone())
+                                    .text_size(px(text::CAPTION))
+                                    .text_color(theme.muted)
+                                    .truncate()
+                                    .child(crate::approval::reveal(&f.path, false).0),
+                            ),
+                    )
+                    .child(
+                        Segmented::new(
+                            SharedString::from(format!("bs-folder-mode-{id}")),
+                            vec![("Read only".into(), None), ("Read & write".into(), None)],
+                            f.writable() as usize,
+                        )
+                        .segment_width(96.0)
+                        .on_select(move |i, _, cx| mode_this.update(cx, |p, cx| p.set_folder_mode(id, i == 1, cx))),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("bs-folder-rm-{id}")), "Remove")
+                            .size(ButtonSize::Small)
+                            .ghost()
+                            .on_click(move |_, _, cx| rm_this.update(cx, |p, cx| p.remove_folder(id, cx))),
+                    ),
+            );
+        }
+        let add_this = cx.entity();
+        let full = self.folders.as_ref().is_some_and(|l| l.len() >= 20);
+        col.child(
+            div().flex().child(
+                Button::new("bs-folder-add", "Add folder")
+                    .size(ButtonSize::Small)
+                    .icon(icons::FOLDER)
+                    .disabled(full)
+                    .on_click(move |_, _, cx| add_this.update(cx, |p, cx| p.add_folder(cx))),
+            ),
+        )
+        .into_any_element()
+    }
+}
+
 fn label(s: &'static str) -> gpui::Div {
     div().text_size(px(text::SMALL)).font_weight(FontWeight::MEDIUM).child(s)
 }
@@ -1058,6 +1232,7 @@ impl Render for BotSettings {
                     .child(div().flex().flex_col().gap(px(6.0)).child(label("Model")).child(model_control)),
             )
             .when_some(if create { None } else { self.allowed_view(cx) }, |el, v| el.child(v))
+            .when(!create, |el| el.child(self.folders_view(cx)))
             .when_some(summary, |el, summary| {
                 el.child(div().flex().flex_col().gap(px(6.0)).child(label("What it sets up")).child(summary))
             })

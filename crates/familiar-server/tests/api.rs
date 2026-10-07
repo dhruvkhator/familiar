@@ -10,6 +10,13 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 const PW: &str = "correct horse battery";
+
+/// A folder for this test run outside the home folder (temp folders live in app data, which is never shared).
+fn test_dir(name: &str) -> std::path::PathBuf {
+    let d = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("api-{}", std::process::id())).join(name);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
 const KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 
 struct App {
@@ -50,6 +57,7 @@ async fn start(secret: bool) -> Option<App> {
         secret_key: secret.then(|| KEY.to_string()),
         public_url: None,
         web_origins: vec![],
+        bots_dir: Some(test_dir("bots")),
     };
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -603,6 +611,64 @@ async fn approvals_edit_note_revise_and_always_allow() {
     let d6 = offered(&app, &a, uid(&gone_run), b, "propose_draft", queued, &fields, None).await;
     app.exec("update approvals set expires_at = now() - interval '1 second' where id = $1", &[d6]).await;
     assert_eq!(app.post(t, &decide(d6), json!({ "decision": "approve" })).await.0, 409, "expired drafts are final");
+}
+
+// ------------------------------------------------------------------ folders
+
+#[tokio::test(flavor = "multi_thread")]
+async fn folders_are_checked_and_scoped() {
+    let app = app!();
+    let a = app.owner().await;
+    let t = &a.tok;
+    let bot = app.bot(t, "Desk").await;
+    let url = format!("/api/bots/{bot}/folders");
+    assert_eq!(app.get(t, &url).await.1, json!([]));
+    let docs = test_dir("Documents");
+    let (s, f) = app.post(t, &url, json!({ "path": format!("{}/", docs.display()) })).await;
+    assert_eq!(s, 201, "{f}");
+    assert_eq!(f["mode"], "read", "read only by default");
+    let real = docs.canonicalize().unwrap().display().to_string();
+    assert_eq!(f["path"].as_str(), Some(real.trim_start_matches(r"\\?\")), "stored resolved");
+    assert!(f.get("owner_id").is_none());
+    assert_eq!(app.post(t, &url, json!({ "path": docs.display().to_string(), "mode": "write" })).await.0, 409);
+
+    let refused = |v: &Value, why: &str| assert!(v["error"].as_str().is_some_and(|e| e.contains(why)), "{why}: {v}");
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap();
+    for (path, why) in [
+        (home.clone(), "whole home folder"),
+        (format!("{home}/AppData"), if cfg!(windows) { "app data" } else { "" }),
+        (test_dir("bots").display().to_string(), "teammates' workspaces"),
+        ("relative/folder".to_owned(), "full path"),
+        (r"\\server\share".to_owned(), "Network folders"),
+        (test_dir("x").join("missing").display().to_string(), "doesn't exist"),
+        (if cfg!(windows) { r"C:\".to_owned() } else { "/".to_owned() }, "whole drive"),
+        (if cfg!(windows) { r"C:\Windows".to_owned() } else { "/etc".to_owned() }, if cfg!(windows) { "Windows system files" } else { "system files" }),
+    ] {
+        if why.is_empty() {
+            continue;
+        }
+        let (s, v) = app.post(t, &url, json!({ "path": path })).await;
+        assert_eq!(s, 400, "{path}: {v}");
+        refused(&v, why);
+    }
+    assert_eq!(app.post(t, &url, json!({ "path": docs.display().to_string(), "mode": "admin" })).await.0, 400);
+
+    let id = f["id"].as_str().unwrap();
+    let (s, v) = app.patch(t, &format!("/api/folders/{id}"), json!({ "mode": "write" })).await;
+    assert_eq!((s, v["mode"].as_str()), (200, Some("write")));
+    assert_eq!(app.patch(t, &format!("/api/folders/{id}"), json!({ "mode": "all" })).await.0, 400);
+    assert_eq!(app.get(t, &url).await.1[0]["mode"], "write");
+
+    // Only the owner's: another account sees and changes nothing.
+    let b = app.second().await;
+    assert_eq!(app.get(&b.tok, &url).await.0, 404);
+    assert_eq!(app.post(&b.tok, &url, json!({ "path": docs.display().to_string() })).await.0, 404);
+    assert_eq!(app.patch(&b.tok, &format!("/api/folders/{id}"), json!({ "mode": "read" })).await.0, 404);
+    assert_eq!(app.del(&b.tok, &format!("/api/folders/{id}")).await.0, 404);
+
+    assert_eq!(app.del(t, &format!("/api/folders/{id}")).await.0, 204);
+    assert_eq!(app.del(t, &format!("/api/folders/{id}")).await.0, 404);
+    assert_eq!(app.get(t, &url).await.1, json!([]));
 }
 
 // ------------------------------------------------------------------ rules

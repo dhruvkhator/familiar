@@ -21,6 +21,7 @@ mod data;
 mod desktop;
 mod engine;
 mod events;
+mod folders;
 mod gallery;
 mod markdown;
 mod memory;

@@ -15,7 +15,7 @@ use crate::claude::{self, Session};
 use crate::codex;
 use crate::daemon::{Ctx, Notice, Signal};
 use crate::db::{Bot, Rule, Run};
-use crate::{drafts, mcp, permissions, reviewer, skills, storage, workspace};
+use crate::{drafts, folders, mcp, permissions, reviewer, skills, storage, workspace};
 
 const MAX_PAYLOAD_STR: usize = 32 * 1024;
 /// How long a tool call or question waits for the owner before it expires.
@@ -123,6 +123,14 @@ async fn execute_inner(ctx: &Ctx, run: &Run, bot: &Bot, cancel: &CancellationTok
         // The decisions this run delivers, from the database: the teammate's way to tell them from a claimed one.
         notes.extend(drafts::decisions_note(&ctx.db.followup_drafts(run.id).await?));
     }
+    // Shared folders, checked again now: one that became a link to somewhere else (or forbidden) is left out.
+    let env = folders::Env::current(&ctx.cfg.bots_dir());
+    let (shared, skipped) = folders::active(&ctx.db.bot_folders(bot.id).await?, &env);
+    for (path, why) in &skipped {
+        warn!(run = %run.id, %path, "shared folder left out: {why}");
+        send(events, "status", json!({ "state": "folder_skipped", "path": path, "reason": why }));
+    }
+    notes.extend(folders::note(&shared, &skipped));
     let (cwd, system_prompt) = workspace::prepare(&ctx.cfg.bots_dir(), bot, &memories, &notes)?;
 
     let mut prompt = run.prompt.clone();
@@ -164,13 +172,14 @@ async fn execute_inner(ctx: &Ctx, run: &Run, bot: &Bot, cancel: &CancellationTok
     let _browser = BrowserGuard::start(ctx, bot.id).await;
     if bot.engine == "codex" {
         // Same workspace, instructions, gate, MCP servers and browser; Codex speaks its own protocol.
-        return codex::execute(ctx, run, bot, &thread, &cwd, &system_prompt, prompt, &rules, &mcp, &shots, cancel, events)
+        return codex::execute(ctx, run, bot, &thread, &cwd, &system_prompt, prompt, &rules, &mcp, &shared, &shots, cancel, events)
             .await;
     }
     let mcp_file = SecretFile::write(
         &ctx.cfg.bots_dir().join(".prompts").join(format!("{}.{}.mcp.json", bot.slug, run.id)),
         &mcp.to_string(),
     )?;
+    let add_dirs: Vec<PathBuf> = shared.iter().map(|f| f.path.clone()).collect();
     let mut session = match thread.claude_session_id {
         // Each dream starts fresh: yesterday's dream is no context for today's.
         Some(id) if run.kind != "dream" => Session::Resume(id),
@@ -186,6 +195,7 @@ async fn execute_inner(ctx: &Ctx, run: &Run, bot: &Bot, cancel: &CancellationTok
             tools: if run.research() { permissions::RESEARCH_TOOLS } else { permissions::FULL_TOOLS },
             system_prompt: &system_prompt,
             mcp_config: Some(&mcp_file.0),
+            add_dirs: &add_dirs,
         };
         let outcome = drive(ctx, run, &spec, &prompt, &rules, &shots, cancel, events).await?;
         if outcome.missing_session && matches!(session, Session::Resume(_)) {
@@ -653,6 +663,9 @@ pub async fn decide_tool(
     } else if let Some(rule) = permissions::owner_denies(rules, tool, input) {
         // Deny rules win over everything, allow rules included.
         ("denied".to_owned(), "rule", format!("Blocked by the owner's rule `{}`.", rule.pattern), None)
+    } else if let Some(why) = folder_refusal(ctx, run, tool, input).await {
+        // File changes only in the workspace and the folders shared read & write; nobody can approve others.
+        ("denied".to_owned(), "rule", why, None)
     } else if let Some(why) = permissions::always_human(tool, input) {
         // Neither owner rules nor the reviewer can unlock these.
         owner(format!("Always needs you: this {why}.")).await
@@ -682,6 +695,21 @@ pub async fn decide_tool(
         json!({ "tool_name": tool, "status": status, "decided_by": by, "reason": message, "edited": edited.is_some() }),
     );
     Verdict { allow, message: if allow { String::new() } else { message }, input: edited.filter(|_| allow) }
+}
+
+/// Why a file change must not happen (see [`folders::write_refusal`]): the bot's shared folders are read again and
+/// re-checked for every such decision, so a folder made read only (or removed) counts at once.
+async fn folder_refusal(ctx: &Ctx, run: &Run, tool: &str, input: &Value) -> Option<String> {
+    if !folders::WRITE_TOOLS.contains(&tool) {
+        return None;
+    }
+    let (bot, rows) = match tokio::try_join!(ctx.db.bot(run.bot_id), ctx.db.bot_folders(run.bot_id)) {
+        Ok(v) => v,
+        Err(e) => return Some(format!("Familiar couldn't check where this file change goes ({e:#}), so it was not allowed.")),
+    };
+    let bots_dir = ctx.cfg.bots_dir();
+    let (shared, _) = folders::active(&rows, &folders::Env::current(&bots_dir));
+    folders::write_refusal(tool, input, &bots_dir.join(&bot.slug), &shared)
 }
 
 /// Owner decision as (status, decided_by, message for the model, the input as the owner edited it).

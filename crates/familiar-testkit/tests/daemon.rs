@@ -1426,3 +1426,107 @@ async fn codex_lost_thread_restarts_seeded() {
     assert!(prompt.ends_with("(New message:)\nwhere were we"), "{prompt}");
     h.finish().await;
 }
+
+// ------------------------------------------------------------------------------------------------ shared folders
+
+/// Folders for this test outside the home folder (temp folders live in app data, which is never shared), resolved.
+fn shared_dirs(test: &str, names: &[&str]) -> Vec<PathBuf> {
+    let base = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("folders-{test}-{}", Uuid::new_v4().simple()));
+    names
+        .iter()
+        .map(|n| {
+            std::fs::create_dir_all(base.join(n)).unwrap();
+            let env = familiar_core::folders::Env::current(Path::new("unused-bots-dir"));
+            familiar_core::folders::check(&base.join(n).display().to_string(), &env).unwrap()
+        })
+        .collect()
+}
+
+async fn share(h: &H, bot: Uuid, path: &str, mode: &str) {
+    sqlx::query("insert into bot_folders (owner_id, bot_id, path, mode) values ($1, $2, $3, $4)")
+        .bind(h.owner)
+        .bind(bot)
+        .bind(path)
+        .bind(mode)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+}
+
+/// Claude gets `--add-dir` for every shared folder still valid at run start; a missing one is left out with a notice;
+/// the instructions list the folders and their modes. A write into a read-only folder is refused by the daemon without
+/// asking anyone; a write into a read & write folder goes to the owner as usual; one outside both is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_folders_reach_claude_and_read_only_is_enforced() {
+    let Some(mut h) = setup("shared_folders_reach_claude_and_read_only_is_enforced").await else { return };
+    let dirs = shared_dirs("claude", &["Invoices", "Reports"]);
+    let (ro, rw) = (&dirs[0], &dirs[1]);
+    let gone = ro.parent().unwrap().join("Gone");
+    let outside = ro.parent().unwrap().join("elsewhere.txt");
+    h.scenario(json!([[
+        { "init": {} },
+        tool("Write", json!({ "file_path": ro.join("2025.csv").display().to_string(), "content": "x" })),
+        tool("Edit", json!({ "file_path": ro.join("old.csv").display().to_string(), "old_string": "a", "new_string": "b" })),
+        tool("Write", json!({ "file_path": outside.display().to_string(), "content": "x" })),
+        tool("Write", json!({ "file_path": rw.join("summary.md").display().to_string(), "content": "ok" })),
+        { "result": "done" },
+    ]]));
+    h.start();
+    let bot = h.bot("desk").await;
+    share(&h, bot, &ro.display().to_string(), "read").await;
+    share(&h, bot, &rw.display().to_string(), "write").await;
+    share(&h, bot, &gone.display().to_string(), "read").await;
+    let thread = h.thread(bot).await;
+    let run = h.say(thread, "tidy the reports").await;
+
+    // Only the read & write folder's change reaches the owner.
+    let (approval, tool_name, input, _) = h.pending_approval(run).await;
+    assert_eq!((tool_name.as_str(), input["file_path"].as_str()), ("Write", Some(rw.join("summary.md").display().to_string().as_str())));
+    h.decide(approval, "approved", None).await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+    assert_eq!(h.approvals(run).await.len(), 1, "nothing else asked the owner");
+
+    let inv = h.invocation(0);
+    let added: Vec<&str> = inv.argv.windows(2).filter(|w| w[0] == "--add-dir").map(|w| w[1].as_str()).collect();
+    assert_eq!(added, vec![ro.display().to_string(), rw.display().to_string()], "{:?}", inv.argv);
+    let d = inv.decisions();
+    assert_eq!(d.len(), 4, "{d:?}");
+    for i in 0..2 {
+        assert_eq!(d[i]["behavior"], "deny");
+        assert!(d[i]["message"].as_str().unwrap().contains("read only"), "{d:?}");
+    }
+    assert_eq!(d[2]["behavior"], "deny");
+    assert!(d[2]["message"].as_str().unwrap().contains("outside your workspace"), "{d:?}");
+    assert_eq!(d[3]["behavior"], "allow");
+
+    let instructions = std::fs::read_to_string(inv.flag("--append-system-prompt-file").unwrap()).unwrap();
+    assert!(instructions.contains("## Folders your owner shared"), "{instructions}");
+    assert!(instructions.contains(&format!("- `{}` (read only", ro.display())), "{instructions}");
+    assert!(instructions.contains(&format!("- `{}` (read & write", rw.display())), "{instructions}");
+    assert!(instructions.contains(&format!("Not available this run: `{}`", gone.display())), "{instructions}");
+    let ev = h.events(run).await;
+    assert!(ev.iter().any(|e| e.1 == "status" && e.2["state"] == "folder_skipped" && e.2["path"] == gone.display().to_string()), "{ev:?}");
+    h.finish().await;
+}
+
+/// Codex: only read & write folders are passed as writable roots (Familiar keeps it unsandboxed so every patch comes back
+/// for approval, where read-only folders are refused: see `folders::write_refusal`); the instructions list both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_folders_on_codex() {
+    let Some(mut h) = setup("shared_folders_on_codex").await else { return };
+    let dirs = shared_dirs("codex", &["Originals", "Out"]);
+    let (ro, rw) = (&dirs[0], &dirs[1]);
+    h.codex_scenario(json!([[{ "text": "looked" }, { "complete": {} }]]));
+    h.start();
+    let bot = codex_bot(&h, "codex-desk").await;
+    share(&h, bot, &ro.display().to_string(), "read").await;
+    share(&h, bot, &rw.display().to_string(), "write").await;
+    let thread = h.thread(bot).await;
+    let run = h.say(thread, "look").await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+    let start = &codex_requests(&h, 0, "thread/start")[0];
+    assert_eq!(start["config"]["sandbox_workspace_write.writable_roots"], json!([rw.display().to_string()]));
+    assert_eq!(start["sandbox"], "danger-full-access", "every patch still comes back for approval");
+    assert!(start["developerInstructions"].as_str().unwrap().contains(&format!("- `{}` (read only", ro.display())));
+    h.finish().await;
+}

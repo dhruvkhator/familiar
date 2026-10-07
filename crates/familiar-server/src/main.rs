@@ -23,6 +23,8 @@ async fn main() -> anyhow::Result<()> {
         web_origins: env("FAMILIAR_WEB_ORIGINS")
             .map(|v| v.split(',').map(str::to_owned).collect())
             .unwrap_or_default(),
+        // Set when this API runs on the PC with the teammates' workspaces (next to `familiard`).
+        bots_dir: env("FAMILIAR_BOTS_DIR").map(std::path::PathBuf::from),
     };
     familiar_server::serve(cfg, async {
         let _ = tokio::signal::ctrl_c().await;

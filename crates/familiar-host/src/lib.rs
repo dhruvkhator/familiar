@@ -185,6 +185,7 @@ impl Host {
             secret_key: cfg.secret_key.clone(),
             public_url: Some(format!("http://localhost:{port}")),
             web_origins: vec![],
+            bots_dir: Some(cfg.bots_dir()),
         };
         let stop = self.inner.api_stop.clone();
         self.inner.rt.spawn(async move {

@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use routes::{
-    approvals, artifacts, bots, channels, connectors, live, memories, models, overview, rules, runs,
+    approvals, artifacts, bots, channels, connectors, folders, live, memories, models, overview, rules, runs,
     schedules, skills, stream, templates, threads, triggers,
 };
 
@@ -36,6 +36,8 @@ pub struct AppState {
     pub s3: Option<routes::artifacts::S3>,
     pub http: reqwest::Client,
     pub public_url: Option<String>,
+    /// The teammates' workspaces, when the API runs on the PC that has them (see [`Config::bots_dir`]).
+    pub bots_dir: Option<std::path::PathBuf>,
 }
 pub type S = Arc<AppState>;
 
@@ -123,6 +125,8 @@ fn router(state: S, web_origins: &[String]) -> Router {
         .route("/api/bots/{id}/live", get(live::info))
         .route("/api/bots/{id}/live.jpg", get(live::frame))
         .route("/api/bots/{id}/live/input", post(live::input))
+        .route("/api/bots/{id}/folders", get(folders::list).post(folders::create))
+        .route("/api/folders/{id}", patch(folders::update).delete(folders::remove))
         .route("/api/rules", get(rules::list).post(rules::create))
         .route("/api/rules/{id}", delete(rules::remove))
         .route("/api/bots/{id}/skills", get(skills::list))
@@ -188,6 +192,9 @@ pub struct Config {
     pub secret_key: Option<String>,
     pub public_url: Option<String>,
     pub web_origins: Vec<String>,
+    /// The teammates' workspaces on this PC (the desktop app). Sharing folders with a teammate needs it: the API checks
+    /// them on the PC they are on. None = a hosted API, where folders can't be shared.
+    pub bots_dir: Option<std::path::PathBuf>,
 }
 
 /// Serve the API until `shutdown` resolves.
@@ -242,6 +249,7 @@ pub async fn serve_listener(
             .public_url
             .map(|u| u.trim().trim_end_matches('/').to_string())
             .filter(|u| !u.is_empty()),
+        bots_dir: cfg.bots_dir,
     });
 
     axum::serve(listener, router(state, &cfg.web_origins))

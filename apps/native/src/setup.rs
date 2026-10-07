@@ -1,8 +1,8 @@
 //! The "Set up" checklist on the chat of a teammate hired from a template: sign in to the sites it needs (in its own
-//! browser, through the computer panel's take-over), tick each one off, and turn its schedules on. It goes away once
-//! everything is done, or when you hide it.
+//! browser, through the computer panel's take-over), tick each one off, choose the folder it works on (templates that
+//! work on your files), and turn its schedules on. It goes away once everything is done, or when you hide it.
 
-use familiar_client::{Schedule, SchedulePatch, SetupPatch};
+use familiar_client::{Folder, Schedule, SchedulePatch, SetupPatch};
 use familiar_ui::anim;
 use familiar_ui::components::{Button, ButtonSize, card};
 use familiar_ui::icons::{self, icon};
@@ -28,6 +28,8 @@ pub struct SetupCard {
     bot: Uuid,
     /// This teammate's schedules (`None` until loaded).
     schedules: Option<Vec<Schedule>>,
+    /// The folders shared with it (`None` until loaded).
+    folders: Option<Vec<Folder>>,
     busy: bool,
 }
 
@@ -38,13 +40,15 @@ impl SetupCard {
         cx.observe(&data, |_, _, cx| cx.notify()).detach();
         cx.subscribe(&data, |this: &mut Self, _, ev: &DataEvent, cx| match ev {
             DataEvent::Changed(None) => this.reload(cx),
-            DataEvent::Changed(Some(n)) if n.t == "schedules" && n.bot.as_deref().is_none_or(|b| b == this.bot.to_string()) => {
+            DataEvent::Changed(Some(n))
+                if matches!(n.t.as_str(), "schedules" | "bot_folders") && n.bot.as_deref().is_none_or(|b| b == this.bot.to_string()) =>
+            {
                 this.reload(cx)
             }
             _ => {}
         })
         .detach();
-        let mut this = Self { data, toasts, bot, schedules: None, busy: false };
+        let mut this = Self { data, toasts, bot, schedules: None, folders: None, busy: false };
         this.reload(cx);
         this
     }
@@ -53,6 +57,24 @@ impl SetupCard {
         let client = self.data.read(cx).client.clone();
         swr(self, &client, format!("/api/bots/{}/schedules", self.bot), cx, |this, list: Vec<Schedule>, _| {
             this.schedules = Some(list)
+        });
+        swr(self, &client, format!("/api/bots/{}/folders", self.bot), cx, |this, list: Vec<Folder>, _| this.folders = Some(list));
+    }
+
+    /// "Choose a folder": the system picker, then share it read only (Settings can make it read & write).
+    fn choose_folder(&mut self, cx: &mut Context<Self>) {
+        crate::folders::pick(cx, |this: &mut Self, path, cx| {
+            let client = this.data.read(cx).client.clone();
+            crate::folders::share(client, this.bot, path, cx, |this: &mut Self, r, cx| {
+                match r {
+                    Ok(f) => this.toasts.update(cx, |t, cx| {
+                        t.push(Tone::Ok, format!("Shared {} (read only)", crate::folders::short_name(&f)), None, cx)
+                    }),
+                    Err(e) => this.toasts.update(cx, |t, cx| t.push(Tone::Bad, "Couldn't share that folder", Some(e.into()), cx)),
+                }
+                this.data.read(cx).client.invalidate(&format!("/api/bots/{}/folders", this.bot));
+                this.reload(cx);
+            });
         });
     }
 
@@ -142,18 +164,23 @@ impl Render for SetupCard {
             .as_ref()
             .map(|all| setup.schedules.iter().filter_map(|id| all.iter().find(|s| s.id == *id)).collect());
         let logins_left = setup.logins.iter().filter(|l| !l.done).count();
+        // A template that works on your files asks for a folder until one is shared.
+        let shared: Option<&Folder> = self.folders.as_ref().and_then(|f| f.first());
+        let folder_left = setup.folder && shared.is_none();
         // Until the schedules load, assume they are still off; with nothing else to show, wait for them instead.
         let off: Vec<Uuid> = match &mine {
             Some(m) => m.iter().filter(|s| !s.enabled).map(|s| s.id).collect(),
-            None if logins_left == 0 => return div(),
+            None if logins_left == 0 && !folder_left => return div(),
             None => setup.schedules.clone(),
         };
         let has_schedules = !setup.schedules.is_empty() && mine.as_ref().is_none_or(|m| !m.is_empty());
-        if logins_left == 0 && off.is_empty() {
+        if logins_left == 0 && off.is_empty() && !folder_left {
             return div();
         }
-        let total = setup.logins.len() + has_schedules as usize;
-        let done = setup.logins.len() - logins_left + (has_schedules && off.is_empty()) as usize;
+        let total = setup.logins.len() + has_schedules as usize + setup.folder as usize;
+        let done = setup.logins.len() - logins_left
+            + (has_schedules && off.is_empty()) as usize
+            + (setup.folder && !folder_left) as usize;
 
         let mut rows = div().flex().flex_col().gap(px(2.0));
         for l in &setup.logins {
@@ -187,6 +214,29 @@ impl Render for SetupCard {
                 action,
                 &theme,
             ));
+        }
+        if setup.folder {
+            let (title, detail) = match shared {
+                Some(f) => (
+                    format!("Folder shared: {}", crate::folders::short_name(f)),
+                    format!("{} · change it in its Settings", if f.writable() { "Read & write" } else { "Read only" }),
+                ),
+                None => (
+                    "Choose a folder".to_owned(),
+                    "Pick the folder with the files it works on. It gets read-only access.".to_owned(),
+                ),
+            };
+            let action = folder_left.then(|| {
+                let this = cx.entity();
+                Button::new("setup-folder", "Choose…")
+                    .size(ButtonSize::Small)
+                    .icon(icons::FOLDER)
+                    .tooltip("Opens the folder picker. It gets read-only access; you can allow changes in its Settings.")
+                    .on_click(move |_, _, cx| this.update(cx, |p, cx| p.choose_folder(cx)))
+                    .into_any_element()
+            });
+            let tick = checkbox(!folder_left, &theme).mt(px(0.0)).into_any_element();
+            rows = rows.child(Self::row(!folder_left, tick, title, detail, action, &theme));
         }
         if has_schedules {
             let named: Vec<String> = mine

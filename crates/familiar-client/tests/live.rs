@@ -23,7 +23,7 @@ async fn setup_bot_message_notice() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let cfg = Config { database_url: u.to_string(), host: [127, 0, 0, 1], port: 0, secret_key: None, public_url: None, web_origins: vec![] };
+    let cfg = Config { database_url: u.to_string(), host: [127, 0, 0, 1], port: 0, secret_key: None, public_url: None, web_origins: vec![], bots_dir: None };
     let (stop, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         let _ = serve_listener(listener, cfg, async {

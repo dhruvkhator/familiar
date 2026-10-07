@@ -52,6 +52,13 @@ teammates, and stops for your approval before doing anything risky.
 - Some actions always need you, whatever the rules: recursive deletes, installs, `sudo`, force pushes, running inline
   code, touching the browser's debugging port. Browser navigation is auto-allowed only to public websites.
 - Proactive and dream runs are read-only. Approvals expire after 30 minutes.
+- Drafts (posts, replies, emails, DMs) wait in your queue for up to 7 days without holding their teammate up; it hears
+  your decision (approved with the exact final text, changes asked, or rejected) in a message Familiar writes, and the
+  actual post or send still asks you.
+- You can share folders on this PC with a teammate, read only (default) or read & write. Drives, your home folder,
+  hidden settings folders (`.ssh`, `.aws`, `.config`…), app data, system folders, Familiar's own data and other
+  teammates' workspaces are refused; links and junctions are resolved first and checked again before every run. Read
+  only is enforced by Familiar (changes there are refused); on Codex, reading can't be limited to the shared folders.
 
 ## Install
 Download `Familiar-<version>-setup.exe` from [Releases](https://github.com/dhruvkhator/familiar/releases) (Windows;

@@ -30,6 +30,8 @@ pub struct Spec<'a> {
     pub system_prompt: &'a Path,
     /// `--mcp-config` file. It carries the run token and connector secrets, so it lives outside the workspace.
     pub mcp_config: Option<&'a Path>,
+    /// Folders the owner shared (`--add-dir`): restricted mode confines file tools to the workspace and these.
+    pub add_dirs: &'a [std::path::PathBuf],
 }
 
 pub struct Process {
@@ -61,6 +63,9 @@ pub fn spawn(spec: &Spec) -> Result<Process> {
     cmd.args(["--system-prompt-snapshot", "off", "--append-system-prompt-file"]).arg(spec.system_prompt);
     if let Some(mcp) = &spec.mcp_config {
         cmd.arg("--mcp-config").arg(mcp);
+    }
+    for dir in spec.add_dirs {
+        cmd.arg("--add-dir").arg(dir);
     }
     // ask_user and handoff(wait) block for up to 30 / 15 minutes (drafts don't block). One value covers every MCP
     // server, so a hung connector call also waits that long (cancelling the run still stops it).

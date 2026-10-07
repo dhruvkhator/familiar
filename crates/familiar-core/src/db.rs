@@ -423,6 +423,15 @@ impl Db {
             .await?)
     }
 
+    /// The folders the owner shared with a bot: (path, mode), oldest first.
+    pub async fn bot_folders(&self, bot: Uuid) -> Result<Vec<(String, String)>> {
+        Ok(sqlx::query_as("select path, mode from bot_folders where bot_id = $1 and owner_id = $2 order by created_at")
+            .bind(bot)
+            .bind(self.owner)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
     /// Enabled schedules that the SQL cron job consumed (next_run_at null) and need their next fire time.
     pub async fn schedules_without_next(&self) -> Result<Vec<(Uuid, String)>> {
         Ok(sqlx::query_as(

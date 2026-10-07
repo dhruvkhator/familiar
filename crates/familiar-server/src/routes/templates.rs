@@ -56,6 +56,9 @@ struct Template {
     logins: Vec<Login>,
     connectors: Vec<String>,
     first_task: Option<String>,
+    /// It works on the owner's files: the Set up checklist asks for a folder.
+    #[serde(default)]
+    folder: bool,
 }
 
 /// Parsed once; the unit tests below keep the file valid.
@@ -179,6 +182,7 @@ pub async fn create(
         "template": t.id,
         "logins": t.logins.iter().map(|l| json!({ "site": l.site, "url": l.url, "done": false })).collect::<Vec<_>>(),
         "schedules": schedule_ids,
+        "folder": t.folder,
         "dismissed": false,
     });
     sqlx::query("update bots set setup = $2 where id = $1")

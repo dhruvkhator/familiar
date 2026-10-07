@@ -389,6 +389,23 @@ impl Client {
         self.mutate::<Value>(Method::DELETE, &format!("/api/rules/{id}"), None, true).await.map(|_| ())
     }
 
+    // ---- shared folders -------------------------------------------------
+
+    pub async fn folders(&self, bot: Uuid) -> Result<Vec<Folder>, ApiError> {
+        self.get(&format!("/api/bots/{bot}/folders")).await
+    }
+    /// Share a folder (`mode`: read | write); the API refuses dangerous ones with a plain-words reason.
+    pub async fn add_folder(&self, bot: Uuid, path: &str, mode: &str) -> Result<Folder, ApiError> {
+        let b = serde_json::json!({ "path": path, "mode": mode });
+        self.mutate(Method::POST, &format!("/api/bots/{bot}/folders"), Some(b), true).await
+    }
+    pub async fn set_folder_mode(&self, id: Uuid, mode: &str) -> Result<Folder, ApiError> {
+        self.mutate(Method::PATCH, &format!("/api/folders/{id}"), Some(serde_json::json!({ "mode": mode })), true).await
+    }
+    pub async fn delete_folder(&self, id: Uuid) -> Result<(), ApiError> {
+        self.mutate::<Value>(Method::DELETE, &format!("/api/folders/{id}"), None, true).await.map(|_| ())
+    }
+
     // ---- schedules ------------------------------------------------------
 
     pub async fn schedules(&self, bot: Uuid) -> Result<Vec<Schedule>, ApiError> {

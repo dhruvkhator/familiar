@@ -88,6 +88,8 @@ pub struct BotSetup {
     pub template: Option<String>,
     pub logins: Vec<SetupLogin>,
     pub schedules: Vec<Uuid>,
+    /// The template works on the owner's files: the checklist offers "Choose a folder" until one is shared.
+    pub folder: bool,
     /// The owner hid the Set up checklist.
     pub dismissed: bool,
 }
@@ -325,6 +327,25 @@ pub struct Decided {
     pub rule: Option<Rule>,
 }
 
+/// A folder on this PC shared with a teammate (`/api/bots/{id}/folders`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Folder {
+    pub id: Uuid,
+    pub bot_id: Uuid,
+    /// As Familiar resolved it when it was shared.
+    pub path: String,
+    /// read (read only) | write (read & write)
+    pub mode: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Folder {
+    pub fn writable(&self) -> bool {
+        self.mode == "write"
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Rule {
@@ -438,6 +459,8 @@ pub struct Template {
     /// Connector preset ids it benefits from.
     pub connectors: Vec<String>,
     pub first_task: Option<String>,
+    /// It works on the owner's files: its Set up checklist asks for a folder.
+    pub folder: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

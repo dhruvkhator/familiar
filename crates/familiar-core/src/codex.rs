@@ -33,6 +33,7 @@ use tracing::warn;
 
 use crate::daemon::Ctx;
 use crate::db::{Bot, Rule, Run, Thread};
+use crate::folders::Folder;
 use crate::permissions;
 use crate::runner::{self, Deltas, Events, Outcome, send};
 
@@ -255,6 +256,7 @@ pub(crate) async fn execute(
     mut prompt: String,
     rules: &[Rule],
     mcp: &Value,
+    folders: &[Folder],
     shots: &Path,
     cancel: &CancellationToken,
     events: &Events,
@@ -263,7 +265,7 @@ pub(crate) async fn execute(
     // Each dream starts fresh, as on the Claude engine.
     let mut resume = thread.codex_thread_id.clone().filter(|_| run.kind != "dream");
     loop {
-        let job = Job { ctx, run, bot, cwd, instructions: &instructions, rules, mcp, shots, cancel, events };
+        let job = Job { ctx, run, bot, cwd, instructions: &instructions, rules, mcp, folders, shots, cancel, events };
         let outcome = job.drive(resume.as_deref(), &prompt).await?;
         if outcome.missing_session && resume.is_some() {
             warn!(run = %run.id, "codex thread missing, starting a fresh one");
@@ -283,6 +285,8 @@ struct Job<'a> {
     instructions: &'a str,
     rules: &'a [Rule],
     mcp: &'a Value,
+    /// The folders the owner shared (see crate::folders).
+    folders: &'a [Folder],
     shots: &'a Path,
     cancel: &'a CancellationToken,
     events: &'a Events,
@@ -430,6 +434,13 @@ impl Job<'_> {
         config.insert("notify".into(), json!([]));
         // Let the first turn wait for slow MCP servers (npx cold starts) instead of starting without their tools.
         config.insert("mcp_optional_startup_grace_ms".into(), json!(120_000));
+        // Only the read & write folders are writable roots. Codex applies them only in its workspace-write sandbox;
+        // Familiar runs it without one (below), so every patch comes back for approval, where read-only folders are
+        // refused (crate::folders::write_refusal). Codex never limits reading: see crate::folders.
+        let writable: Vec<String> = self.folders.iter().filter(|f| f.write).map(|f| f.path.display().to_string()).collect();
+        if !writable.is_empty() {
+            config.insert("sandbox_workspace_write.writable_roots".into(), json!(writable));
+        }
         if research && cfg!(windows) {
             // The elevated Windows sandbox needs a one-time admin setup; the unelevated one works out of the box.
             config.insert("windows.sandbox".into(), json!("unelevated"));
