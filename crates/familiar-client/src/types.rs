@@ -26,7 +26,8 @@ macro_rules! tolerant_enum {
 
 tolerant_enum!(BotEngine { Claude = "claude", Codex = "codex" });
 tolerant_enum!(BotStatus { Idle = "idle", Running = "running", Paused = "paused" });
-tolerant_enum!(RunKind { Chat = "chat", Scheduled = "scheduled", Proactive = "proactive", Handoff = "handoff" });
+// followup: the daemon delivering the owner's decision on a draft to its teammate.
+tolerant_enum!(RunKind { Chat = "chat", Scheduled = "scheduled", Proactive = "proactive", Handoff = "handoff", Followup = "followup" });
 tolerant_enum!(RunStatus {
     Queued = "queued", Running = "running", WaitingApproval = "waiting_approval",
     Succeeded = "succeeded", Failed = "failed", Cancelled = "cancelled",

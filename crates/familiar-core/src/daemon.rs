@@ -240,7 +240,8 @@ async fn listen(ctx: Ctx, mut listener: PgListener, wake: Arc<Notify>, active: A
                 if notice.t == "runs" && active.lock().unwrap().contains_key(&notice.id) {
                     check_cancel(&ctx, &active, notice.id).await;
                 }
-                if matches!(notice.t.as_str(), "runs" | "messages" | "schedules") {
+                // A decided draft (approvals) gets its follow-up run queued on the next tick.
+                if matches!(notice.t.as_str(), "runs" | "messages" | "schedules" | "approvals") {
                     wake.notify_one();
                 }
                 let _ = ctx.notices.send(notice);
@@ -288,6 +289,11 @@ async fn tick(ctx: &Ctx, active: &ActiveMap, wake: &Arc<Notify>) -> Result<()> {
         }
     }
 
+    // Decided drafts → follow-up runs (queued behind whatever the teammate is doing); old undecided ones expire.
+    if let Err(e) = crate::drafts::sweep(ctx).await {
+        warn!("draft queue sweep failed: {e:#}");
+    }
+
     // Safety net for missed cancel notifications.
     let ids: Vec<Uuid> = active.lock().unwrap().keys().copied().collect();
     for id in ids {
@@ -304,7 +310,8 @@ async fn tick(ctx: &Ctx, active: &ActiveMap, wake: &Arc<Notify>) -> Result<()> {
         if started == free {
             break;
         }
-        if throttled && run.kind != "chat" {
+        // The owner's own actions (a message, a draft decision) still go through.
+        if throttled && !matches!(run.kind.as_str(), "chat" | "followup") {
             continue;
         }
         if active.lock().unwrap().values().any(|a| a.bot == run.bot_id) {

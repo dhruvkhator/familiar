@@ -723,8 +723,7 @@ fn mcp_servers(mcp: &Value) -> Map<String, Value> {
                 o.insert("http_headers".into(), s["headers"].clone());
             }
         }
-        // npx downloads on first use; ask_user / handoff(wait) / human approvals block for up to 30 minutes, and
-        // Familiar's propose_draft for up to a day.
+        // npx downloads on first use; ask_user / handoff(wait) / human approvals block for up to 30 minutes.
         o.insert("startup_timeout_sec".into(), json!(120));
         o.insert("tool_timeout_sec".into(), json!(if name == "familiar" { crate::mcp::TOOL_TIMEOUT.as_secs() } else { 1900 }));
         // Familiar's own tools are pre-allowed (they enforce research-only limits themselves); everything else asks us.

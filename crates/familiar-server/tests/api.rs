@@ -593,6 +593,16 @@ async fn approvals_edit_note_revise_and_always_allow() {
     let (_, v) = app.post(t, &decide(d3), json!({ "decision": "deny", "response": "not this one" })).await;
     assert_eq!(v["status"], "denied");
     assert_eq!(app.post(t, &decide(d3), json!({ "decision": "approve" })).await.0, 409);
+
+    // A draft doesn't wait inside its run: the run being over doesn't make it stale, only its week-long expiry does.
+    let queued = json!({ "kind": "post", "channel": "X", "body": "Later" });
+    let d5 = offered(&app, &a, uid(&gone_run), b, "propose_draft", queued.clone(), &fields, None).await;
+    app.exec("update approvals set expires_at = now() + interval '7 days' where id = $1", &[d5]).await;
+    let (s, v) = app.post(t, &decide(d5), json!({ "decision": "revise", "response": "warmer" })).await;
+    assert_eq!((s, v["status"].as_str()), (200, Some("revise")), "{v}");
+    let d6 = offered(&app, &a, uid(&gone_run), b, "propose_draft", queued, &fields, None).await;
+    app.exec("update approvals set expires_at = now() - interval '1 second' where id = $1", &[d6]).await;
+    assert_eq!(app.post(t, &decide(d6), json!({ "decision": "approve" })).await.0, 409, "expired drafts are final");
 }
 
 // ------------------------------------------------------------------ rules

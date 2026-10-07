@@ -852,8 +852,9 @@ impl Shell {
                     .text_size(px(text::LEAD))
                     .text_color(theme.muted)
                     .child(
-                        "Teammates pause here until you decide. Drafts wait a day for you; other requests expire after \
-                         30 minutes. Approving a draft moves you to the next one.",
+                        "Drafts wait here up to 7 days without holding their teammate up: it hears your decision as \
+                         soon as you make it. Other requests pause the teammate and expire after 30 minutes. Approving \
+                         a draft moves you to the next one.",
                     ),
             );
         let mut page = div().flex().flex_col().gap(px(24.0)).child(anim::appear("needs-head", head));

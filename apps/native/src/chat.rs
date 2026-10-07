@@ -785,6 +785,7 @@ impl BotPage {
         let theme = Theme::of(cx).clone();
         let kind = match run.kind {
             RunKind::Handoff => "handoff".to_owned(),
+            RunKind::Followup => "your decision on a draft".to_owned(),
             RunKind::Unknown => "run".to_owned(),
             k => format!("{} run", k.as_str()),
         };

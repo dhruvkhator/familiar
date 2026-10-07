@@ -316,6 +316,7 @@ fn kind_label(r: &Run) -> String {
     match r.kind {
         RunKind::Unknown if r.prompt.as_deref() == Some("(dream)") => "dream".into(),
         RunKind::Unknown => "run".into(),
+        RunKind::Followup => "draft decision".into(),
         k => k.as_str().into(),
     }
 }

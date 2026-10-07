@@ -474,8 +474,10 @@ async fn chat_turn_then_resume() {
     let mcp_file = PathBuf::from(inv.flag("--mcp-config").unwrap());
     assert!(!mcp_file.exists(), "the per-run MCP config (run token) must be deleted after the run");
     assert!(strings(&inv.permissions()["allow"]).contains(&"mcp__familiar"));
-    // propose_draft waits up to a day for the owner: the CLI must not give up on it first.
+    // ask_user waits up to 30 minutes for the owner: the CLI must not give up on it first (drafts don't block).
     assert_eq!(inv.env["MCP_TOOL_TIMEOUT"], (familiar_core::mcp::TOOL_TIMEOUT.as_millis()).to_string());
+    assert!(familiar_core::mcp::TOOL_TIMEOUT >= familiar_core::runner::APPROVAL_TIMEOUT);
+    assert!(familiar_core::mcp::TOOL_TIMEOUT <= Duration::from_secs(60 * 60), "no day-long tool timeout");
     assert_eq!(inv.prompt(), "hi");
 
     let run2 = h.say(thread, "again").await;
@@ -751,105 +753,257 @@ async fn mcp_remember_notify_ask() {
     h.finish().await;
 }
 
-/// Drafts: propose_draft blocks until the owner decides; edited and approved → the tool returns the edited text to use
-/// exactly; the approval keeps the proposal and the edit.
+/// The draft's follow-up run (kind `followup`), once the daemon has queued it.
+async fn followup_run(h: &H, approval: Uuid) -> Uuid {
+    wait_for("the draft's follow-up run", || async {
+        Ok(sqlx::query_scalar::<_, Option<Uuid>>("select followup_run_id from approvals where id = $1")
+            .bind(approval)
+            .fetch_one(&h.pool)
+            .await?)
+    })
+    .await
+}
+
+async fn run_kind_thread(h: &H, run: Uuid) -> (String, Uuid) {
+    sqlx::query_as("select kind, thread_id from runs where id = $1").bind(run).fetch_one(&h.pool).await.unwrap()
+}
+
+/// Drafts don't block: propose_draft returns at once and the run finishes; other work runs while the draft waits; the
+/// owner's edit-and-approve queues a follow-up run on the same thread (same session) whose message carries exactly the
+/// final text, written by the daemon (a `system` message in the thread), and whose instructions list the decision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn draft_edit_then_approve() {
-    let Some(mut h) = setup("draft_edit_then_approve").await else { return };
-    h.scenario(json!([[
-        { "init": {} },
-        mcp("propose_draft", json!({ "kind": "post", "channel": "X", "body": "Shipping drafts today!!", "note": "launch week" })),
-        { "result": "posted" },
-    ]]));
+async fn draft_queued_then_follow_up() {
+    let Some(mut h) = setup("draft_queued_then_follow_up").await else { return };
+    h.scenario(json!([
+        [{ "init": {} }, mcp("propose_draft", json!({ "kind": "post", "channel": "X", "body": "Shipping drafts today!!", "note": "launch week" })),
+         { "result": "proposed" }],
+        [{ "init": {} }, { "result": "other work done" }],
+        [{ "init": {} }, { "result": "posted" }],
+    ]));
     h.start();
     let bot = h.bot("poster").await;
     let thread = h.thread(bot).await;
     let run = h.say(thread, "draft a post").await;
-
-    let (approval, tool_name, input, reason) = h.pending_approval(run).await;
-    assert_eq!(tool_name, "propose_draft");
-    assert_eq!(input, json!({ "kind": "post", "channel": "X", "body": "Shipping drafts today!!" }));
-    assert_eq!(reason.as_deref(), Some("launch week"));
-    assert_eq!(h.offer(approval).await, (vec!["body".to_owned(), "subject".to_owned(), "to".to_owned()], None));
-    h.wait_status(run, "waiting_approval").await;
-    let mut edited = input.clone();
-    edited["body"] = json!("Drafts ship today.");
-    h.decide_edited(approval, edited.clone()).await;
+    // Finishes without anyone deciding: nothing waits.
     assert_eq!(h.finished(run).await, ("succeeded".into(), None));
-
     let results = h.invocation(0).mcp_results();
     assert_eq!(results.len(), 1, "{results:?}");
-    let (tool, text, is_error) = &results[0];
-    assert_eq!((tool.as_str(), *is_error), ("propose_draft", false));
-    assert!(text.starts_with("APPROVED WITH EDITS"), "{text}");
-    assert!(text.contains("use exactly this text"), "{text}");
-    assert!(text.contains("\nDrafts ship today.\n----- END APPROVED TEXT -----") && !text.contains("today!!"), "{text}");
-    let (proposed, kept): (sqlx::types::Json<Value>, sqlx::types::Json<Value>) =
-        sqlx::query_as("select input, edited_input from approvals where id = $1").bind(approval).fetch_one(&h.pool).await.unwrap();
-    assert_eq!((proposed.0, kept.0), (input, edited));
-    let ev = h.events(run).await;
-    assert!(
-        ev.iter().any(|e| e.1 == "approval" && e.2["status"] == "approved" && e.2["edited"] == true && e.2["tool_name"] == "propose_draft"),
-        "{ev:?}"
+    let (approval, tool_name, input, reason): (Uuid, String, sqlx::types::Json<Value>, Option<String>) =
+        sqlx::query_as("select id, tool_name, input, reason from approvals where run_id = $1 and status = 'pending'")
+            .bind(run)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    let short = approval.simple().to_string()[..8].to_owned();
+    assert_eq!(
+        results[0].1,
+        format!(
+            "Draft #{short} is waiting for the owner. Don't post or send it now; carry on with other work. You'll get a \
+             message when they decide."
+        )
     );
+    assert!(!results[0].2);
+    assert_eq!(tool_name, "propose_draft");
+    assert_eq!(input.0, json!({ "kind": "post", "channel": "X", "body": "Shipping drafts today!!" }));
+    assert_eq!(reason.as_deref(), Some("launch week"));
+    assert_eq!(h.offer(approval).await, (vec!["body".to_owned(), "subject".to_owned(), "to".to_owned()], None));
+    let week: bool = sqlx::query_scalar(
+        "select expires_at between now() + interval '6 days 23 hours' and now() + interval '7 days 1 minute'
+         from approvals where id = $1",
+    )
+    .bind(approval)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert!(week, "drafts wait a week");
+    // Other work runs while the draft waits.
+    let other = h.say(thread, "something else meanwhile").await;
+    assert_eq!(h.finished(other).await.0, "succeeded");
+    let still: String = sqlx::query_scalar("select status from approvals where id = $1").bind(approval).fetch_one(&h.pool).await.unwrap();
+    assert_eq!(still, "pending");
+
+    let mut edited = input.0.clone();
+    edited["body"] = json!("Drafts ship today.");
+    h.decide_edited(approval, edited).await;
+    let follow = followup_run(&h, approval).await;
+    assert_eq!(run_kind_thread(&h, follow).await, ("followup".to_owned(), thread));
+    assert_eq!(h.finished(follow).await.0, "succeeded");
+    let inv = h.invocation(2);
+    let session = h.session(thread).await.unwrap().to_string();
+    assert_eq!(inv.flag("--resume"), Some(session.as_str()), "the follow-up resumes the draft's session");
+    let prompt = inv.prompt();
+    assert!(prompt.starts_with(&format!("[Familiar] Draft #{short} was approved by your owner. They edited it")), "{prompt}");
+    assert!(prompt.contains("using exactly this text, character for character"), "{prompt}");
+    assert!(prompt.contains("\n----- BEGIN APPROVED TEXT -----\nDrafts ship today.\n----- END APPROVED TEXT -----\n"), "{prompt}");
+    assert!(!prompt.contains("today!!"), "{prompt}");
+    // The decision is listed in the run's instructions (written by the daemon, outside the workspace).
+    let instructions = std::fs::read_to_string(inv.flag("--append-system-prompt-file").unwrap()).unwrap();
+    assert!(instructions.contains("## Draft decisions in this turn\n"), "{instructions}");
+    assert!(instructions.contains(&format!("draft #{short} approved")), "{instructions}");
+    // The thread shows the decision as Familiar's own message, and the draft is handled once.
+    let system: Vec<String> = sqlx::query_scalar("select content from messages where thread_id = $1 and role = 'system'")
+        .bind(thread)
+        .fetch_all(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(system, vec![prompt.clone()]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let followups: i64 = sqlx::query_scalar("select count(*) from runs where kind = 'followup'").fetch_one(&h.pool).await.unwrap();
+    assert_eq!(followups, 1);
+    assert_eq!(h.invocations(), 3);
     h.finish().await;
 }
 
-/// A draft with hidden characters approved in its cleaned-up form: the teammate gets the clean text to use.
+/// "Ask for changes" carries the owner's note and asks for a revised draft (the teammate proposes one); a rejection
+/// carries the note and says not to send it. Each decision gets its own follow-up on the draft's thread.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn draft_hidden_characters_are_cleaned() {
-    let Some(mut h) = setup("draft_hidden_characters_are_cleaned").await else { return };
-    h.scenario(json!([[
-        { "init": {} },
-        mcp("propose_draft", json!({ "kind": "post", "channel": "X", "body": "Pay at moc.live\u{202E} now" })),
-        { "result": "ok" },
-    ]]));
-    h.start();
-    let bot = h.bot("sneaky").await;
-    let thread = h.thread(bot).await;
-    let run = h.say(thread, "draft").await;
-    let (approval, _, input, _) = h.pending_approval(run).await;
-    let mut clean = input.clone();
-    clean["body"] = json!("Pay at moc.live now");
-    h.decide_edited(approval, clean).await;
-    assert_eq!(h.finished(run).await.0, "succeeded");
-    let results = h.invocation(0).mcp_results();
-    assert!(results[0].1.contains("\nPay at moc.live now\n") && !results[0].1.contains('\u{202E}'), "{results:?}");
-    h.finish().await;
-}
-
-/// Drafts: a rejection carries the owner's note; "Ask for changes" tells the teammate to revise and propose again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn draft_reject_and_revise() {
-    let Some(mut h) = setup("draft_reject_and_revise").await else { return };
+async fn draft_revise_and_reject() {
+    let Some(mut h) = setup("draft_revise_and_reject").await else { return };
     let reply = json!({ "kind": "reply", "channel": "Reddit", "to": "https://reddit.com/r/x/1", "body": "Try Familiar!" });
-    h.scenario(json!([[{ "init": {} }, mcp("propose_draft", reply.clone()), mcp("propose_draft", reply), { "result": "ok" }]]));
+    let revised = json!({ "kind": "reply", "channel": "Reddit", "to": "https://reddit.com/r/x/1", "body": "Here is how: ..." });
+    h.scenario(json!([
+        [{ "init": {} }, mcp("propose_draft", reply.clone()), mcp("propose_draft", reply), { "result": "two drafts" }],
+        [{ "init": {} }, mcp("propose_draft", revised), { "result": "revised" }],
+        [{ "init": {} }, { "result": "dropped" }],
+    ]));
     h.start();
     let bot = h.bot("listener").await;
     let thread = h.thread(bot).await;
     let run = h.say(thread, "answer the thread").await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+    let drafts: Vec<Uuid> =
+        sqlx::query_scalar("select id from approvals where run_id = $1 order by created_at").bind(run).fetch_all(&h.pool).await.unwrap();
+    assert_eq!(drafts.len(), 2);
 
-    let (first, ..) = h.pending_approval(run).await;
-    h.decide(first, "denied", Some("too salesy")).await;
-    let (second, ..) = wait_for("the second draft", || async {
-        Ok(sqlx::query_scalar::<_, Uuid>("select id from approvals where run_id = $1 and status = 'pending'")
-            .bind(run)
-            .fetch_optional(&h.pool)
-            .await?
-            .map(|id| (id,)))
+    h.decide(drafts[0], "revise", Some("answer their question first")).await;
+    let f1 = followup_run(&h, drafts[0]).await;
+    assert_eq!(h.finished(f1).await.0, "succeeded");
+    let p1 = h.invocation(1).prompt();
+    assert!(p1.starts_with("[Familiar] Your owner asked for changes to draft #"), "{p1}");
+    assert!(p1.contains("Their note: \"answer their question first\"") && p1.contains("propose a revised draft"), "{p1}");
+    assert!(p1.contains("Don't post or send anything until a version is approved"), "{p1}");
+    // The teammate proposed its revision: a new pending draft from the follow-up run.
+    let (_, tool, input, _) = h.pending_approval(f1).await;
+    assert_eq!((tool.as_str(), input["body"].as_str()), ("propose_draft", Some("Here is how: ...")));
+
+    h.decide(drafts[1], "denied", Some("too salesy")).await;
+    let f2 = followup_run(&h, drafts[1]).await;
+    assert_eq!(h.finished(f2).await.0, "succeeded");
+    let p2 = h.invocation(2).prompt();
+    assert!(p2.starts_with("[Familiar] Your owner rejected draft #") && p2.contains("\"too salesy\"") && p2.contains("Don't send it."), "{p2}");
+    assert!(!p2.contains("BEGIN APPROVED"), "{p2}");
+    for f in [f1, f2] {
+        assert_eq!(run_kind_thread(&h, f).await, ("followup".to_owned(), thread));
+    }
+    h.finish().await;
+}
+
+/// A draft decided while its teammate is busy is queued, not lost: the follow-up starts once the teammate is free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_decided_while_busy() {
+    let Some(mut h) = setup("draft_decided_while_busy").await else { return };
+    h.scenario(json!([
+        [{ "init": {} }, mcp("propose_draft", json!({ "kind": "post", "channel": "X", "body": "Hello" })), { "result": "queued" }],
+        [{ "init": {} }, { "sleep_ms": 2500 }, { "result": "long job done" }],
+        [{ "init": {} }, { "result": "posted" }],
+    ]));
+    h.start();
+    let bot = h.bot("busy").await;
+    let drafts_thread = h.thread(bot).await;
+    let run = h.say(drafts_thread, "draft").await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+    let approval: Uuid = sqlx::query_scalar("select id from approvals where run_id = $1").bind(run).fetch_one(&h.pool).await.unwrap();
+
+    let work_thread = h.thread(bot).await;
+    let long = h.say(work_thread, "long job").await;
+    h.wait_status(long, "running").await;
+    h.decide(approval, "approved", None).await;
+    let follow = followup_run(&h, approval).await;
+    assert_eq!(h.run_row(follow).await.0, "queued", "waits while the teammate works");
+    assert_eq!(h.run_row(long).await.0, "running");
+    assert_eq!(h.finished(long).await.0, "succeeded");
+    assert_eq!(h.finished(follow).await.0, "succeeded");
+    let after: bool =
+        sqlx::query_scalar("select (select started_at from runs where id = $2) >= (select finished_at from runs where id = $1)")
+            .bind(long)
+            .bind(follow)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(after, "one run at a time per teammate");
+    let p = h.invocation(2).prompt();
+    assert!(p.contains("was approved by your owner") && p.contains("\n----- BEGIN APPROVED TEXT -----\nHello\n"), "{p}");
+    assert_eq!(run_kind_thread(&h, follow).await.1, drafts_thread, "on the thread the draft came from");
+    h.finish().await;
+}
+
+/// Undecided drafts expire after their week: marked expired, no follow-up run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_expires_without_follow_up() {
+    let Some(mut h) = setup("draft_expires_without_follow_up").await else { return };
+    h.scenario(json!([[{ "init": {} }, mcp("propose_draft", json!({ "kind": "post", "channel": "X", "body": "Old news" })), { "result": "ok" }]]));
+    h.start();
+    let bot = h.bot("slowpoke").await;
+    let thread = h.thread(bot).await;
+    let run = h.say(thread, "draft").await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+    let approval: Uuid = sqlx::query_scalar("select id from approvals where run_id = $1").bind(run).fetch_one(&h.pool).await.unwrap();
+    sqlx::query("update approvals set expires_at = now() - interval '1 second' where id = $1").bind(approval).execute(&h.pool).await.unwrap();
+    let (status, by) = wait_for("the draft to expire", || async {
+        let (s, by, handled): (String, Option<String>, bool) =
+            sqlx::query_as("select status, decided_by, followed_up_at is not null from approvals where id = $1")
+                .bind(approval)
+                .fetch_one(&h.pool)
+                .await?;
+        Ok((s != "pending" && handled).then_some((s, by)))
     })
     .await;
-    assert_ne!(first, second);
-    h.decide(second, "revise", Some("answer their question first")).await;
-    assert_eq!(h.finished(run).await.0, "succeeded");
+    assert_eq!((status.as_str(), by.as_deref()), ("expired", Some("rule")));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let followups: i64 = sqlx::query_scalar("select count(*) from runs where kind = 'followup'").fetch_one(&h.pool).await.unwrap();
+    assert_eq!(followups, 0);
+    assert_eq!(h.invocations(), 1);
+    h.finish().await;
+}
 
-    let results = h.invocation(0).mcp_results();
-    assert_eq!(results.len(), 2, "{results:?}");
-    assert!(results[0].1.starts_with("REJECTED") && results[0].1.contains("\"too salesy\""), "{results:?}");
-    assert!(results[0].1.contains("Do not post or send"));
-    assert!(results[1].1.starts_with("CHANGES REQUESTED") && results[1].1.contains("answer their question first"), "{results:?}");
-    assert!(results[1].1.contains("call propose_draft again"));
-    assert!(results.iter().all(|r| !r.2), "decisions are not tool errors: {results:?}");
+/// A draft approved with hidden characters (only possible outside the API and Telegram) is never passed on as text to
+/// publish; approved in its cleaned-up form (what the app sends), the clean text is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_hidden_characters_are_never_passed_on() {
+    let Some(mut h) = setup("draft_hidden_characters_are_never_passed_on").await else { return };
+    h.scenario(json!([
+        [{ "init": {} }, mcp("propose_draft", json!({ "kind": "post", "channel": "X", "body": "Pay at moc.live\u{202E} now" })), { "result": "ok" }],
+        [{ "init": {} }, { "result": "ok" }],
+    ]));
+    h.start();
+    let bot = h.bot("sneaky").await;
+    let thread = h.thread(bot).await;
+    let run = h.say(thread, "draft").await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+    let (approval, input): (Uuid, sqlx::types::Json<Value>) =
+        sqlx::query_as("select id, input from approvals where run_id = $1").bind(run).fetch_one(&h.pool).await.unwrap();
+    h.decide(approval, "approved", None).await;
+    let f = followup_run(&h, approval).await;
+    assert_eq!(h.finished(f).await.0, "succeeded");
+    let p = h.invocation(1).prompt();
+    assert!(p.contains("hidden characters") && !p.contains('\u{202E}') && !p.contains("BEGIN APPROVED"), "{p}");
+
+    let again: Uuid = sqlx::query_scalar(
+        "insert into approvals (owner_id, run_id, bot_id, tool_name, input, status) values ($1, $2, $3, 'propose_draft', $4, 'pending')
+         returning id",
+    )
+    .bind(h.owner)
+    .bind(run)
+    .bind(bot)
+    .bind(input)
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    h.decide_edited(again, json!({ "kind": "post", "channel": "X", "body": "Pay at moc.live now" })).await;
+    let f2 = followup_run(&h, again).await;
+    assert_eq!(h.finished(f2).await.0, "succeeded");
+    let p = h.invocation(2).prompt();
+    assert!(p.contains("\n----- BEGIN APPROVED TEXT -----\nPay at moc.live now\n") && !p.contains('\u{202E}'), "{p}");
     h.finish().await;
 }
 

@@ -6,6 +6,7 @@ pub mod codex;
 pub mod config;
 pub mod daemon;
 pub mod db;
+pub mod drafts;
 pub mod mcp;
 pub mod models;
 pub mod permissions;

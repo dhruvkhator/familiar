@@ -85,11 +85,13 @@ pub async fn decide(
 
     let mut tx = st.pool.begin().await?;
     // The approval, its teammate (still the owner's) and whether it is still waiting: not past its expiry, and its run
-    // not over (a daemon that stopped mid-wait leaves it pending until its next start).
+    // not over (a daemon that stopped mid-wait leaves it pending until its next start). A draft doesn't wait inside its
+    // run (the decision reaches the teammate as a follow-up run), so only its expiry counts.
     type Pending = (String, String, Option<sqlx::types::Json<Value>>, Vec<String>, Option<String>, Uuid, bool);
     let row: Option<Pending> = sqlx::query_as(
         "select a.status, a.tool_name, a.input, a.editable, a.allow_rule, a.bot_id,
-                coalesce(a.expires_at <= now(), false) or r.status in ('succeeded', 'failed', 'cancelled')
+                coalesce(a.expires_at <= now(), false)
+                  or (a.tool_name <> 'propose_draft' and r.status in ('succeeded', 'failed', 'cancelled'))
          from approvals a
          join bots b on b.id = a.bot_id and b.owner_id = a.owner_id
          join runs r on r.id = a.run_id

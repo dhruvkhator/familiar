@@ -346,7 +346,7 @@ impl Telegram {
     async fn decide(&self, approval: Uuid, approve: bool, response: Option<&str>) -> Result<bool> {
         let r = sqlx::query(
             "update approvals set status = $1, decided_by = 'user', decided_at = now(), response = $2
-             where id = $3 and owner_id = $4 and status = 'pending'",
+             where id = $3 and owner_id = $4 and status = 'pending' and coalesce(expires_at > now(), true)",
         )
         .bind(if approve { "approved" } else { "denied" })
         .bind(response)

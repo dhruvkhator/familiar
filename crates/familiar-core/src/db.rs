@@ -69,9 +69,10 @@ impl Db {
         .bind(self.owner)
         .fetch_all(&mut *tx)
         .await?;
+        // Drafts don't wait inside their run: they stay in the owner's queue.
         sqlx::query(
             "update approvals set status = 'expired', decided_by = 'rule', decided_at = now()
-             where owner_id = $1 and status = 'pending' and run_id = any($2)",
+             where owner_id = $1 and status = 'pending' and run_id = any($2) and tool_name <> 'propose_draft'",
         )
         .bind(self.owner)
         .bind(&stale)
@@ -332,6 +333,94 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // ---- the draft queue (see crate::drafts) ----
+
+    /// Drafts past their expiry are expired; drafts that ended without a decision (expired) are marked handled.
+    pub async fn expire_drafts(&self) -> Result<u64> {
+        let r = sqlx::query(
+            "update approvals set status = 'expired', decided_by = 'rule', decided_at = now(), followed_up_at = now()
+             where owner_id = $1 and tool_name = 'propose_draft' and status = 'pending' and expires_at <= now()",
+        )
+        .bind(self.owner)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "update approvals set followed_up_at = now()
+             where owner_id = $1 and tool_name = 'propose_draft' and status = 'expired' and followed_up_at is null",
+        )
+        .bind(self.owner)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// Drafts the owner decided whose decision hasn't been passed on yet, oldest decision first.
+    pub async fn decided_drafts(&self) -> Result<Vec<DecidedDraft>> {
+        Ok(sqlx::query_as(
+            "select a.id, a.status, coalesce(a.input, '{}'::jsonb) as input, a.edited_input, a.response, a.bot_id,
+                    r.thread_id
+             from approvals a join runs r on r.id = a.run_id
+             where a.owner_id = $1 and a.tool_name = 'propose_draft' and a.followed_up_at is null
+               and a.status in ('approved', 'denied', 'revise')
+             order by a.decided_at limit 50",
+        )
+        .bind(self.owner)
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Pass one decision on: mark the draft handled and, with a message, add it to the draft's thread (as Familiar's
+    /// own `system` message) and queue the `followup` run that delivers it. One transaction; None when the draft was
+    /// already handled (or changed since it was read) or there is nothing to deliver.
+    pub async fn queue_draft_followup(&self, d: &DecidedDraft, message: Option<&str>) -> Result<Option<Uuid>> {
+        let mut tx = self.pool.begin().await?;
+        let claimed: Option<Uuid> = sqlx::query_scalar(
+            "update approvals set followed_up_at = now()
+             where id = $1 and owner_id = $2 and status = $3 and followed_up_at is null returning id",
+        )
+        .bind(d.id)
+        .bind(self.owner)
+        .bind(&d.status)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (Some(_), Some(message)) = (claimed, message) else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        sqlx::query("insert into messages (thread_id, owner_id, role, content) values ($1, $2, 'system', $3)")
+            .bind(d.thread_id)
+            .bind(self.owner)
+            .bind(message)
+            .execute(&mut *tx)
+            .await?;
+        let run: Uuid = sqlx::query_scalar(
+            "insert into runs (bot_id, owner_id, thread_id, kind, prompt) values ($1, $2, $3, 'followup', $4) returning id",
+        )
+        .bind(d.bot_id)
+        .bind(self.owner)
+        .bind(d.thread_id)
+        .bind(message)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query("update approvals set followup_run_id = $1 where id = $2 and owner_id = $3")
+            .bind(run)
+            .bind(d.id)
+            .bind(self.owner)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(run))
+    }
+
+    /// The draft decisions a `followup` run delivers: (approval id, status).
+    pub async fn followup_drafts(&self, run: Uuid) -> Result<Vec<(Uuid, String)>> {
+        Ok(sqlx::query_as("select id, status from approvals where followup_run_id = $1 and owner_id = $2 order by decided_at")
+            .bind(run)
+            .bind(self.owner)
+            .fetch_all(&self.pool)
+            .await?)
     }
 
     /// Enabled schedules that the SQL cron job consumed (next_run_at null) and need their next fire time.
@@ -675,6 +764,24 @@ impl Db {
             .await?;
         Ok(())
     }
+}
+
+/// A draft the owner decided (see [`Db::decided_drafts`]).
+#[derive(Debug, Clone, FromRow)]
+pub struct DecidedDraft {
+    pub id: Uuid,
+    /// approved | denied | revise
+    pub status: String,
+    /// The draft as the teammate proposed it.
+    pub input: Json<Value>,
+    /// The owner's version, when they edited it before approving.
+    #[sqlx(rename = "edited_input")]
+    pub edited: Option<Json<Value>>,
+    /// The owner's note.
+    pub response: Option<String>,
+    pub bot_id: Uuid,
+    /// The thread the draft came from: its follow-up runs there.
+    pub thread_id: Uuid,
 }
 
 pub enum Stored<'a> {

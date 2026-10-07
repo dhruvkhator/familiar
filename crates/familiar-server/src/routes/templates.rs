@@ -293,6 +293,9 @@ mod tests {
             // Every outward action is proposed as a draft first, and the approved text is used as it comes back.
             let rules = str_of(t, "instructions", id);
             assert!(rules.contains("through `propose_draft` first") && rules.contains("EXACTLY the text"), "{id}: drafts rule");
+            // Drafts don't block: the decision arrives later as Familiar's own message.
+            assert!(rules.contains("doesn't wait") && rules.contains("decision arrives as a message from Familiar"), "{id}: queue");
+            assert!(!rules.contains("text `propose_draft` returned") && !rules.contains("as it came back"), "{id}: old blocking flow");
             assert!(!rules.contains("approved that exact action through `ask_user`"), "{id}: old approval rule");
 
             let a = &t["avatar"];

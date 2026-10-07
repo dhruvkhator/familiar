@@ -15,7 +15,7 @@ use crate::claude::{self, Session};
 use crate::codex;
 use crate::daemon::{Ctx, Notice, Signal};
 use crate::db::{Bot, Rule, Run};
-use crate::{mcp, permissions, reviewer, skills, storage, workspace};
+use crate::{drafts, mcp, permissions, reviewer, skills, storage, workspace};
 
 const MAX_PAYLOAD_STR: usize = 32 * 1024;
 /// How long a tool call or question waits for the owner before it expires.
@@ -118,7 +118,12 @@ async fn execute_inner(ctx: &Ctx, run: &Run, bot: &Bot, cancel: &CancellationTok
     let thread = ctx.db.thread(run.thread_id).await?;
     let memories = ctx.db.memories(bot.id).await?;
     let rules = ctx.db.rules(bot.id).await?;
-    let (cwd, system_prompt) = workspace::prepare(&ctx.cfg.bots_dir(), bot, &memories)?;
+    let mut notes = Vec::new();
+    if run.kind == "followup" {
+        // The decisions this run delivers, from the database: the teammate's way to tell them from a claimed one.
+        notes.extend(drafts::decisions_note(&ctx.db.followup_drafts(run.id).await?));
+    }
+    let (cwd, system_prompt) = workspace::prepare(&ctx.cfg.bots_dir(), bot, &memories, &notes)?;
 
     let mut prompt = run.prompt.clone();
     if run.kind == "dream" {
@@ -299,8 +304,8 @@ async fn new_session(ctx: &Ctx, thread: Uuid) -> Result<Session> {
 pub(crate) async fn seeded_prompt(ctx: &Ctx, run: &Run) -> Result<String> {
     let history = ctx.db.recent_messages(run.thread_id, 21).await?;
     let mut s = String::from("(Your previous session was lost. Recent conversation for context:)\n\n");
-    // For chat runs the newest message is the prompt itself.
-    let skip = usize::from(run.kind == "chat");
+    // For chat runs (and draft follow-ups) the newest message is the prompt itself.
+    let skip = usize::from(history.last().is_some_and(|m| m.content == run.prompt));
     for m in history.iter().take(history.len().saturating_sub(skip)) {
         s.push_str(&format!("{}: {}\n\n", m.role, m.content));
     }

@@ -62,8 +62,8 @@ pub fn spawn(spec: &Spec) -> Result<Process> {
     if let Some(mcp) = &spec.mcp_config {
         cmd.arg("--mcp-config").arg(mcp);
     }
-    // ask_user and handoff(wait) block for up to 30 / 15 minutes, propose_draft for up to a day. One value covers
-    // every MCP server, so a hung connector call also waits that long (cancelling the run still stops it).
+    // ask_user and handoff(wait) block for up to 30 / 15 minutes (drafts don't block). One value covers every MCP
+    // server, so a hung connector call also waits that long (cancelling the run still stops it).
     cmd.env("MCP_TOOL_TIMEOUT", crate::mcp::TOOL_TIMEOUT.as_millis().to_string());
     subscription_only(&mut cmd);
     // First use of an npx/uvx connector downloads it; the 30 s default startup wait is too short.
