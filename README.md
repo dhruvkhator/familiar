@@ -35,6 +35,12 @@ teammates, and stops for your approval before doing anything risky.
 - **Chat channels** (Telegram, later WhatsApp) route messages through those companies' servers — fine for personal
   use; keep companies on options 1–2.
 
+## Playbook: what to automate
+The [Familiar Playbook](https://claude.ai/artifact/W14Wv1R1kWydAhYMN99yvD) collects the automations and best practices
+that work for always-on agents (Dots, Grok Bot, Claude Cowork) and shows how to run each one in Familiar: golden rules,
+20 recipes for growth, sales, social, research, ops and desk work, a fill-in template for a teammate's job, and how to
+connect accounts while staying in control. It is updated as new features ship.
+
 ## What a teammate can do
 | | |
 |---|---|
