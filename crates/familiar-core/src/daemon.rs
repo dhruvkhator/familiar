@@ -43,6 +43,8 @@ pub enum Signal {
     RunFinished { bot: String, status: String },
     /// The bot used `notify_user` to tell its owner something.
     Notify { bot: String, message: String, thread: Uuid },
+    /// A teammate started using this PC's desktop (`Some(name)`), or nobody uses it any more (`None`).
+    Desktop { bot: Option<String> },
 }
 
 #[derive(Clone)]
@@ -60,6 +62,11 @@ pub struct Ctx {
     pub browsers: Arc<crate::browser::Manager>,
     /// Decrypts connector and channel secrets (None when `secret_key` is not configured).
     pub secrets: Option<Arc<familiar_crypto::SecretBox>>,
+    /// Which teammate is using this PC's desktop (one at a time).
+    pub desktop: Arc<crate::desktop::Control>,
+    /// Desktop control is offered only when the daemon runs inside the app ([`run_with_signals`]), which shows who is
+    /// using the desktop and can stop it from the tray.
+    pub desktop_ui: bool,
 }
 
 impl Ctx {
@@ -90,11 +97,16 @@ type ActiveMap = Arc<Mutex<HashMap<Uuid, Active>>>;
 
 /// Run the daemon until `shutdown` is cancelled.
 pub async fn run(cfg: Config, shutdown: CancellationToken) -> Result<()> {
-    run_with_signals(cfg, shutdown, broadcast::channel(16).0).await
+    serve(cfg, shutdown, broadcast::channel(16).0, false).await
 }
 
-/// Like [`run`], but publishes [`Signal`]s to `signals`.
+/// Like [`run`], but publishes [`Signal`]s to `signals`: for the app, which shows them (approvals, who is using the
+/// desktop). Only this offers desktop control.
 pub async fn run_with_signals(cfg: Config, shutdown: CancellationToken, signals: broadcast::Sender<Signal>) -> Result<()> {
+    serve(cfg, shutdown, signals, true).await
+}
+
+async fn serve(cfg: Config, shutdown: CancellationToken, signals: broadcast::Sender<Signal>, desktop_ui: bool) -> Result<()> {
     let url = cfg.database_url.as_deref().context("database_url is not set")?;
     let pool = PgPoolOptions::new().max_connections(8).connect(url).await?;
     sqlx::migrate!("../../migrations").run(&pool).await?;
@@ -117,6 +129,8 @@ pub async fn run_with_signals(cfg: Config, shutdown: CancellationToken, signals:
         registry: mcp::Registry::default(),
         browsers: Arc::default(),
         secrets,
+        desktop: Arc::default(),
+        desktop_ui,
     };
     mcp::serve(mcp_listener, ctx.clone(), shutdown.clone());
     tokio::spawn(crate::tools::ensure_playwright());
@@ -212,6 +226,13 @@ async fn listen(ctx: Ctx, mut listener: PgListener, wake: Arc<Notify>, active: A
                     // Take-over input from the computer panel, already validated and owner-scoped by the API.
                     let Ok(ev) = serde_json::from_str::<serde_json::Value>(n.payload()) else { continue };
                     let owner = ev["owner"].as_str().and_then(|o| o.parse::<Uuid>().ok());
+                    // "Stop desktop control" (the tray, `POST /api/desktop/stop`).
+                    if ev["type"] == "desktop_stop" {
+                        if owner == Some(ctx.db.owner) {
+                            stop_desktop(&ctx).await;
+                        }
+                        continue;
+                    }
                     let bot = ev["bot"].as_str().and_then(|b| b.parse::<Uuid>().ok());
                     if let (Some(owner), Some(bot)) = (owner, bot) {
                         if owner == ctx.db.owner {
@@ -260,6 +281,20 @@ async fn listen(ctx: Ctx, mut listener: PgListener, wake: Arc<Notify>, active: A
     }
 }
 
+/// "Stop desktop control": the teammate using the desktop loses it at once, its waiting desktop requests are denied and
+/// its run is cancelled.
+pub async fn stop_desktop(ctx: &Ctx) {
+    if let Some((run, bot, cancel)) = ctx.desktop.stop() {
+        info!(%run, %bot, "desktop control stopped by the owner");
+        // Denied first (so the teammate is told it was stopped), then the run ends.
+        if let Err(e) = ctx.db.deny_desktop_approvals(Some(run)).await {
+            warn!("denying desktop requests failed: {e:#}");
+        }
+        cancel.cancel();
+        ctx.signal(Signal::Desktop { bot: None });
+    }
+}
+
 async fn check_cancel(ctx: &Ctx, active: &ActiveMap, run: Uuid) {
     if let Ok(Some(status)) = ctx.db.run_status(run).await {
         if status == "cancelled" {
@@ -287,6 +322,14 @@ async fn tick(ctx: &Ctx, active: &ActiveMap, wake: &Arc<Notify>) -> Result<()> {
             Ok(next) => ctx.db.set_next_run(id, Some(next.with_timezone(&Utc))).await?,
             Err(e) => warn!(schedule = %id, "invalid cron `{expr}`: {e}"),
         }
+    }
+
+    // Windows-MCP is installed once, when a teammate first gets desktop control (never at run time).
+    if ctx.desktop_ui
+        && matches!(crate::tools::desktop_status(), crate::tools::Desktop::Missing)
+        && ctx.db.any_desktop_bot().await.unwrap_or(false)
+    {
+        tokio::spawn(crate::tools::ensure_windows_mcp());
     }
 
     // Decided drafts → follow-up runs (queued behind whatever the teammate is doing); old undecided ones expire.

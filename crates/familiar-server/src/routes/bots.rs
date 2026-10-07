@@ -191,6 +191,8 @@ pub struct BotPatch {
     engine: Option<String>,
     #[serde(default, deserialize_with = "nullable")]
     avatar: Option<Option<serde_json::Value>>,
+    /// "Can use this PC's desktop" (Windows only).
+    desktop: Option<bool>,
 }
 
 pub async fn update(
@@ -215,6 +217,9 @@ pub async fn update(
         .as_deref()
         .map(|e| one_of(e, "engine", &ENGINES))
         .transpose()?;
+    if p.desktop == Some(true) && !cfg!(windows) {
+        return Err(ApiError::bad("Desktop control works on Windows only."));
+    }
     let set_avatar = p.avatar.is_some();
     let avatar = p.avatar.flatten();
     if let Some(v) = &avatar {
@@ -242,7 +247,8 @@ pub async fn update(
         "update bots set name = coalesce($3, name), persona = coalesce($4, persona),
                 model = coalesce($5, model), paused = coalesce($6, paused),
                 engine = coalesce($7, engine),
-                avatar = case when $8 then $9 else avatar end
+                avatar = case when $8 then $9 else avatar end,
+                desktop = coalesce($10, desktop)
          where id = $1 and owner_id = $2",
     )
     .bind(id)
@@ -254,6 +260,7 @@ pub async fn update(
     .bind(engine)
     .bind(set_avatar)
     .bind(avatar.map(sqlx::types::Json))
+    .bind(p.desktop)
     .execute(&st.pool)
     .await?
     .rows_affected();

@@ -82,6 +82,7 @@ impl EventEmitter<DataEvent> for AppData {}
 impl AppData {
     /// `client` is already signed in (the [`crate::engine::Engine`] did that).
     pub fn new(client: Client, mode: Mode, cx: &mut Context<Self>) -> Self {
+        crate::tray::set_client(client.clone());
         let mut this = Self {
             client,
             mode,
@@ -242,7 +243,25 @@ impl AppData {
         self.fetch("/api/approvals?status=pending".into(), cx, |this, list: Vec<Approval>, cx| {
             this.pending = list.into_iter().filter(|a| a.status == ApprovalStatus::Pending).collect();
             this.alert_approvals(cx);
+            this.load_previews(cx);
         });
+    }
+
+    /// Desktop steps' pictures of the screen, for their approval cards (dropped once they are decided).
+    fn load_previews(&mut self, cx: &mut Context<Self>) {
+        let waiting: Vec<Uuid> = self.pending.iter().filter(|a| a.has_preview).map(|a| a.id).collect();
+        crate::approval::keep_previews(&waiting);
+        for id in waiting.into_iter().filter(|id| !crate::approval::has_preview(*id)) {
+            let client = self.client.clone();
+            let task = Tokio::spawn(cx, async move { client.approval_preview(id).await });
+            cx.spawn(async move |this, cx| {
+                if let Ok(Ok(bytes)) = task.await {
+                    crate::approval::put_preview(id, bytes.to_vec());
+                    let _ = this.update(cx, |_, cx| cx.notify());
+                }
+            })
+            .detach();
+        }
     }
 
     fn home_paths(&self, f: impl Fn(Uuid) -> String) -> Vec<String> {

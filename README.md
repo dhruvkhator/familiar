@@ -27,6 +27,11 @@ teammates, and stops for your approval before doing anything risky.
   2. **Self-hosted (teams/companies):** run `familiar-server` (one Docker image) and any Postgres inside your own
      infrastructure; data never leaves it.
   3. *Planned:* an optional end-to-end-encrypted relay that only forwards bytes it cannot read.
+- **Desktop control** (optional, Windows, off for every teammate until you turn it on) uses
+  [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) (MIT). It isn't bundled: the first time a teammate gets it,
+  Familiar installs the pinned version (0.8.7, from PyPI) once with your `uv` into `~/.familiar/tools/windows-mcp`
+  (its own Python, cache and config there; never `uvx` at run time). Windows-MCP sends anonymous usage telemetry to
+  PostHog by default; Familiar always runs it with telemetry off (`ANONYMIZED_TELEMETRY=false`, no PostHog key).
 - **Chat channels** (Telegram, later WhatsApp) route messages through those companies' servers — fine for personal
   use; keep companies on options 1–2.
 
@@ -59,6 +64,11 @@ teammates, and stops for your approval before doing anything risky.
   hidden settings folders (`.ssh`, `.aws`, `.config`…), app data, system folders, Familiar's own data and other
   teammates' workspaces are refused; links and junctions are resolved first and checked again before every run. Read
   only is enforced by Familiar (changes there are refused); on Codex, reading can't be limited to the shared folders.
+- Desktop control: every step asks you, screenshots and screen reads included (they show your screen), in plain words
+  with a small picture of the spot it would touch; no rule, auto-review or "Always allow" covers it. Windows-MCP's
+  tools that run commands or touch files, processes, the registry, the clipboard, web pages or notifications are
+  switched off, and starting programs by path is refused. One teammate at a time; while one uses the desktop the tray
+  icon turns red and the tray's **Stop desktop control** ends it at once. It only works inside the Familiar app.
 
 ## Install
 Download `Familiar-<version>-setup.exe` from [Releases](https://github.com/dhruvkhator/familiar/releases) (Windows;

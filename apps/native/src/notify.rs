@@ -91,6 +91,7 @@ fn on_signal(signal: familiar_host::Signal, cx: &mut App) {
             show(&bot, "finished", title, body, cx)
         }
         Signal::Notify { bot, message, .. } => show(&bot, "notify", bot.clone(), message, cx),
+        Signal::Desktop { bot } => crate::tray::desktop_changed(bot, cx),
     }
 }
 

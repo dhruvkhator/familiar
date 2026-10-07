@@ -59,6 +59,9 @@ struct Template {
     /// It works on the owner's files: the Set up checklist asks for a folder.
     #[serde(default)]
     folder: bool,
+    /// It works on the desktop: the Set up checklist offers to turn desktop control on (it starts off).
+    #[serde(default)]
+    desktop: bool,
 }
 
 /// Parsed once; the unit tests below keep the file valid.
@@ -183,6 +186,7 @@ pub async fn create(
         "logins": t.logins.iter().map(|l| json!({ "site": l.site, "url": l.url, "done": false })).collect::<Vec<_>>(),
         "schedules": schedule_ids,
         "folder": t.folder,
+        "desktop": t.desktop,
         "dismissed": false,
     });
     sqlx::query("update bots set setup = $2 where id = $1")

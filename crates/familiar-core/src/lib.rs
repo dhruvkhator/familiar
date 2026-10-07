@@ -6,6 +6,7 @@ pub mod codex;
 pub mod config;
 pub mod daemon;
 pub mod db;
+pub mod desktop;
 pub mod drafts;
 pub mod folders;
 pub mod mcp;

@@ -15,6 +15,8 @@ pub struct Bot {
     pub model: String,
     /// `claude` (Claude Code CLI) or `codex` (OpenAI Codex CLI).
     pub engine: String,
+    /// The owner let it use this PC's desktop (see crate::desktop).
+    pub desktop: bool,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -128,7 +130,7 @@ impl Db {
     }
 
     pub async fn bot(&self, id: Uuid) -> Result<Bot> {
-        Ok(sqlx::query_as("select id, slug, name, persona, model, engine from bots where id = $1 and owner_id = $2")
+        Ok(sqlx::query_as("select id, slug, name, persona, model, engine, desktop from bots where id = $1 and owner_id = $2")
             .bind(id)
             .bind(self.owner)
             .fetch_one(&self.pool)
@@ -289,11 +291,12 @@ impl Db {
         editable: &[String],
         allow_rule: Option<&str>,
         timeout: std::time::Duration,
+        preview: Option<&[u8]>,
     ) -> Result<Uuid> {
         Ok(sqlx::query_scalar(
             "insert into approvals (run_id, bot_id, owner_id, tool_use_id, tool_name, input, reason, status, editable,
-                                    allow_rule, expires_at)
-             values ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, now() + make_interval(secs => $10)) returning id",
+                                    allow_rule, expires_at, preview)
+             values ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, now() + make_interval(secs => $10), $11) returning id",
         )
         .bind(run.id)
         .bind(run.bot_id)
@@ -305,6 +308,7 @@ impl Db {
         .bind(editable)
         .bind(allow_rule)
         .bind(timeout.as_secs_f64())
+        .bind(preview)
         .fetch_one(&self.pool)
         .await?)
     }
@@ -430,6 +434,29 @@ impl Db {
             .bind(self.owner)
             .fetch_all(&self.pool)
             .await?)
+    }
+
+    /// Whether any teammate has desktop control on (then Windows-MCP gets installed).
+    pub async fn any_desktop_bot(&self) -> Result<bool> {
+        Ok(sqlx::query_scalar("select exists(select 1 from bots where owner_id = $1 and desktop)")
+            .bind(self.owner)
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
+    /// "Stop desktop control": deny the desktop requests still waiting (of one run, or all).
+    pub async fn deny_desktop_approvals(&self, run: Option<Uuid>) -> Result<u64> {
+        let r = sqlx::query(
+            "update approvals set status = 'denied', decided_by = 'user', decided_at = now(),
+                    response = 'You stopped desktop control.'
+             where owner_id = $1 and status = 'pending' and tool_name like 'mcp\\_\\_desktop\\_\\_%'
+               and ($2::uuid is null or run_id = $2)",
+        )
+        .bind(self.owner)
+        .bind(run)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
     }
 
     /// Enabled schedules that the SQL cron job consumed (next_run_at null) and need their next fire time.
@@ -624,7 +651,7 @@ impl Db {
     }
 
     pub async fn bot_by_slug(&self, slug: &str) -> Result<Option<Bot>> {
-        Ok(sqlx::query_as("select id, slug, name, persona, model, engine from bots where slug = $1 and owner_id = $2")
+        Ok(sqlx::query_as("select id, slug, name, persona, model, engine, desktop from bots where slug = $1 and owner_id = $2")
             .bind(slug)
             .bind(self.owner)
             .fetch_optional(&self.pool)

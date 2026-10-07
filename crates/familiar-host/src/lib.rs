@@ -25,6 +25,13 @@ use tokio_util::sync::CancellationToken;
 
 pub use cli::{CliStatus, claude_status, codex_status, open_cli_terminal, open_folder};
 pub use familiar_core::Signal;
+/// Where desktop control stands on this PC (Windows-MCP installed, being installed, uv missing...).
+pub use familiar_core::tools::{Desktop, desktop_status};
+
+/// A desktop tool call (`mcp__desktop__<Tool>`) in Familiar's plain words, for the approval card; None for other tools.
+pub fn desktop_words(tool: &str, input: &serde_json::Value) -> Option<String> {
+    tool.strip_prefix("mcp__desktop__").map(|t| familiar_core::desktop::describe(t, input))
+}
 pub use instance::InstanceLock;
 
 /// Where startup is. Serialises as `starting | database | ready | error` (the web UI's `AppStatus.boot.phase`).

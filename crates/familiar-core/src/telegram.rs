@@ -558,10 +558,14 @@ fn approval_message(bot: &str, tool: &str, input: &Value, reason: Option<&str>) 
         whole = false;
         text = clip(&text, MESSAGE_MAX);
     }
-    if !whole {
+    // A desktop step is approved only in the app, next to its picture of the screen and the tray's Stop.
+    let desktop = tool.starts_with("mcp__desktop__");
+    if desktop {
+        text.push_str("\n\nThis would act on your PC's desktop: approve it in Familiar on that PC.");
+    } else if !whole {
         text.push_str("\n\nNot all of it can be shown safely here: review it in Familiar.");
     }
-    (text, whole)
+    (text, whole && !desktop)
 }
 
 
@@ -617,6 +621,9 @@ mod tests {
 
     #[test]
     fn tool_calls_show_every_input_field() {
+        // A desktop step is shown, but approved only in the app.
+        let (text, ok) = approval_message("Ada", "mcp__desktop__Click", &json!({ "loc": [1, 2] }), None);
+        assert!(!ok && text.contains("approve it in Familiar on that PC"), "{text}");
         let (text, ok) = approval_message("Ada", "Bash", &json!({ "command": "ls -la", "description": "look" }), None);
         assert!(ok && text.contains("\nls -la") && text.contains("description: look"), "{text}");
         // The field the old message left out is there now.

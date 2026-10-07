@@ -95,10 +95,35 @@ pub fn question(a: &Approval) -> Option<String> {
     ["question", "prompt"].iter().find_map(|k| input.get(*k).and_then(Value::as_str)).map(str::to_owned)
 }
 
+/// Desktop steps' pictures of the screen around their target, by approval (PNG), while they wait.
+static PREVIEWS: std::sync::Mutex<Option<std::collections::HashMap<Uuid, std::sync::Arc<gpui::Image>>>> = std::sync::Mutex::new(None);
+
+pub fn put_preview(id: Uuid, png: Vec<u8>) {
+    let image = std::sync::Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png));
+    PREVIEWS.lock().unwrap().get_or_insert_default().insert(id, image);
+}
+
+pub fn has_preview(id: Uuid) -> bool {
+    PREVIEWS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&id))
+}
+
+/// Forget the pictures of steps no longer waiting.
+pub fn keep_previews(waiting: &[Uuid]) {
+    if let Some(m) = PREVIEWS.lock().unwrap().as_mut() {
+        m.retain(|id, _| waiting.contains(id));
+    }
+}
+
+fn preview_of(id: Uuid) -> Option<std::sync::Arc<gpui::Image>> {
+    PREVIEWS.lock().unwrap().as_ref().and_then(|m| m.get(&id).cloned())
+}
+
 /// The web's `riskOf`.
 pub fn risk_of(tool: &str) -> (&'static str, Tone) {
     let t = tool.to_lowercase();
-    if matches!(tool, "Bash" | "PowerShell") {
+    if tool.starts_with("mcp__desktop__") {
+        ("your desktop", Tone::Bad)
+    } else if matches!(tool, "Bash" | "PowerShell") {
         ("high risk", Tone::Bad)
     } else if matches!(tool, "Write" | "Edit" | "MultiEdit" | "NotebookEdit")
         || ["click", "type", "fill", "select", "upload", "evaluate", "press"].iter().any(|k| t.contains(k))
@@ -114,6 +139,10 @@ pub fn risk_of(tool: &str) -> (&'static str, Tone) {
 pub fn action_of(tool: &str) -> &'static str {
     let t = tool.to_lowercase();
     match tool {
+        "mcp__desktop__Screenshot" | "mcp__desktop__Snapshot" | "mcp__desktop__WaitFor" | "mcp__desktop__DisplayInventory" => {
+            "Look at your screen"
+        }
+        _ if tool.starts_with("mcp__desktop__") => "Use your mouse and keyboard",
         "Bash" | "PowerShell" => "Run a command on your computer",
         "Write" => "Create or overwrite a file",
         "Edit" | "MultiEdit" | "NotebookEdit" => "Change a file",
@@ -397,6 +426,8 @@ pub fn approval_card(
     let hidden = detail.as_ref().is_some_and(|d| d.hidden) || question.as_ref().is_some_and(|q| q.1) || draft_hidden;
     // Compact cards only approve what they show whole.
     let review = !big && !ask && !draft && (hidden || detail.as_ref().is_some_and(needs_review));
+    // A desktop step in Familiar's own words, made here from the input the card shows (not the teammate's text).
+    let desktop_words = a.input.as_ref().and_then(|i| familiar_host::desktop_words(&a.tool_name, i)).map(|w| reveal(&w, false).0);
     let channel = reveal(draft_field(a, "channel").unwrap_or("its channel"), false).0;
     let kind = reveal(draft_field(a, "kind").unwrap_or("other"), false).0;
 
@@ -444,6 +475,63 @@ pub fn approval_card(
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme.ink)
                         .child(SharedString::from(format!("{who} wants to {action}"))),
+                ),
+        );
+    }
+    if let Some(words) = desktop_words.clone() {
+        body = body.child(
+            div()
+                .flex()
+                .items_start()
+                .gap(px(8.0))
+                .px(px(12.0))
+                .py(px(9.0))
+                .rounded(px(RADIUS_CHIP))
+                .bg(theme.bad_soft)
+                .border_l_2()
+                .border_color(theme.bad)
+                .child(icons::icon(icons::MONITOR).size(px(16.0)).mt(px(2.0)).text_color(theme.bad))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(if big { text::LEAD } else { text::BODY }))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.ink)
+                                .child(SharedString::from(words)),
+                        )
+                        .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(
+                            "On your PC, with your mouse, keyboard or screen. Nothing happens unless you approve.",
+                        ))
+                        .when_some(preview_of(a.id), |el, image| {
+                            el.child(
+                                div()
+                                    .mt(px(6.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .w(px(if big { 360.0 } else { 270.0 }))
+                                            .h(px(if big { 220.0 } else { 165.0 }))
+                                            .rounded(px(6.0))
+                                            .overflow_hidden()
+                                            .border_1()
+                                            .border_color(theme.line)
+                                            .child({
+                                                use gpui::StyledImage as _;
+                                                gpui::img(image).size_full().object_fit(gpui::ObjectFit::Contain)
+                                            }),
+                                    )
+                                    .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(format!(
+                                        "Your screen around the spot (red cross) when it asked, {}. It may have changed since.",
+                                        ago(Some(a.created_at))
+                                    ))),
+                            )
+                        }),
                 ),
         );
     }
@@ -498,7 +586,7 @@ pub fn approval_card(
         );
     }
     // The model's own explanation: its words, never styled like Familiar's risk hint.
-    if let Some(r) = a.reason.clone().filter(|r| !r.trim().is_empty()) {
+    if let Some(r) = a.reason.clone().filter(|r| !r.trim().is_empty() && desktop_words.is_none()) {
         let (r, _) = reveal(r.trim(), true);
         let r = if big { r } else { head_tail(&r, COMPACT_END) };
         body = body.child(

@@ -2,7 +2,7 @@
 //! browser, through the computer panel's take-over), tick each one off, choose the folder it works on (templates that
 //! work on your files), and turn its schedules on. It goes away once everything is done, or when you hide it.
 
-use familiar_client::{Folder, Schedule, SchedulePatch, SetupPatch};
+use familiar_client::{BotPatch, Folder, Schedule, SchedulePatch, SetupPatch};
 use familiar_ui::anim;
 use familiar_ui::components::{Button, ButtonSize, card};
 use familiar_ui::icons::{self, icon};
@@ -59,6 +59,24 @@ impl SetupCard {
             this.schedules = Some(list)
         });
         swr(self, &client, format!("/api/bots/{}/folders", self.bot), cx, |this, list: Vec<Folder>, _| this.folders = Some(list));
+    }
+
+    /// "Turn on" desktop control (the row says what that means first).
+    fn turn_on_desktop(&mut self, cx: &mut Context<Self>) {
+        let client = self.data.read(cx).client.clone();
+        let bot = self.bot;
+        let task = Tokio::spawn(cx, async move { client.update_bot(bot, &BotPatch { desktop: Some(true), ..Default::default() }).await });
+        cx.spawn(async move |this, cx| {
+            let r = task.await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.message()));
+            let _ = this.update(cx, |this, cx| match r {
+                Ok(bot) => {
+                    this.toasts.update(cx, |t, cx| t.push(Tone::Ok, "It can use your desktop, one approved step at a time", None, cx));
+                    this.data.update(cx, |d, cx| d.put_bot(bot, cx));
+                }
+                Err(e) => this.toasts.update(cx, |t, cx| t.push(Tone::Bad, "Couldn't turn it on", Some(e.into()), cx)),
+            });
+        })
+        .detach();
     }
 
     /// "Choose a folder": the system picker, then share it read only (Settings can make it read & write).
@@ -167,20 +185,23 @@ impl Render for SetupCard {
         // A template that works on your files asks for a folder until one is shared.
         let shared: Option<&Folder> = self.folders.as_ref().and_then(|f| f.first());
         let folder_left = setup.folder && shared.is_none();
+        // A template that works on the desktop offers to turn desktop control on (it starts off).
+        let desktop_left = setup.desktop && !bot.desktop;
         // Until the schedules load, assume they are still off; with nothing else to show, wait for them instead.
         let off: Vec<Uuid> = match &mine {
             Some(m) => m.iter().filter(|s| !s.enabled).map(|s| s.id).collect(),
-            None if logins_left == 0 && !folder_left => return div(),
+            None if logins_left == 0 && !folder_left && !desktop_left => return div(),
             None => setup.schedules.clone(),
         };
         let has_schedules = !setup.schedules.is_empty() && mine.as_ref().is_none_or(|m| !m.is_empty());
-        if logins_left == 0 && off.is_empty() && !folder_left {
+        if logins_left == 0 && off.is_empty() && !folder_left && !desktop_left {
             return div();
         }
-        let total = setup.logins.len() + has_schedules as usize + setup.folder as usize;
+        let total = setup.logins.len() + has_schedules as usize + setup.folder as usize + setup.desktop as usize;
         let done = setup.logins.len() - logins_left
             + (has_schedules && off.is_empty()) as usize
-            + (setup.folder && !folder_left) as usize;
+            + (setup.folder && !folder_left) as usize
+            + (setup.desktop && !desktop_left) as usize;
 
         let mut rows = div().flex().flex_col().gap(px(2.0));
         for l in &setup.logins {
@@ -237,6 +258,33 @@ impl Render for SetupCard {
             });
             let tick = checkbox(!folder_left, &theme).mt(px(0.0)).into_any_element();
             rows = rows.child(Self::row(!folder_left, tick, title, detail, action, &theme));
+        }
+        if setup.desktop {
+            let status = familiar_host::desktop_status();
+            let usable = !matches!(status, familiar_host::Desktop::Unsupported | familiar_host::Desktop::NoUv);
+            let (title, detail) = if desktop_left {
+                (
+                    "Let it use your desktop".to_owned(),
+                    if usable {
+                        "It can see your screen and use your mouse and keyboard. Every action asks you first.".to_owned()
+                    } else {
+                        status.message()
+                    },
+                )
+            } else {
+                ("Desktop control is on".to_owned(), "Every action asks you first. Turn it off in its Settings.".to_owned())
+            };
+            let action = (desktop_left && usable && cfg!(windows)).then(|| {
+                let this = cx.entity();
+                Button::new("setup-desktop", "Turn on")
+                    .size(ButtonSize::Small)
+                    .icon(icons::MONITOR)
+                    .tooltip("It can see your screen and use your mouse and keyboard. Every action asks you first.")
+                    .on_click(move |_, _, cx| this.update(cx, |p, cx| p.turn_on_desktop(cx)))
+                    .into_any_element()
+            });
+            let tick = checkbox(!desktop_left, &theme).mt(px(0.0)).into_any_element();
+            rows = rows.child(Self::row(!desktop_left, tick, title, detail, action, &theme));
         }
         if has_schedules {
             let named: Vec<String> = mine

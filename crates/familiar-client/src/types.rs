@@ -79,6 +79,8 @@ pub struct Bot {
     pub created_at: DateTime<Utc>,
     /// What the template it was hired from set up (`None` for a teammate made from scratch).
     pub setup: Option<BotSetup>,
+    /// It may use this PC's desktop (every step asks you).
+    pub desktop: bool,
 }
 
 /// `bots.setup`: the template's sign-ins (ticked off by the owner) and the schedules it created (off at first).
@@ -90,6 +92,8 @@ pub struct BotSetup {
     pub schedules: Vec<Uuid>,
     /// The template works on the owner's files: the checklist offers "Choose a folder" until one is shared.
     pub folder: bool,
+    /// The template works on the desktop: the checklist offers to turn desktop control on.
+    pub desktop: bool,
     /// The owner hid the Set up checklist.
     pub dismissed: bool,
 }
@@ -309,6 +313,8 @@ pub struct Approval {
     pub allow_rule: Option<String>,
     /// What the owner approved when they changed it (`input` keeps the proposal).
     pub edited_input: Option<Value>,
+    /// A desktop step with a picture of the screen around its target (`/api/approvals/{id}/preview`, while waiting).
+    pub has_preview: bool,
 }
 
 impl Approval {
@@ -461,6 +467,8 @@ pub struct Template {
     pub first_task: Option<String>,
     /// It works on the owner's files: its Set up checklist asks for a folder.
     pub folder: bool,
+    /// It works on the desktop: its Set up checklist offers to turn desktop control on.
+    pub desktop: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -654,8 +662,8 @@ macro_rules! body {
 
 body!(NewBot { name: String, slug: String, persona: String, model: String, engine: String, avatar: Avatar });
 body!(
-    /// `avatar: Some(Value::Null)` clears the avatar.
-    BotPatch { name: String, persona: String, model: String, paused: bool, engine: String, avatar: Value }
+    /// `avatar: Some(Value::Null)` clears the avatar. `desktop`: "Can use this PC's desktop".
+    BotPatch { name: String, persona: String, model: String, paused: bool, engine: String, avatar: Value, desktop: bool }
 );
 body!(NewSchedule { cron: String, prompt: String, kind: String, enabled: bool, gate_command: String });
 body!(SchedulePatch { label: String, cron: String, prompt: String, kind: String, enabled: bool, gate_command: String });

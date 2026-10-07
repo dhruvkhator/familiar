@@ -250,6 +250,7 @@ impl Tools {
             reason: None,
             offer: Offer::default(),
             timeout: runner::APPROVAL_TIMEOUT,
+            preview: None,
         };
         match runner::ask_human(&self.ctx, &s.run, ask, &s.events, &s.cancel).await {
             Ok(Decision { status, response: Some(answer), .. }) if status == "approved" => ok(format!("Owner answered: {answer}")),
@@ -290,7 +291,7 @@ impl Tools {
         let id = match self
             .ctx
             .db
-            .create_approval(&s.run, None, "propose_draft", &input, note, &editable, None, drafts::DRAFT_TIMEOUT)
+            .create_approval(&s.run, None, "propose_draft", &input, note, &editable, None, drafts::DRAFT_TIMEOUT, None)
             .await
         {
             Ok(id) => id,

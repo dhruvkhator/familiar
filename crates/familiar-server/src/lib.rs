@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use routes::{
-    approvals, artifacts, bots, channels, connectors, folders, live, memories, models, overview, rules, runs,
+    approvals, artifacts, bots, channels, connectors, desktop, folders, live, memories, models, overview, rules, runs,
     schedules, skills, stream, templates, threads, triggers,
 };
 
@@ -100,6 +100,7 @@ fn router(state: S, web_origins: &[String]) -> Router {
         .route("/api/runs/{id}/cancel", post(runs::cancel))
         .route("/api/approvals", get(approvals::list))
         .route("/api/approvals/{id}", post(approvals::decide))
+        .route("/api/approvals/{id}/preview", get(approvals::preview))
         .route(
             "/api/bots/{id}/schedules",
             get(schedules::list).post(schedules::create),
@@ -125,6 +126,7 @@ fn router(state: S, web_origins: &[String]) -> Router {
         .route("/api/bots/{id}/live", get(live::info))
         .route("/api/bots/{id}/live.jpg", get(live::frame))
         .route("/api/bots/{id}/live/input", post(live::input))
+        .route("/api/desktop/stop", post(desktop::stop))
         .route("/api/bots/{id}/folders", get(folders::list).post(folders::create))
         .route("/api/folders/{id}", patch(folders::update).delete(folders::remove))
         .route("/api/rules", get(rules::list).post(rules::create))

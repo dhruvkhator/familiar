@@ -30,3 +30,8 @@ unicode-properties = { version = "0.1.4", default-features = false, features = [
 tracing = "0.1.44"
 uuid = { version = "1.26.1", features = ["v4", "serde"] }
 familiar-crypto = { version = "0.1.0", path = "../familiar-crypto" }
+# The approval card's small picture of the screen around a desktop step's target.
+png = "0.18.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }

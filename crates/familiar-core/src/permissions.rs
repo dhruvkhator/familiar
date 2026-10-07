@@ -76,6 +76,8 @@ pub fn editable_field(tool: &str, input: &Value) -> Option<&'static str> {
         "Bash" => "command",
         "Write" => "content",
         "mcp__browser__browser_type" => "text",
+        // Desktop steps are approved exactly as shown.
+        t if t.starts_with("mcp__desktop__") => return None,
         t if t.starts_with("mcp__") && !t.starts_with("mcp__browser__") && !t.starts_with("mcp__familiar__") => {
             return ["body", "text", "message", "content", "comment"].into_iter().find(|k| input[*k].is_string());
         }
@@ -106,7 +108,8 @@ pub fn always_allow_rule(tool: &str, input: &Value) -> Option<String> {
     }
     let server_tool = tool.strip_prefix("mcp__")?;
     let (server, action) = server_tool.split_once("__")?;
-    if server.is_empty() || matches!(server, "browser" | "familiar") {
+    // Never a desktop tool: each one is a look at, or a touch of, the owner's own screen.
+    if server.is_empty() || matches!(server, "browser" | "familiar" | crate::desktop::SERVER) {
         return None;
     }
     read_only_action(action).then(|| tool.to_owned())

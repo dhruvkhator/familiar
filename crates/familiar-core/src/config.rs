@@ -48,6 +48,10 @@ pub struct Config {
     /// off so the fake CLIs see only run invocations).
     #[serde(default = "default_true")]
     pub check_models: bool,
+    /// Show a small picture of the screen around a desktop step's target on its approval card (default on; tests turn
+    /// it off so they never read the screen).
+    #[serde(default = "default_true")]
+    pub desktop_previews: bool,
 }
 
 fn default_true() -> bool {

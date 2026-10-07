@@ -44,6 +44,12 @@ fn global_setup() {
         std::fs::create_dir_all(&pkg).unwrap();
         std::fs::write(pkg.join("package.json"), r#"{"name":"@playwright/mcp","version":"0.0.83"}"#).unwrap();
         std::fs::write(pkg.join("cli.js"), "process.exit(0)\n").unwrap();
+        // A "pre-installed" Windows-MCP (desktop control), so the daemon never runs `uv tool install` either.
+        let wmcp = home.join("tools").join("windows-mcp");
+        std::fs::create_dir_all(wmcp.join("bin")).unwrap();
+        std::fs::write(wmcp.join("bin").join("windows-mcp.exe"), b"not a real program").unwrap();
+        let site = wmcp.join("uv-tools").join("windows-mcp").join("Lib").join("site-packages");
+        std::fs::create_dir_all(site.join("windows_mcp-0.8.7.dist-info")).unwrap();
         // SAFETY: runs once, before any test of this binary starts a daemon or spawns a process.
         unsafe { std::env::set_var("FAMILIAR_HOME", &home) };
         if std::env::var_os("RUST_LOG").is_some() {
@@ -102,6 +108,8 @@ impl H {
             "device_name": "testkit",
             "max_parallel": 2,
             "check_models": false,
+            // Never read the real screen.
+            "desktop_previews": false,
         });
         for (k, v) in extra.as_object().cloned().unwrap_or_default() {
             cfg[k] = v;
@@ -111,6 +119,15 @@ impl H {
 
     fn start(&mut self) {
         self.start_with(json!({}));
+    }
+
+    /// Start the daemon the way the app does (`run_with_signals`, which offers desktop control); returns its signals.
+    fn start_app(&mut self) -> tokio::sync::broadcast::Receiver<familiar_core::Signal> {
+        let cfg = self.config(json!({}));
+        self.shutdown = CancellationToken::new();
+        let (tx, rx) = tokio::sync::broadcast::channel(64);
+        self.daemon = Some(tokio::spawn(familiar_core::run_with_signals(cfg, self.shutdown.clone(), tx)));
+        rx
     }
 
     fn start_with(&mut self, extra: Value) {
@@ -1528,5 +1545,185 @@ async fn shared_folders_on_codex() {
     assert_eq!(start["config"]["sandbox_workspace_write.writable_roots"], json!([rw.display().to_string()]));
     assert_eq!(start["sandbox"], "danger-full-access", "every patch still comes back for approval");
     assert!(start["developerInstructions"].as_str().unwrap().contains(&format!("- `{}` (read only", ro.display())));
+    h.finish().await;
+}
+
+// ------------------------------------------------------------------------------------------------ desktop control
+
+async fn desktop_bot(h: &H, slug: &str) -> Uuid {
+    let bot = h.bot(slug).await;
+    sqlx::query("update bots set desktop = true where id = $1").bind(bot).execute(&h.pool).await.unwrap();
+    bot
+}
+
+/// The run's MCP config while the run is alive (it is deleted when the run ends).
+fn live_mcp_config(h: &H, n: usize) -> Value {
+    let inv = h.invocation(n);
+    serde_json::from_str(&std::fs::read_to_string(inv.flag("--mcp-config").unwrap()).unwrap()).unwrap()
+}
+
+/// Every desktop step asks the owner, in plain words, with nothing to edit and no "Always allow", whatever the owner's
+/// allow rules say; excluded tools and starting programs by path are refused without asking; the app is told who uses
+/// the desktop and when it is free again. Windows-MCP runs from the tools folder with telemetry off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_steps_always_ask() {
+    if !cfg!(windows) {
+        return;
+    }
+    let Some(mut h) = setup("desktop_steps_always_ask").await else { return };
+    h.scenario(json!([[
+        { "init": {} },
+        tool("mcp__desktop__PowerShell", json!({ "command": "Get-Process" })),
+        tool("mcp__desktop__App", json!({ "mode": "launch_executable", "executable": "cmd.exe", "args": ["/c", "calc"] })),
+        tool("mcp__desktop__Click", json!({ "loc": [120, 340] })),
+        tool("mcp__desktop__Screenshot", json!({ "region": [0, 0, 400, 300] })),
+        { "result": "done" },
+    ]]));
+    let mut signals = h.start_app();
+    let bot = desktop_bot(&h, "deskbot").await;
+    // Blanket allow rules never cover the desktop.
+    for p in ["*", "mcp__desktop", "mcp__desktop__Click"] {
+        sqlx::query("insert into rules (owner_id, bot_id, pattern, decision) values ($1, $2, $3, 'allow')")
+            .bind(h.owner)
+            .bind(bot)
+            .bind(p)
+            .execute(&h.pool)
+            .await
+            .unwrap();
+    }
+    let thread = h.thread(bot).await;
+    let run = h.say(thread, "click it").await;
+
+    let (click, tool_name, input, reason) = h.pending_approval(run).await;
+    assert_eq!((tool_name.as_str(), &input), ("mcp__desktop__Click", &json!({ "loc": [120, 340] })));
+    assert_eq!(reason.as_deref(), Some("On your desktop: Click at (120, 340)."));
+    assert_eq!(h.offer(click).await, (vec![], None), "nothing to edit, no Always allow");
+    let cfg = live_mcp_config(&h, 0);
+    let server = &cfg["mcpServers"]["desktop"];
+    assert_eq!(server["type"], "stdio");
+    let exe = server["command"].as_str().unwrap();
+    assert!(exe.ends_with(r"tools\windows-mcp\bin\windows-mcp.exe"), "{exe}");
+    let args: Vec<&str> = server["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
+    let flag = |f: &str| args.iter().position(|a| *a == f).map(|i| args[i + 1]).unwrap();
+    assert!(flag("--exclude-tools").split(',').any(|t| t == "PowerShell"));
+    assert!(!flag("--tools").split(',').any(|t| t == "PowerShell"));
+    assert!(Path::new(flag("--config")).is_file(), "its own config file, not ~/.windows-mcp's");
+    assert_eq!(server["env"]["ANONYMIZED_TELEMETRY"], "false");
+    let Ok(Ok(familiar_core::Signal::Desktop { bot: Some(who) })) = tokio::time::timeout(WAIT, signals.recv()).await else {
+        panic!("no desktop signal")
+    };
+    assert_eq!(who, "deskbot");
+    h.decide(click, "approved", None).await;
+
+    let (shot, tool_name, _, reason) = h.pending_approval(run).await;
+    assert_ne!(shot, click);
+    assert_eq!(tool_name, "mcp__desktop__Screenshot");
+    assert_eq!(reason.as_deref(), Some("On your desktop: Take a screenshot of the area from (0, 0) to (400, 300) of your screen and look at it."));
+    h.decide(shot, "denied", Some("not now")).await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+
+    let d = h.invocation(0).decisions();
+    assert_eq!(d.len(), 4, "{d:?}");
+    assert_eq!(d[0]["behavior"], "deny");
+    assert!(d[0]["message"].as_str().unwrap().contains("not one of the desktop tools"), "{d:?}");
+    assert_eq!(d[1]["behavior"], "deny");
+    assert!(d[1]["message"].as_str().unwrap().contains("by path"), "{d:?}");
+    assert_eq!(d[2]["behavior"], "allow");
+    assert_eq!(d[3]["behavior"], "deny");
+    assert_eq!(h.approvals(run).await.len(), 2, "only the two real steps asked");
+    let free = loop {
+        match tokio::time::timeout(WAIT, signals.recv()).await {
+            Ok(Ok(familiar_core::Signal::Desktop { bot })) => break bot,
+            Ok(Ok(_)) => continue,
+            other => panic!("no release signal: {other:?}"),
+        }
+    };
+    assert_eq!(free, None, "the desktop is free when the run ends");
+    let instructions = std::fs::read_to_string(h.invocation(0).flag("--append-system-prompt-file").unwrap()).unwrap();
+    assert!(instructions.contains("## This PC's desktop\nYou can use this PC's desktop"), "{instructions}");
+    h.finish().await;
+}
+
+/// One teammate at a time: while one holds the desktop, another's desktop step is refused as busy (without asking);
+/// "Stop desktop control" denies the holder's waiting request, cancels its run and frees the desktop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_one_at_a_time_and_stop() {
+    if !cfg!(windows) {
+        return;
+    }
+    let Some(mut h) = setup("desktop_one_at_a_time_and_stop").await else { return };
+    h.scenario(json!([
+        [{ "init": {} }, tool("mcp__desktop__Click", json!({ "loc": [1, 1] })), { "result": "a done" }],
+        [{ "init": {} }, tool("mcp__desktop__Click", json!({ "loc": [2, 2] })), { "result": "b done" }],
+    ]));
+    let mut signals = h.start_app();
+    let a = desktop_bot(&h, "ada").await;
+    let b = desktop_bot(&h, "bo").await;
+    let ta = h.thread(a).await;
+    let tb = h.thread(b).await;
+    let run_a = h.say(ta, "use the desktop").await;
+    let (pending, ..) = h.pending_approval(run_a).await;
+
+    let run_b = h.say(tb, "use the desktop too").await;
+    assert_eq!(h.finished(run_b).await.0, "succeeded");
+    let d = h.invocation(1).decisions();
+    assert_eq!(d[0]["behavior"], "deny");
+    assert!(d[0]["message"].as_str().unwrap().starts_with("ada is using the desktop right now"), "{d:?}");
+    assert!(h.approvals(run_b).await.is_empty(), "busy, not asked");
+
+    // Stop desktop control (what `POST /api/desktop/stop` sends the daemon).
+    sqlx::query("select pg_notify('familiar_input', $1)")
+        .bind(json!({ "type": "desktop_stop", "owner": h.owner }).to_string())
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(h.finished(run_a).await.0, "cancelled");
+    let (status, response): (String, Option<String>) =
+        sqlx::query_as("select status, response from approvals where id = $1").bind(pending).fetch_one(&h.pool).await.unwrap();
+    assert!(matches!(status.as_str(), "denied" | "expired"), "{status}");
+    if status == "denied" {
+        assert_eq!(response.as_deref(), Some("You stopped desktop control."));
+    }
+    let mut seen = Vec::new();
+    while let Ok(Ok(s)) = tokio::time::timeout(Duration::from_millis(500), signals.recv()).await {
+        if let familiar_core::Signal::Desktop { bot } = s {
+            seen.push(bot);
+        }
+    }
+    assert_eq!(seen.first(), Some(&Some("ada".to_owned())), "{seen:?}");
+    assert_eq!(seen.last(), Some(&None), "{seen:?}");
+    h.finish().await;
+}
+
+/// Without the app (the headless daemon) or with the switch off, a teammate gets no desktop server and every desktop
+/// call is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn desktop_needs_the_switch_and_the_app() {
+    let Some(mut h) = setup("desktop_needs_the_switch_and_the_app").await else { return };
+    h.scenario(json!([
+        [{ "init": {} }, tool("mcp__desktop__Click", json!({ "loc": [1, 1] })), { "result": "no" }],
+        [{ "init": {} }, tool("mcp__desktop__Click", json!({ "loc": [1, 1] })), { "sleep_ms": 1500 }, { "result": "no" }],
+    ]));
+    h.start(); // headless: no app to show who uses the desktop
+    let on = desktop_bot(&h, "on-headless").await;
+    let t = h.thread(on).await;
+    let run = h.say(t, "click").await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+    let d = h.invocation(0).decisions();
+    assert_eq!(d[0]["behavior"], "deny");
+    assert!(d[0]["message"].as_str().unwrap().contains("not on for this run"), "{d:?}");
+    let instructions = std::fs::read_to_string(h.invocation(0).flag("--append-system-prompt-file").unwrap()).unwrap();
+    assert!(instructions.contains("not ready (it only works while the Familiar app runs your teammates)"), "{instructions}");
+
+    let off = h.bot("off").await;
+    let t = h.thread(off).await;
+    let run = h.say(t, "click").await;
+    // Its config has no desktop server.
+    wait_for("the second run to start", || async { Ok((h.invocations() == 2).then_some(())) }).await;
+    let cfg = live_mcp_config(&h, 1);
+    assert!(cfg["mcpServers"].get("desktop").is_none(), "{cfg}");
+    assert_eq!(h.finished(run).await.0, "succeeded");
+    assert_eq!(h.invocation(1).decisions()[0]["behavior"], "deny");
+    assert!(h.approvals(run).await.is_empty());
     h.finish().await;
 }

@@ -14,6 +14,7 @@ pub mod artifacts;
 pub mod bots;
 pub mod channels;
 pub mod connectors;
+pub mod desktop;
 pub mod folders;
 pub mod live;
 pub mod memories;

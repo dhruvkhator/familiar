@@ -389,6 +389,13 @@ impl Client {
         self.mutate::<Value>(Method::DELETE, &format!("/api/rules/{id}"), None, true).await.map(|_| ())
     }
 
+    // ---- desktop control ------------------------------------------------
+
+    /// "Stop desktop control": deny every waiting desktop request and take the desktop from the teammate using it.
+    pub async fn stop_desktop(&self) -> Result<(), ApiError> {
+        self.mutate::<Value>(Method::POST, "/api/desktop/stop", Some(serde_json::json!({})), true).await.map(|_| ())
+    }
+
     // ---- shared folders -------------------------------------------------
 
     pub async fn folders(&self, bot: Uuid) -> Result<Vec<Folder>, ApiError> {
@@ -461,6 +468,10 @@ impl Client {
     }
     pub async fn run_artifacts(&self, run: Uuid) -> Result<Vec<Artifact>, ApiError> {
         self.get(&format!("/api/runs/{run}/artifacts")).await
+    }
+    /// A waiting desktop step's picture of the screen around its target (PNG).
+    pub async fn approval_preview(&self, id: Uuid) -> Result<Bytes, ApiError> {
+        self.send(Method::GET, &format!("/api/approvals/{id}/preview"), None, true).await.map(|(_, b)| b)
     }
     pub async fn download_artifact(&self, id: Uuid) -> Result<Bytes, ApiError> {
         self.send(Method::GET, &format!("/api/artifacts/{id}/download"), None, true).await.map(|(_, b)| b)

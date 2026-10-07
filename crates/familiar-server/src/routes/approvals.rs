@@ -12,8 +12,9 @@ use crate::{
     error::{ApiError, R},
 };
 
-const WITH_BOT: &str =
-    "(to_jsonb(a) - 'owner_id') || jsonb_build_object('bot_name', b.name, 'bot_slug', b.slug)";
+/// The picture of the screen of a desktop step is served on its own ([`preview`]), never inside the row.
+const WITH_BOT: &str = "(to_jsonb(a) - 'owner_id' - 'preview') || jsonb_build_object('bot_name', b.name, 'bot_slug', b.slug,
+    'has_preview', a.preview is not null)";
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -37,6 +38,19 @@ pub async fn list(State(st): State<S>, a: Auth, Q(q): Q<ListQuery>) -> R<Json<Ve
     .fetch_all(&st.pool)
     .await?;
     Ok(Json(rows))
+}
+
+/// A waiting desktop step's picture of the owner's screen around its target (PNG). Gone once it is decided.
+pub async fn preview(State(st): State<S>, a: Auth, Id(id): Id) -> R<axum::response::Response> {
+    use axum::response::IntoResponse;
+    let png: Option<Option<Vec<u8>>> =
+        sqlx::query_scalar("select preview from approvals where id = $1 and owner_id = $2 and status = 'pending'")
+            .bind(id)
+            .bind(a.user)
+            .fetch_optional(&st.pool)
+            .await?;
+    let png = png.flatten().ok_or(ApiError::NotFound)?;
+    Ok(([(axum::http::header::CONTENT_TYPE, "image/png"), (axum::http::header::CACHE_CONTROL, "no-store")], png).into_response())
 }
 
 /// Approvals that are a teammate's own question or draft, never a tool call: "Always allow" makes no sense for them.

@@ -96,6 +96,8 @@ pub struct BotSettings {
     allowed: Option<Vec<familiar_client::Rule>>,
     /// Edit mode: the folders on this PC shared with it (`None` until loaded).
     folders: Option<Vec<familiar_client::Folder>>,
+    /// "Can use this PC's desktop" (saved at once when switched).
+    desktop: bool,
 }
 
 impl EventEmitter<CreateEvent> for BotSettings {}
@@ -227,6 +229,7 @@ impl BotSettings {
             presets: Vec::new(),
             allowed: None,
             folders: None,
+            desktop: b.desktop,
         };
         this.load_catalog(cx);
         if !create {
@@ -301,6 +304,7 @@ impl BotSettings {
             paused: Some(self.paused),
             engine: Some(if self.codex { "codex" } else { "claude" }.into()),
             avatar: Some(self.avatar.to_json()),
+            desktop: None,
         };
         self.busy = true;
         self.error = None;
@@ -959,6 +963,88 @@ impl BotSettings {
         .detach();
     }
 
+    /// Switch "Can use this PC's desktop" (saved at once).
+    fn set_desktop(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.desktop = on;
+        cx.notify();
+        let client = self.data.read(cx).client.clone();
+        let bot = self.bot;
+        let patch = BotPatch { desktop: Some(on), ..Default::default() };
+        let task = Tokio::spawn(cx, async move { client.update_bot(bot, &patch).await });
+        cx.spawn(async move |this, cx| {
+            let r = task.await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.message()));
+            let _ = this.update(cx, |this, cx| {
+                match r {
+                    Ok(b) => {
+                        this.desktop = b.desktop;
+                        let msg = if b.desktop { "It can use your desktop, one approved step at a time" } else { "It can't use your desktop now" };
+                        this.toasts.update(cx, |t, cx| t.push(Tone::Ok, msg, None, cx));
+                        this.data.update(cx, |d, cx| d.reload_overview(cx));
+                    }
+                    Err(e) => {
+                        this.desktop = !on;
+                        this.toasts.update(cx, |t, cx| t.push(Tone::Bad, "Couldn't change that", Some(e.into()), cx));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// "This PC's desktop": the switch, its plain warning, and where desktop control stands on this PC.
+    fn desktop_view(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let status = familiar_host::desktop_status();
+        let usable = !matches!(status, familiar_host::Desktop::Unsupported | familiar_host::Desktop::NoUv);
+        let on = self.desktop;
+        let this = cx.entity();
+        // Turning it on needs Windows and uv; turning it off always works.
+        let switch = Switch::new("bs-desktop", on).when(on || usable, |s| {
+            s.on_toggle(move |v, _, cx| this.update(cx, |p, cx| p.set_desktop(v, cx)))
+        });
+        let (status_tone, status_text) = match &status {
+            familiar_host::Desktop::Ready(_) if on => (
+                theme.muted,
+                "Ready. While it uses your desktop the tray icon turns red, and the tray menu has Stop desktop control."
+                    .to_owned(),
+            ),
+            familiar_host::Desktop::Ready(_) => (theme.muted, "Ready on this PC.".to_owned()),
+            familiar_host::Desktop::Missing if on => (theme.muted, familiar_host::Desktop::Installing.message()),
+            familiar_host::Desktop::Missing => (theme.muted, "Turning it on sets it up once (a minute or two).".to_owned()),
+            familiar_host::Desktop::Installing => (theme.muted, status.message()),
+            _ => (theme.bad, status.message()),
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(label("This PC's desktop"))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(12.0))
+                    .child(div().mt(px(2.0)).when(!on && !usable, |el| el.opacity(0.5)).child(switch))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(div().font_weight(FontWeight::MEDIUM).child("Can use this PC's desktop"))
+                            .child(
+                                div()
+                                    .text_size(px(text::SMALL))
+                                    .text_color(theme.ink)
+                                    .child("It can see your screen and use your mouse and keyboard. Every action asks you first."),
+                            )
+                            .child(div().text_size(px(text::CAPTION)).text_color(status_tone).child(status_text)),
+                    ),
+            )
+            .into_any_element()
+    }
+
     /// "Folders on this PC": each shared folder with its mode (read only / read & write) and Remove, plus Add folder.
     fn folders_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
@@ -1233,6 +1319,7 @@ impl Render for BotSettings {
             )
             .when_some(if create { None } else { self.allowed_view(cx) }, |el, v| el.child(v))
             .when(!create, |el| el.child(self.folders_view(cx)))
+            .when(!create && cfg!(windows), |el| el.child(self.desktop_view(cx)))
             .when_some(summary, |el, summary| {
                 el.child(div().flex().flex_col().gap(px(6.0)).child(label("What it sets up")).child(summary))
             })

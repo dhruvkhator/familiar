@@ -1428,6 +1428,7 @@ dependencies = [
  "futures-util",
  "hostname",
  "http",
+ "png 0.18.1",
  "reqwest",
  "rmcp",
  "rusty-s3",
@@ -1442,6 +1443,7 @@ dependencies = [
  "tracing",
  "unicode-properties",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
