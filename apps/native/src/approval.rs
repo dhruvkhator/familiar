@@ -724,7 +724,7 @@ fn draft_fields(a: &Approval, ui: Option<&CardUi<'_>>, big: bool, hidden: bool, 
                     .flex_col()
                     .gap(px(4.0))
                     .child(caption(label(field)))
-                    .child(text_input::field(("draft", key * 8 + i as u64), state, min_h, window, cx));
+                    .child(text_input::field(("draft", key.wrapping_mul(8).wrapping_add(i as u64)), state, min_h, window, cx));
                 if field == "body" {
                     let value = state.read(cx).value().to_string();
                     let n = value.trim().chars().count();
