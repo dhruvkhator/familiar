@@ -529,7 +529,7 @@ pub fn open(args: Args, rt: tokio::runtime::Handle, cx: &mut App) {
     let page = args.shot.as_deref().unwrap_or("");
     let mut fixture = Fixture::new(page);
     // The CRM shots show three of the GTM crew at work (not the ones that hire it).
-    if page.starts_with("crm") && !matches!(page, "crm-crew" | "crm-crew-done" | "crm-picker") {
+    if (page.starts_with("crm") && !matches!(page, "crm-crew" | "crm-crew-done" | "crm-picker")) || page == "integrations-link" {
         fixture.add_crew();
     }
     let fx = Arc::new(Mutex::new(fixture));
@@ -765,7 +765,7 @@ async fn crm_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Sh
 /// catalog), `integrations-install` (Slack's install dialog: two secret fields), `integrations-custom` (your own
 /// server), `integrations-edit` (an installed server of the owner's, with its stored secrets' names), and Telegram:
 /// `integrations-phone` (paired), `integrations-telegram-pair` (waiting for `/start <code>`), `integrations-telegram`
-/// (the three steps).
+/// (the three steps), and `integrations-link` (after installing Google Workspace: who may use it, with the GTM crew).
 async fn integrations_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Shell>, cx: &mut AsyncApp) {
     let target = if page == "integrations-install" { "integrations/slack" } else { "integrations" };
     cx.update(|cx| shell.update(cx, |s, cx| s.open(target, cx)));
@@ -777,6 +777,10 @@ async fn integrations_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &
             "integrations-custom" => p.open_dialog(None, window, cx),
             "integrations-edit" => p.open_dialog(Some("notes"), window, cx),
             "integrations-catalog" => p.scroll_to(1200.0, cx),
+            "integrations-link" => p.start_linking(
+                familiar_client::Connector { name: "google-workspace".into(), preset: Some("google-workspace".into()), transport: "stdio".into(), enabled: true, ..Default::default() },
+                cx,
+            ),
             "integrations-telegram" | "integrations-telegram-pair" | "integrations-phone" => p.scroll_to(640.0, cx),
             _ => {}
         });

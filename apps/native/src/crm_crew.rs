@@ -2,7 +2,8 @@
 //! who to, the ask, who it's from, the voice, follow-up days), the five teammates it creates with their schedules in
 //! plain words (all off until you turn them on) and the sites they sign in to; then one call hires them all (all or
 //! none). Afterwards the crew and a Set up checklist: sign in to the sites (in each teammate's own browser), connect
-//! Google Workspace for email (and link it to them), turn the schedules on.
+//! Google Workspace for email (installed in Integrations, which then offers to link it to them; or linked here when it
+//! is already installed), turn the schedules on.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -621,16 +622,32 @@ impl CrewHire {
                     )
                 }
                 (None, _) => {
-                    let docs = self.presets.iter().find(|p| p.id == EMAIL_CONNECTOR).and_then(|p| p.docs_url.clone());
+                    let docs = self.presets.iter().find(|p| p.id == EMAIL_CONNECTOR).and_then(|p| p.docs_url.as_deref().and_then(crate::crm_model::safe_url));
                     (
-                        "So they can read replies and send the emails you approve. Add it under Integrations in Familiar's web app (it needs a Google OAuth client), then link it here.".to_owned(),
-                        docs.map(|url| {
-                            Button::new("crew-docs", "How to")
-                                .size(ButtonSize::Small)
-                                .icon(icons::LINK)
-                                .on_click(move |_, _, cx| cx.open_url(&url))
-                                .into_any_element()
-                        }),
+                        "So they can read replies and send the emails you approve. It needs a Google OAuth client (the guide says how); once it's installed, Familiar asks who may use it.".to_owned(),
+                        Some(
+                            div()
+                                .flex()
+                                .gap(px(6.0))
+                                .when_some(docs, |el, url| {
+                                    el.child(
+                                        Button::new("crew-docs", "Guide")
+                                            .ghost()
+                                            .size(ButtonSize::Small)
+                                            .icon(icons::LINK)
+                                            .tooltip(url.clone())
+                                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                                    )
+                                })
+                                .child(
+                                    Button::new("crew-connect", "Set it up")
+                                        .size(ButtonSize::Small)
+                                        .icon(icons::PLUG)
+                                        .tooltip("Opens Integrations with Google Workspace's install form")
+                                        .on_click(|_, _, cx| crate::shell::open_page(&format!("integrations/{EMAIL_CONNECTOR}"), cx)),
+                                )
+                                .into_any_element(),
+                        ),
                     )
                 }
             };

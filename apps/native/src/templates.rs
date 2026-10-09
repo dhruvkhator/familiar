@@ -393,7 +393,7 @@ pub fn setup_summary(t: &Template, presets: &[ConnectorPreset], cx: &App) -> Any
             .flex_col()
             .gap(px(2.0))
             .child(div().text_size(px(text::SMALL)).child(join_and(&list)))
-            .child(caption("Optional. Ones you already set up in Settings are linked; add the others there.".into()));
+            .child(caption("Optional. Ones you already set up in Integrations are linked; add the others there.".into()));
         col = col.child(section(icons::WIDGET, "Connectors that help", body.into_any_element()));
     }
     col.into_any_element()

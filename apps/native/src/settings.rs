@@ -604,7 +604,7 @@ impl Render for AppSettings {
                 div().flex().flex_wrap().gap(px(12.0)).child(claude).child(codex),
                 &theme,
             ))
-            .child(section("Your account", Some("You sign in with this from the web or your phone."), account, &theme))
+            .child(section("Your account", Some("Your sign-in, here and on your phone or another computer."), account, &theme))
             .child(section("This computer", None, computer, &theme))
             .child(section(
                 "Send CRM updates to another app",

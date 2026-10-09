@@ -217,7 +217,7 @@ impl Root {
                             .text_size(px(text::LEAD))
                             .text_color(theme.muted)
                             .text_center()
-                            .child("Create your account. You'll use it to sign in from the web or your phone."),
+                            .child("Create your account. It protects your Familiar, and signs you in from your phone or another computer."),
                     )
                     .child(
                         div()

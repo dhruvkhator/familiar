@@ -85,6 +85,14 @@ impl Form {
     }
 }
 
+/// "Who may use it?" after an install: each teammate, ticked or not.
+struct Linking {
+    connector: Connector,
+    picks: Vec<(Uuid, bool)>,
+    saving: bool,
+    error: Option<String>,
+}
+
 pub struct IntegrationsPage {
     data: Entity<AppData>,
     toasts: Entity<ToastStack>,
@@ -103,6 +111,10 @@ pub struct IntegrationsPage {
     scroll: ScrollHandle,
     form_scroll: ScrollHandle,
     telegram: Entity<TelegramCard>,
+    /// After an install: who may use it.
+    linking: Option<Linking>,
+    /// The templates (which connectors each wants), to suggest who may use a new one.
+    templates: Option<Vec<familiar_client::Template>>,
 }
 
 impl IntegrationsPage {
@@ -129,10 +141,15 @@ impl IntegrationsPage {
             scroll: ScrollHandle::new(),
             form_scroll: ScrollHandle::new(),
             telegram,
+            linking: None,
+            templates: None,
         };
         let client = this.client(cx);
         crate::data::swr(&mut this, &client, "/api/connectors/presets".into(), cx, |this, p: Vec<ConnectorPreset>, _| {
             this.presets = Some(p)
+        });
+        crate::data::swr(&mut this, &client, "/api/templates".into(), cx, |this, t: Vec<familiar_client::Template>, _| {
+            this.templates = Some(t)
         });
         this.reload(cx);
         this
@@ -156,6 +173,7 @@ impl IntegrationsPage {
         self.shown = shown;
         if !shown {
             self.form = None;
+            self.linking = None;
             self.confirm_delete = None;
         } else if std::mem::take(&mut self.stale) {
             self.reload(cx);
@@ -405,7 +423,8 @@ impl IntegrationsPage {
                         let name = strip_hidden(&c.name, false);
                         p.form = None;
                         if creating {
-                            p.toast(Tone::Ok, format!("Installed {name}"), Some("Choose which teammates may use it on each one's Settings tab.".into()), cx);
+                            p.toast(Tone::Ok, format!("Installed {name}"), None, cx);
+                            p.start_linking(c, cx);
                         } else {
                             p.toast(Tone::Ok, format!("Saved {name}"), None, cx);
                         }
@@ -422,6 +441,161 @@ impl IntegrationsPage {
             });
         })
         .detach();
+    }
+
+    // ---- who may use a new connector --------------------------------------------------------------------------------
+
+    /// After installing: ask which teammates may use it, ticking the ones hired from a template that wants it (public
+    /// for the bench's shot).
+    pub fn start_linking(&mut self, c: Connector, cx: &mut Context<Self>) {
+        let wanted: HashSet<String> = self
+            .templates
+            .iter()
+            .flatten()
+            .filter(|t| c.preset.as_deref().is_some_and(|p| t.connectors.iter().any(|x| x == p)))
+            .map(|t| t.id.clone())
+            .collect();
+        let d = self.data.read(cx);
+        let picks: Vec<(Uuid, bool)> = d
+            .bots()
+            .iter()
+            .map(|b| (b.id, b.setup.as_ref().and_then(|s| s.template.as_ref()).is_some_and(|t| wanted.contains(t))))
+            .collect();
+        if picks.is_empty() {
+            return;
+        }
+        self.linking = Some(Linking { connector: c, picks, saving: false, error: None });
+        cx.notify();
+    }
+
+    /// Let the ticked teammates use the new connector (each keeps the ones it already has).
+    fn link(&mut self, cx: &mut Context<Self>) {
+        let Some(l) = self.linking.as_mut() else { return };
+        let bots: Vec<Uuid> = l.picks.iter().filter(|(_, on)| *on).map(|(b, _)| *b).collect();
+        if bots.is_empty() {
+            self.linking = None;
+            cx.notify();
+            return;
+        }
+        if l.saving {
+            return;
+        }
+        l.saving = true;
+        l.error = None;
+        let connector = l.connector.id;
+        let name = strip_hidden(&l.connector.name, false);
+        cx.notify();
+        let client = self.client(cx);
+        let count = bots.len();
+        let task = Tokio::spawn(cx, async move {
+            for b in bots {
+                let mut ids: Vec<Uuid> = client.bot_connectors(b).await?.into_iter().map(|c| c.id).collect();
+                if !ids.contains(&connector) {
+                    ids.push(connector);
+                    client.set_bot_connectors(b, &ids).await?;
+                }
+            }
+            Ok::<_, familiar_client::ApiError>(())
+        });
+        cx.spawn(async move |this, cx| {
+            let r = task.await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.message()));
+            let _ = this.update(cx, |p, cx| {
+                match r {
+                    Ok(()) => {
+                        p.linking = None;
+                        let who = if count == 1 { "1 teammate".to_owned() } else { format!("{count} teammates") };
+                        p.toast(Tone::Ok, format!("{who} can use {name} now"), Some("It still asks you before using its tools, until you allow them.".into()), cx);
+                    }
+                    Err(e) => {
+                        if let Some(l) = p.linking.as_mut() {
+                            l.saving = false;
+                            l.error = Some(e);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn linking_view(&self, l: &Linking, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        // The catalog's name when it came from there ("Google Workspace"), else its own.
+        let preset = l.connector.preset.as_deref().and_then(|p| self.presets.iter().flatten().find(|x| x.id == p));
+        let name = strip_hidden(preset.map(|p| p.name.as_str()).unwrap_or(&l.connector.name), false);
+        let d = self.data.read(cx);
+        let mut list = div().flex().flex_col().gap(px(4.0));
+        for (i, (bot, on)) in l.picks.iter().enumerate() {
+            let Some(b) = d.bot(*bot) else { continue };
+            let this = cx.entity();
+            list = list.child(
+                div()
+                    .id(("link-bot", i))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .rounded(px(RADIUS_CONTROL))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.hover))
+                    .on_click(move |_, _, cx| {
+                        this.update(cx, |p, cx| {
+                            if let Some(x) = p.linking.as_mut().and_then(|l| l.picks.get_mut(i)) {
+                                x.1 = !x.1;
+                            }
+                            cx.notify()
+                        })
+                    })
+                    .child(crate::bot_settings::checkbox(*on, &theme).mt(px(0.0)))
+                    .child(familiar_ui::mascot::Mascot::new(format!("link-face-{bot}"), crate::data::avatar_of(b), familiar_ui::mascot::MascotState::Idle, 28.0))
+                    .child(div().flex_1().min_w_0().truncate().child(strip_hidden(&b.name, false))),
+            );
+        }
+        let ticked = l.picks.iter().filter(|(_, on)| *on).count();
+        let (go, skip) = (cx.entity(), cx.entity());
+        modal(
+            "link-dialog",
+            460.0,
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(14.0))
+                .p(px(24.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(div().text_size(px(text::TITLE)).font_weight(FontWeight::SEMIBOLD).child(format!("Who may use {name}?")))
+                        .child(div().text_size(px(text::SMALL)).text_color(theme.muted).child(
+                            "Its tools show up for these teammates from their next run. They still ask you before using them, until you allow them.",
+                        )),
+                )
+                .child(div().id("link-list").max_h(px(320.0)).overflow_y_scroll().child(list))
+                .when_some(l.error.clone(), |el, e| el.child(div().text_size(px(text::SMALL)).text_color(theme.bad).child(e)))
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(Button::new("link-skip", "Not now").ghost().on_click(move |_, _, cx| {
+                            skip.update(cx, |p, cx| {
+                                p.linking = None;
+                                cx.notify()
+                            })
+                        }))
+                        .child(
+                            Button::new("link-go", if l.saving { "Saving…" } else if ticked == 0 { "Done" } else { "Let them use it" })
+                                .primary()
+                                .disabled(l.saving)
+                                .on_click(move |_, _, cx| go.update(cx, |p, cx| p.link(cx))),
+                        ),
+                )
+                .into_any_element(),
+            cx,
+        )
     }
 
     // ---- drawing ----------------------------------------------------------------------------------------------------
@@ -1066,7 +1240,7 @@ impl Render for IntegrationsPage {
             .child(connectors)
             .child(phone)
             .child(catalog);
-        let dialog = self.form.as_ref().map(|f| self.form_view(f, window, cx));
+        let dialog = self.form.as_ref().map(|f| self.form_view(f, window, cx)).or_else(|| self.linking.as_ref().map(|l| self.linking_view(l, cx)));
         div()
             .relative()
             .size_full()
@@ -1086,6 +1260,32 @@ impl Render for IntegrationsPage {
 }
 
 // ---- pieces ---------------------------------------------------------------------------------------------------------
+
+/// A dialog over the page (`width` wide), on a soft scrim.
+fn modal(id: &'static str, width: f32, content: AnyElement, cx: &App) -> AnyElement {
+    let theme = Theme::of(cx).clone();
+    div()
+        .id(id)
+        .absolute()
+        .inset_0()
+        .occlude()
+        .bg(if theme.is_dark() { gpui::black().opacity(0.5) } else { theme.ink.opacity(0.18) })
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(anim::appear(
+            SharedString::from(format!("{id}-in")),
+            div()
+                .w(px(width))
+                .rounded(px(RADIUS_DIALOG))
+                .border_1()
+                .border_color(theme.line)
+                .bg(theme.surface)
+                .shadow(theme.float_shadow())
+                .child(content),
+        ))
+        .into_any_element()
+}
 
 /// A field in the monospace face (commands, names, secrets).
 fn mono(field: impl IntoElement, theme: &Theme) -> gpui::Div {

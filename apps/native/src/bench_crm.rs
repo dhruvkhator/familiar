@@ -205,6 +205,8 @@ pub fn crew_bots(now: DateTime<Utc>, ids: &CrewIds) -> Vec<Bot> {
         status: Some(status),
         last_run_at: Some(now - Duration::minutes(last)),
         created_at: now - Duration::days(9),
+        // Hired from their templates, their checklists done (Integrations suggests them for the connectors they use).
+        setup: Some(BotSetup { template: Some(t.id.clone()), dismissed: true, ..Default::default() }),
         ..Default::default()
     };
     vec![
