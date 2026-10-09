@@ -124,6 +124,20 @@ fn templates_and_bot_setup() {
 }
 
 #[test]
+fn secrets_never_show_in_debug() {
+    let ch = NewChannel { kind: Some("telegram".into()), token: Some("123:SECRET".into()), default_bot_id: None };
+    assert_eq!(serde_json::to_value(&ch).unwrap(), json!({"kind": "telegram", "token": "123:SECRET"}));
+    let shown = format!("{ch:?} {:?}", ChannelPatch { token: Some("123:SECRET".into()), ..Default::default() });
+    assert!(!shown.contains("SECRET") && shown.contains("token: \"<set>\""), "{shown}");
+    let acct = format!("{:?}", AccountUpdate { current_password: Some("hunter22SECRET".into()), ..Default::default() });
+    assert!(!acct.contains("SECRET"), "{acct}");
+    let mut s = ConnectorSecrets::default();
+    s.env.insert("API_KEY".into(), "SECRET".into());
+    let shown = format!("{s:?}");
+    assert!(shown.contains("API_KEY") && !shown.contains("SECRET"), "{shown}");
+}
+
+#[test]
 fn request_bodies_skip_unset() {
     assert_eq!(serde_json::to_value(NewBot { name: Some("x".into()), ..Default::default() }).unwrap(), json!({"name": "x"}));
     assert_eq!(serde_json::to_value(BotPatch { avatar: Some(serde_json::Value::Null), ..Default::default() }).unwrap(), json!({"avatar": null}));

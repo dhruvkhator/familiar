@@ -4,8 +4,9 @@
 //! on/off, replace the token, and disconnect with a confirmation.
 //!
 //! The bot token is write-only: a masked field, read into a [`Zeroizing`] string only to send it (the request body is
-//! wiped once it went), never shown again and never logged. The field, with what was typed, is dropped once it is
-//! saved and when the page leaves the screen. Live: a `channels` notice (the chat pairing) refreshes the card.
+//! wiped once it went; the client's JSON and HTTP buffers are freed unwiped), never shown again and never logged. The
+//! field, with what was typed, is dropped once it is saved and when the page leaves the screen. Live: a `channels`
+//! notice (the chat pairing) refreshes the card.
 
 use familiar_client::{Channel, ChannelPatch, NewChannel};
 use familiar_ui::anim;

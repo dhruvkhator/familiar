@@ -228,8 +228,12 @@ impl FilesTab {
                     if let Some(dir) = write_to.parent() {
                         std::fs::create_dir_all(dir).map_err(|e| format!("Couldn't make the folder: {e}"))?;
                     }
-                    std::fs::write(&write_to, &bytes).map_err(|e| format!("Couldn't write the file: {e}"))?;
-                    mark_downloaded(&write_to);
+                    // Opened before and still open in its app (which may lock it): the same bytes are already there.
+                    let same = open && std::fs::read(&write_to).is_ok_and(|old| old == bytes.as_ref());
+                    if !same {
+                        std::fs::write(&write_to, &bytes).map_err(|e| format!("Couldn't write the file: {e}"))?;
+                        mark_downloaded(&write_to);
+                    }
                     Ok::<_, String>(())
                 })
             });
@@ -568,9 +572,13 @@ pub fn safe_file_name(name: &str, mime: &str) -> String {
         Some((a, b)) if !a.is_empty() => (a.to_owned(), Some(b.to_owned())),
         _ => (s.clone(), None),
     };
-    let reserved = ["CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"];
-    let base = stem.split('.').next().unwrap_or("").to_ascii_uppercase();
-    let stem = if reserved.contains(&base.as_str()) { format!("_{stem}") } else { stem };
+    // Windows' device names (trailing spaces and dots don't count; COM/LPT with 0-9 or a superscript digit).
+    let base = stem.split('.').next().unwrap_or("").trim_end_matches([' ', '.']).to_uppercase();
+    let device = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || ((base.starts_with("COM") || base.starts_with("LPT"))
+            && base.chars().count() == 4
+            && base.chars().last().is_some_and(|c| c.is_ascii_digit() || matches!(c, '¹' | '²' | '³')));
+    let stem = if device { format!("_{stem}") } else { stem };
     let ext = ext.map(|e| e.chars().take(16).collect::<String>());
     let room = 120usize.saturating_sub(ext.as_ref().map(|e| e.chars().count() + 1).unwrap_or(0));
     let stem: String = stem.chars().take(room.max(1)).collect();
@@ -656,6 +664,11 @@ mod tests {
         assert_eq!(safe_file_name("what?<now>.md", ""), "what__now_.md");
         assert_eq!(safe_file_name("CON.txt", ""), "_CON.txt");
         assert_eq!(safe_file_name("nul", "text/plain"), "_nul.txt");
+        assert_eq!(safe_file_name("nul .txt", ""), "_nul .txt");
+        assert_eq!(safe_file_name("CONOUT$.log", ""), "_CONOUT$.log");
+        assert_eq!(safe_file_name("com0.txt", ""), "_com0.txt");
+        assert_eq!(safe_file_name("LPT¹.txt", ""), "_LPT¹.txt");
+        assert_eq!(safe_file_name("company.txt", ""), "company.txt");
         assert_eq!(safe_file_name("screenshot", "image/png"), "screenshot.png");
         assert_eq!(safe_file_name("...", ""), "file");
         assert_eq!(safe_file_name("trailing. . ", ""), "trailing");

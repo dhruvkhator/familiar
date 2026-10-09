@@ -959,6 +959,22 @@ macro_rules! body {
     };
 }
 
+macro_rules! secret_body {
+    ($(#[$m:meta])* $name:ident { $($f:ident : $t:ty),* $(,)? }) => {
+        $(#[$m])*
+        #[derive(Clone, Default, Serialize)]
+        pub struct $name { $(#[serde(skip_serializing_if = "Option::is_none")] pub $f: Option<$t>,)* }
+        /// Carries a secret: `{:?}` says which fields are set, never their values.
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct(stringify!($name))
+                    $(.field(stringify!($f), &if self.$f.is_some() { "<set>" } else { "<unset>" }))*
+                    .finish()
+            }
+        }
+    };
+}
+
 body!(NewBot { name: String, slug: String, persona: String, model: String, engine: String, avatar: Avatar });
 body!(
     /// `avatar: Some(Value::Null)` clears the avatar. `desktop`: "Can use this PC's desktop".
@@ -978,9 +994,9 @@ body!(NewRule { bot_id: Uuid, pattern: String, decision: String, note: String })
 body!(MemoryPatch { content: String, status: String });
 body!(NewTrigger { name: String, prompt: String, kind: String });
 body!(TriggerPatch { name: String, prompt: String, kind: String, enabled: bool });
-body!(NewChannel { kind: String, token: String, default_bot_id: Uuid });
-body!(ChannelPatch { token: String, default_bot_id: Uuid, enabled: bool });
-body!(AccountUpdate { current_password: String, email: String, new_password: String });
+secret_body!(NewChannel { kind: String, token: String, default_bot_id: Uuid });
+secret_body!(ChannelPatch { token: String, default_bot_id: Uuid, enabled: bool });
+secret_body!(AccountUpdate { current_password: String, email: String, new_password: String });
 body!(
     /// Hire from a template; unset fields take the template's.
     FromTemplate {
@@ -1050,10 +1066,17 @@ body!(
 );
 
 /// Secrets for a connector: env vars (stdio) and/or headers (http). Write-only.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 pub struct ConnectorSecrets {
     pub env: std::collections::BTreeMap<String, String>,
     pub headers: std::collections::BTreeMap<String, String>,
+}
+
+/// `{:?}` names the secrets, never their values.
+impl std::fmt::Debug for ConnectorSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectorSecrets").field("env", &self.env.keys().collect::<Vec<_>>()).field("headers", &self.headers.keys().collect::<Vec<_>>()).finish()
+    }
 }
 body!(NewConnector {
     name: String, preset: String, transport: String, command: String, args: Vec<String>,

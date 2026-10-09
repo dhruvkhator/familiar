@@ -5,10 +5,11 @@
 //! ([`crate::telegram`]).
 //!
 //! Secrets are write-only: typed into masked fields, read out only to send them (held in [`Zeroizing`] strings, and
-//! wiped from the request body once it went), never shown again (the API reports their names only) and never logged.
-//! The form, with whatever was typed in it, is dropped when it closes and when the page leaves the screen. A server's
-//! command, arguments and address are shown as stored, with hidden characters written out, under a plain warning that
-//! the command runs on this PC. Live: a `connectors` notice refreshes the list while the page is on screen.
+//! wiped from the request struct once it went; the client's JSON and HTTP buffers are freed unwiped), never shown again
+//! (the API reports their names only, `{:?}` of the request too) and never logged. The form, with whatever was typed
+//! in it, is dropped when it closes and when the page leaves the screen. A server's command, arguments and address are
+//! shown as stored (a password in a connection string as •••), with hidden characters written out, under a plain
+//! warning that the command runs on this PC. An edit sends the arguments only when they changed. Live: a `connectors` notice refreshes the list while the page is on screen.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -659,7 +660,7 @@ impl IntegrationsPage {
         let busy = self.busy.contains(&id);
         let name = strip_hidden(&c.name, false);
         let http = c.transport == "http";
-        let target = if http { c.url.clone().unwrap_or_default() } else { command_line(c) };
+        let target = masked(&if http { c.url.clone().unwrap_or_default() } else { command_line(c) });
         let (target, hidden) = reveal(&target, false);
         let preset_name = c.preset.as_deref().and_then(|p| self.presets.iter().flatten().find(|x| x.id == p)).map(|p| p.name.clone());
         let (t_on, t_edit, t_del) = (cx.entity(), cx.entity(), cx.entity());
@@ -951,7 +952,7 @@ impl IntegrationsPage {
             let cmd = if f.fixed() { fixed_box(&command, &theme) } else { mono(text_input::field("conn-cmd", &f.command, 38.0, window, cx), &theme).into_any_element() };
             let args_hint = match &preset {
                 Some(p) if p.description.to_lowercase().contains("replace the last") => strip_hidden(&p.description, false),
-                _ => "Separated by spaces; put quotes around one that has spaces in it.".to_owned(),
+                _ => "Separated by spaces; put quotes around one that has spaces in it (and write a quote inside one as \\\").".to_owned(),
             };
             body = body
                 .child(div().flex().flex_col().gap(px(6.0)).child(label("Command")).child(cmd))
@@ -1352,7 +1353,7 @@ fn warning(http: bool, command: &str, args: &str, url: &str, theme: &Theme) -> A
             },
         )
     } else {
-        let line = [command, args].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" ");
+        let line = masked(&[command, args].iter().filter(|s| !s.is_empty()).copied().collect::<Vec<_>>().join(" "));
         (
             "This runs a program on this PC".to_owned(),
             if line.is_empty() {
@@ -1451,7 +1452,8 @@ fn build(f: &Form, cx: &App) -> Result<Request, String> {
                 name: Some(name),
                 // A catalog entry's command and address stay as they are.
                 command: if f.fixed() { None } else { command },
-                args,
+                // Sent only when they changed (an edit of the name or a secret leaves them exactly as stored).
+                args: args.filter(|a| c.args.as_deref() != Some(a.as_slice())),
                 url: if f.fixed() { None } else { url },
                 secrets,
                 ..Default::default()
@@ -1506,13 +1508,35 @@ pub fn url_problem(url: &str) -> Option<&'static str> {
     }
 }
 
-/// Arguments as typed: split on spaces, except inside double quotes (`"C:\My files"` stays one).
+/// Arguments as typed, read the way Windows programs read their command line: split on spaces except inside double
+/// quotes (`"C:\My files"` stays one); `\"` is a quote inside an argument, and backslashes count only before a quote
+/// (`2n` of them then a quote: `n` backslashes and the quote opens or closes; `2n+1`: `n` and a literal quote).
 pub fn split_args(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let (mut quoted, mut any) = (false, false);
-    for c in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
+            '\\' => {
+                let mut n = 1;
+                while chars.peek() == Some(&'\\') {
+                    chars.next();
+                    n += 1;
+                }
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    cur.extend(std::iter::repeat_n('\\', n / 2));
+                    if n % 2 == 1 {
+                        cur.push('"');
+                    } else {
+                        quoted = !quoted;
+                    }
+                } else {
+                    cur.extend(std::iter::repeat_n('\\', n));
+                }
+                any = true;
+            }
             '"' => {
                 quoted = !quoted;
                 any = true;
@@ -1535,14 +1559,59 @@ pub fn split_args(s: &str) -> Vec<String> {
     out
 }
 
-/// Arguments back as text [`split_args`] reads the same: one with a space (or nothing) in double quotes.
+/// Arguments back as text [`split_args`] reads the same: one with a space, a quote (or nothing) in double quotes,
+/// quotes inside written `\"` and the backslashes before them (or before the closing quote) doubled.
 pub fn join_args(args: &[String]) -> String {
     args.iter()
-        .map(|a| if a.is_empty() || a.chars().any(char::is_whitespace) { format!("\"{a}\"") } else { a.clone() })
+        .map(|a| {
+            if !a.is_empty() && !a.chars().any(|c| c.is_whitespace() || c == '"') {
+                return a.clone();
+            }
+            let mut out = String::from('"');
+            let mut slashes = 0;
+            for c in a.chars() {
+                match c {
+                    '\\' => slashes += 1,
+                    '"' => {
+                        out.extend(std::iter::repeat_n('\\', slashes * 2 + 1));
+                        out.push('"');
+                        slashes = 0;
+                        continue;
+                    }
+                    _ => {
+                        out.extend(std::iter::repeat_n('\\', slashes));
+                        slashes = 0;
+                        out.push(c);
+                        continue;
+                    }
+                }
+            }
+            out.extend(std::iter::repeat_n('\\', slashes * 2));
+            out.push('"');
+            out
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
 
+/// A command line or address as shown: any password in a web address (`postgresql://user:pass@host/db`) hidden as
+/// `•••` (the Postgres entry puts its connection string in the arguments).
+pub fn masked(s: &str) -> String {
+    s.split(' ')
+        .map(|w| {
+            let bare = w.trim_matches('"');
+            match reqwest::Url::parse(bare) {
+                Ok(mut u) if u.password().is_some_and(|p| !p.is_empty()) => {
+                    let _ = u.set_password(Some("•••"));
+                    // The address writes the dots percent-encoded; shown as dots.
+                    w.replace(bare, &u.as_str().replacen("%E2%80%A2%E2%80%A2%E2%80%A2", "•••", 1))
+                }
+                _ => w.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 /// How an installed program connector runs: its command and arguments.
 pub fn command_line(c: &Connector) -> String {
     let args = join_args(c.args.as_deref().unwrap_or_default());
@@ -1636,6 +1705,13 @@ mod tests {
         assert_eq!(split_args(&join_args(&args)), args);
         let c = Connector { command: Some("npx".into()), args: Some(vec!["-y".into(), "a b".into()]), ..Default::default() };
         assert_eq!(command_line(&c), r#"npx -y "a b""#);
+        // Quotes and backslashes survive the round trip (JSON settings, a folder ending in a backslash).
+        let hard: Vec<String> = [r#"{"a":1}"#, r"C:\Team notes\", r#"say "hi""#, r"a\\b", r#"x\"y"#].iter().map(|s| s.to_string()).collect();
+        assert_eq!(split_args(&join_args(&hard)), hard);
+        assert_eq!(split_args(r#"--json "{\"a\":1}""#), ["--json", r#"{"a":1}"#]);
+        // A password in a connection string isn't shown.
+        assert_eq!(masked("npx -y server postgresql://sam:s3cret@db:5432/app"), "npx -y server postgresql://sam:•••@db:5432/app");
+        assert_eq!(masked("uvx notes-mcp"), "uvx notes-mcp");
     }
 
     #[test]

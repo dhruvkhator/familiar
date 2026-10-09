@@ -699,9 +699,49 @@ fn danger_note(theme: &Theme) -> AnyElement {
 
 // ---- pure ---------------------------------------------------------------------------------------------------------
 
-/// A rule that lets a teammate run anything without asking.
+/// A rule that lets a teammate run any command without asking: it matches Bash with any command, the way the engine
+/// matches rules (`*` in the tool name or the argument matches anything: `*`, `Bash`, `Bash(*)`, `B*`, `*(*)`…).
 pub fn dangerous(pattern: &str, decision: RuleDecision) -> bool {
-    decision == RuleDecision::Allow && matches!(pattern.trim(), "*" | "Bash" | "Bash(*)")
+    decision == RuleDecision::Allow && any_command(pattern)
+}
+
+/// The pattern covers Bash with any command at all.
+pub fn any_command(pattern: &str) -> bool {
+    let p = pattern.trim();
+    if p == "*" {
+        return true;
+    }
+    let (name, arg) = match p.split_once('(') {
+        Some((n, rest)) => (n, rest.strip_suffix(')')),
+        None => (p, None),
+    };
+    // Two unrelated commands: a pattern that matches both matches any command.
+    glob(name, "Bash") && arg.is_none_or(|a| glob(a, "x7q; rm -rf zz") && glob(a, "git status"))
+}
+
+/// The engine's glob: `*` matches any run of characters; everything else is literal.
+fn glob(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+    let mut rest = text;
+    for (i, part) in parts.iter().enumerate() {
+        if i == 0 {
+            match rest.strip_prefix(part) {
+                Some(r) => rest = r,
+                None => return false,
+            }
+        } else if i == parts.len() - 1 {
+            return rest.ends_with(part);
+        } else {
+            match rest.find(part) {
+                Some(at) => rest = &rest[at + part.len()..],
+                None => return false,
+            }
+        }
+    }
+    true
 }
 
 /// What a rule's pattern covers, after "When a teammate wants to …".
@@ -736,6 +776,13 @@ pub fn pattern_words(pattern: &str) -> String {
             (s, "" | "*") => format!("use any of {s}'s tools"),
             (s, t) if t.contains('*') => format!("use {s}'s tools like {}", tick(t)),
             (s, _) => format!("use {s}'s {words}"),
+        };
+    }
+    if name.contains('*') {
+        return if any_command(&p) {
+            format!("run any command, and use any tool named like {}", tick(&p))
+        } else {
+            format!("use tools named like {}", tick(&p))
         };
     }
     let base = match name.as_str() {
@@ -787,6 +834,15 @@ mod tests {
             assert!(!dangerous(p, RuleDecision::Ask), "{p}");
         }
         assert!(!dangerous("Bash(git status*)", RuleDecision::Allow));
+        // Patterns the engine reads as "any command" too.
+        for p in ["B*", "Ba*", "Bash(**)", "*(*)", "**", "*sh"] {
+            assert!(dangerous(p, RuleDecision::Allow), "{p}");
+        }
+        for p in ["Bash(git *)", "Edit", "W*", "mcp__github", "Bash(*status)"] {
+            assert!(!dangerous(p, RuleDecision::Allow), "{p}");
+        }
+        assert_eq!(pattern_words("B*"), "run any command, and use any tool named like “B*”");
+        assert_eq!(pattern_words("Web*"), "use tools named like “Web*”");
         assert_eq!(TIERS.iter().map(|(d, _, _)| d.as_str()).collect::<Vec<_>>(), ["allow", "review", "ask", "deny"]);
     }
 }
