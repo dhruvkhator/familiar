@@ -289,11 +289,17 @@ pub fn same_text(sent: &str, approved: &str) -> bool {
     norm(sent) == norm(approved)
 }
 
-/// Absent in effect: null, false, an empty (or blank) string, an empty list or object.
+/// A value that can go into an email header as it is: no line breaks or other control characters (which could start
+/// another header, a `Bcc:` say), at most one header line long.
+fn header_safe(s: &str) -> bool {
+    s.len() <= 998 && !s.chars().any(char::is_control)
+}
+
+/// Absent in effect: null, false, an empty string (or only spaces), an empty list or object.
 fn blank(v: &Value) -> bool {
     match v {
         Value::Null | Value::Bool(false) => true,
-        Value::String(s) => s.trim().is_empty(),
+        Value::String(s) => s.chars().all(|c| c == ' '),
         Value::Array(a) => a.is_empty(),
         Value::Object(o) => o.is_empty(),
         _ => false,
@@ -308,6 +314,9 @@ fn recipients(v: &Value) -> Option<BTreeMap<String, Option<String>>> {
         Value::Array(a) => a.iter().map(Value::as_str).collect::<Option<_>>()?,
         _ => return None,
     };
+    if !parts.iter().all(|p| header_safe(p)) {
+        return None;
+    }
     let mut out = BTreeMap::new();
     for part in parts.iter().flat_map(|p| p.split([',', ';'])).map(str::trim).filter(|p| !p.is_empty()) {
         let (name, addr) = match (part.find('<'), part.rfind('>')) {
@@ -360,6 +369,11 @@ pub fn send_matches(draft: &Value, tool: &str, input: &Value) -> Result<Via, &'s
                 _ => return Err("this call has fields Familiar doesn't check"),
             }
         }
+        // Typed key by key, a line break is an Enter press (which can send); otherwise the text is filled in whole.
+        let breaks = fields.get("text").and_then(Value::as_str).is_some_and(|t| t.contains(['\n', '\r']));
+        if fields.get("slowly") == Some(&Value::Bool(true)) && breaks {
+            return Err("typed key by key, its line breaks would press Enter, which can send it");
+        }
         return if fields.contains_key("text") { Ok(Via::BrowserType) } else { Err("this call types no text") };
     }
     let spec = email_tool(tool).ok_or("Familiar can't check what this tool sends")?;
@@ -373,8 +387,9 @@ pub fn send_matches(draft: &Value, tool: &str, input: &Value) -> Result<Via, &'s
             "to" if same_recipients(v, &draft["to"]) => {}
             "to" => return Err("the recipients differ from the approved ones"),
             "subject" => {
+                // Only spaces around it are ignored: a line break in a header could start another header.
                 let sent = if v.is_null() { Some("") } else { v.as_str() };
-                if sent.map(str::trim) != Some(draft["subject"].as_str().unwrap_or_default().trim()) {
+                if sent.map(|s| s.trim_matches(' ')) != Some(draft["subject"].as_str().unwrap_or_default().trim_matches(' ')) {
                     return Err("the subject differs from the approved one");
                 }
             }
@@ -384,7 +399,8 @@ pub fn send_matches(draft: &Value, tool: &str, input: &Value) -> Result<Via, &'s
             k if spec.empty.contains(&k) => return Err("it adds recipients, attachments or an HTML version"),
             k if k == spec.plain.0 && (v.is_null() || v.as_str() == Some(spec.plain.1)) => {}
             k if k == spec.plain.0 => return Err("it isn't sent as plain text"),
-            k if spec.free.contains(&k) && (v.is_string() || v.is_null()) => {}
+            k if spec.free.contains(&k) && (v.is_null() || v.as_str().is_some_and(header_safe)) => {}
+            k if spec.free.contains(&k) => return Err("a header field has line breaks or other control characters"),
             _ => return Err("this call has fields Familiar doesn't check"),
         }
         seen.insert(key);
@@ -627,6 +643,13 @@ mod tests {
         // a different subject, or none
         assert_eq!(miss(&|g| g["subject"] = json!("Quick question!")), Err("the subject differs from the approved one"));
         assert_eq!(miss(&|g| { g.as_object_mut().unwrap().remove("subject"); }), Err("the subject differs from the approved one"));
+        // header injection: a line break in a recipient, the subject or a header field could add a `Bcc:`
+        for to in ["sam@acme.com, kim@acme.com,\r\n", "sam@acme.com, kim@acme.com\r\nBcc: eve@evil.io", "sam@acme.com,\nkim@acme.com"] {
+            assert_eq!(miss(&|g| g["to"] = json!(to)), Err("the recipients differ from the approved ones"), "{to:?}");
+        }
+        assert_eq!(miss(&|g| g["subject"] = json!("Quick question\r\n")), Err("the subject differs from the approved one"));
+        assert_eq!(miss(&|g| g["references"] = json!("<a@b>\r\nBcc: eve@evil.io")), Err("a header field has line breaks or other control characters"));
+        assert_eq!(miss(&|g| g["cc"] = json!("\r\n")), Err("it adds recipients, attachments or an HTML version"));
         // an attachment, HTML, a field Familiar doesn't know
         assert_eq!(miss(&|g| g["attachments"] = json!([{ "path": "a.pdf" }])), Err("it adds recipients, attachments or an HTML version"));
         assert_eq!(miss(&|g| g["body_format"] = json!("html")), Err("it isn't sent as plain text"));
@@ -654,13 +677,22 @@ mod tests {
         let post = json!({ "kind": "post", "channel": "X", "body": "Drafts ship today." });
         let typed = |v: Value| send_matches(&post, BROWSER_TYPE, &v);
         assert_eq!(typed(json!({ "element": "Post text", "ref": "e12", "text": "Drafts ship today." })), Ok(Via::BrowserType));
-        assert_eq!(typed(json!({ "element": "Post text", "ref": "e12", "text": "Drafts ship today.\n", "slowly": true, "submit": false })), Ok(Via::BrowserType));
+        assert_eq!(typed(json!({ "element": "Post text", "ref": "e12", "text": "Drafts ship today.\n", "slowly": false, "submit": false })), Ok(Via::BrowserType));
+        assert_eq!(typed(json!({ "ref": "e12", "text": "Drafts ship today.", "slowly": true })), Ok(Via::BrowserType));
         assert_eq!(typed(json!({ "ref": "e12", "text": "Drafts ship today!" })), Err("the text differs from the approved one"));
         assert_eq!(typed(json!({ "ref": "e12", "text": "Drafts ship today. Also: buy now" })), Err("the text differs from the approved one"));
         // Enter after typing can post it: that's the click, which asks
         assert_eq!(typed(json!({ "ref": "e12", "text": "Drafts ship today.", "submit": true })), Err("it would press Enter after typing, which can send it"));
         assert_eq!(typed(json!({ "ref": "e12", "text": "Drafts ship today.", "extra": 1 })), Err("this call has fields Familiar doesn't check"));
         assert_eq!(typed(json!({ "ref": "e12" })), Err("this call types no text"));
+        // typed key by key, a line break is Enter
+        let two_lines = json!({ "kind": "dm", "channel": "LinkedIn", "to": "https://linkedin.com/in/sam", "body": "Hi Sam,\nthanks!" });
+        assert_eq!(send_matches(&two_lines, BROWSER_TYPE, &json!({ "ref": "e1", "text": "Hi Sam,\nthanks!" })), Ok(Via::BrowserType));
+        assert_eq!(
+            send_matches(&two_lines, BROWSER_TYPE, &json!({ "ref": "e1", "text": "Hi Sam,\nthanks!", "slowly": true })),
+            Err("typed key by key, its line breaks would press Enter, which can send it")
+        );
+        assert_eq!(typed(json!({ "ref": "e12", "text": "Drafts ship today.\n", "slowly": true })), Err("typed key by key, its line breaks would press Enter, which can send it"));
         // any kind of draft can be typed; one with media can't
         let mut with_media = post.clone();
         with_media["media"] = json!(["media/a.png"]);

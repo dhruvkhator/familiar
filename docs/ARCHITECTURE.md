@@ -425,11 +425,14 @@ connector's send (or the browser typing it).
     must be absent or empty; the format field, when present, plain text (`body_format: plain`, `mimeType: text/plain`).
     Subject: equal (surrounding spaces aside) to the approved one; a draft without one may not gain one. Free: the
     sending account (`user_google_email`, one the owner connected) and threading fields (`thread_id`, `in_reply_to`,
-    `references`, `threadId`, `inReplyTo`). Any other field asks. Draft-creating tools (`draft_gmail_message`), Slack
+    `references`, `threadId`, `inReplyTo`). Any other field asks. Header injection: a line break or other control
+    character in a recipient, the subject, an "empty" field or a free field (which could start a `Bcc:` header)
+    means no match. Draft-creating tools (`draft_gmail_message`), Slack
     and anything unrecognised ask as before.
   - **The browser typing the approved text** (`mcp__browser__browser_type`, any draft kind): `text` equal, `element`
     / `ref` / `slowly` free, `submit` must be absent or false (Enter can post or send, which is the unverifiable
-    part). Typing is not sending: the **click** on Post/Send still asks. Familiar can't tell what a click (or Enter)
+    part), and text with a line break may not be typed `slowly` (key by key a line break is an Enter press; otherwise
+    the text is filled in whole). Typing is not sending: the **click** on Post/Send still asks. Familiar can't tell what a click (or Enter)
     lands on — the conversation, the account, a different button — so allowing "one click after the type" would hand
     every approved draft a free unverifiable click on whatever the page offers. That click's card says the draft's text
     was just typed in as approved and to check the live view.
