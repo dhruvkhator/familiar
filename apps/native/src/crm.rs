@@ -1320,7 +1320,7 @@ impl CrmPage {
     /// Room for the table's columns: (wide, medium).
     fn widths(window: &Window) -> (bool, bool) {
         let w = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH - 64.0;
-        (w >= 980.0, w >= 820.0)
+        (w >= 860.0, w >= 700.0)
     }
 
     /// A table: its header and a virtualised body of `count` rows drawn by `rows`.
@@ -1446,6 +1446,7 @@ impl CrmPage {
                         cell(None, false).child(
                             div()
                                 .flex()
+                                .min_w_0()
                                 .items_center()
                                 .gap(px(12.0))
                                 .child(monogram(&c.name, false, &theme))
@@ -1491,6 +1492,7 @@ impl CrmPage {
                         cell(None, false).child(
                             div()
                                 .flex()
+                                .min_w_0()
                                 .items_center()
                                 .gap(px(12.0))
                                 .child(monogram(&c.name, true, &theme))
@@ -2499,7 +2501,7 @@ impl Render for CrmPage {
 
 /// A table cell: a fixed width (or the rest of the row), left or right aligned.
 fn cell(width: Option<f32>, right: bool) -> gpui::Div {
-    let c = div().flex().items_center().min_w_0().when(right, |el| el.justify_end());
+    let c = div().flex().items_center().min_w_0().overflow_hidden().when(right, |el| el.justify_end());
     match width {
         Some(w) => c.w(px(w)).flex_none(),
         None => c.flex_1(),
@@ -2611,7 +2613,8 @@ pub fn dialog(id: &'static str, content: impl IntoElement, cx: &App) -> AnyEleme
         .absolute()
         .inset_0()
         .occlude()
-        .bg(theme.ink.opacity(if theme.is_dark() { 0.45 } else { 0.18 }))
+        // Dark pages dim with black (their ink is light).
+        .bg(if theme.is_dark() { gpui::black().opacity(0.5) } else { theme.ink.opacity(0.18) })
         .flex()
         .items_center()
         .justify_center()

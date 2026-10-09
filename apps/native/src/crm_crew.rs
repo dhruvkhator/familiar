@@ -560,7 +560,9 @@ impl CrewHire {
 
         // Set up: the sites to sign in to, grouped by site.
         let mut rows: Vec<AnyElement> = Vec::new();
-        let mut sites: Vec<(String, String, Vec<(Uuid, String, bool)>)> = Vec::new();
+        // (site, sign-in page, [(teammate, name, signed in)])
+        type Site = (String, String, Vec<(Uuid, String, bool)>);
+        let mut sites: Vec<Site> = Vec::new();
         for b in &bots {
             for l in b.setup.iter().flat_map(|s| &s.logins) {
                 match sites.iter_mut().find(|(s, _, _)| *s == l.site) {

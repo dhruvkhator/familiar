@@ -85,7 +85,7 @@ pub fn thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -109,7 +109,7 @@ pub fn money(cents: i64, currency: &str) -> String {
     let neg = cents < 0;
     let c = cents.unsigned_abs();
     let whole = thousands(c / 100);
-    let amount = if c % 100 == 0 { whole } else { format!("{whole}.{:02}", c % 100) };
+    let amount = if c.is_multiple_of(100) { whole } else { format!("{whole}.{:02}", c % 100) };
     let amount = match currency_sign(currency) {
         Some(sign) => format!("{sign}{amount}"),
         None => format!("{} {amount}", currency.to_ascii_uppercase()),
@@ -505,6 +505,13 @@ pub fn webhook_url_problem(s: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// A link from a CRM record that may be opened in the browser: only `http` / `https` (records are partly copied from
+/// web pages; the API checks this too). Returns the normalised URL.
+pub fn safe_url(s: &str) -> Option<String> {
+    let url = reqwest::Url::parse(s.trim()).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.to_string())
+}
+
 /// The stage menu's keyboard: up and down move (wrapping), Home and End jump, a digit picks that stage. `None`: the
 /// key isn't the menu's.
 pub fn menu_step(at: usize, len: usize, key: &str) -> Option<usize> {
@@ -675,6 +682,15 @@ mod tests {
             assert!(webhook_url_problem(bad).is_err(), "{bad}");
         }
         assert!(webhook_url_problem("https://192.168.1.20/hook").unwrap_err().contains("local network"));
+    }
+
+    #[test]
+    fn only_web_links_open() {
+        assert_eq!(safe_url(" https://acme.com/careers ").as_deref(), Some("https://acme.com/careers"));
+        assert!(safe_url("http://acme.com").is_some());
+        for bad in ["javascript:alert(1)", "file:///C:/Windows/system32", "acme.com", "ms-settings:", "httpx://a.b", ""] {
+            assert_eq!(safe_url(bad), None, "{bad}");
+        }
     }
 
     #[test]

@@ -489,8 +489,13 @@ impl RecordPanel {
                     p.changes = changes;
                 }
                 cx.notify();
+                // Notices that came meanwhile: read once more, after a breath (a teammate may be writing a lot).
                 if std::mem::take(&mut p.again) {
-                    p.reload(cx);
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(std::time::Duration::from_millis(700)).await;
+                        let _ = this.update(cx, |p, cx| p.reload(cx));
+                    })
+                    .detach();
                 }
             });
         }));
@@ -816,7 +821,7 @@ impl RecordPanel {
             (_, Some(v)) => div().text_size(px(text::SMALL)).text_color(theme.ink).child(v.clone()).into_any_element(),
             (_, None) => div().text_size(px(text::SMALL)).text_color(theme.muted.opacity(0.7)).child("Add…").into_any_element(),
         };
-        let link = shown.clone().filter(|v| matches!(f, Field::Website | Field::Linkedin) && v.starts_with("http"));
+        let link = shown.as_deref().filter(|_| matches!(f, Field::Website | Field::Linkedin)).and_then(model::safe_url);
         div()
             .id(("crm-field", f as usize))
             .flex()
@@ -858,7 +863,7 @@ impl RecordPanel {
             .rounded(px(RADIUS_CONTROL))
             .border_1()
             .border_color(if on { theme.bad.opacity(0.4) } else { theme.line })
-            .bg(if on { theme.bad_soft } else { theme.surface })
+            .bg(if on { theme.bad_soft.opacity(if theme.is_dark() { 0.55 } else { 1.0 }) } else { theme.surface })
             .child(
                 div()
                     .flex()
@@ -1046,7 +1051,7 @@ impl RecordPanel {
             let (face, who) = self.who(&a.actor_kind, a.bot_id, a.bot_name.as_deref(), 18.0, cx);
             let waiting = a.approval_id.is_some_and(|id| pending.contains(&id));
             let needs = cx.entity();
-            let url = a.url.clone().filter(|u| u.starts_with("http"));
+            let url = a.url.as_deref().and_then(model::safe_url);
             let last = i + 1 == list.len();
             col = col.child(
                 div()
@@ -1433,7 +1438,7 @@ impl RecordPanel {
         if !sources.is_empty() {
             let mut s = div().flex().flex_col().gap(px(2.0));
             for (i, u) in sources.iter().enumerate() {
-                let url = u.clone();
+                let url = model::safe_url(u);
                 s = s.child(
                     div()
                         .id(("crm-src", i))
@@ -1443,8 +1448,7 @@ impl RecordPanel {
                         .py(px(2.0))
                         .text_size(px(text::CAPTION))
                         .text_color(theme.accent)
-                        .cursor_pointer()
-                        .on_click(move |_, _, cx| cx.open_url(&url))
+                        .when_some(url, |el, url| el.cursor_pointer().on_click(move |_, _, cx| cx.open_url(&url)))
                         .child(icon(icons::LINK).size(px(12.0)).text_color(theme.accent))
                         .child(div().truncate().child(excerpt(u.trim_start_matches("https://").trim_start_matches("http://"), 60))),
                 );

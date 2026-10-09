@@ -71,6 +71,9 @@ fn stage_of(i: usize) -> DealStage {
     SPREAD[(i * 7) % SPREAD.len()]
 }
 
+/// A hired crew: its teammates and their schedules (for the fixture).
+pub type Hire = (Vec<Bot>, Vec<Schedule>);
+
 /// The crew's teammates as the bench shows them (avatars from their templates).
 pub struct CrewIds {
     pub lead: Uuid,
@@ -332,7 +335,7 @@ impl Crm {
                 },
                 stage,
                 stage_changed_at: ago(30 + i as i64 * 41),
-                value_cents: (i % 6 != 2).then_some(((i * 7919) % 70 + 5) as i64 * 1_000_00),
+                value_cents: (i % 6 != 2).then_some(((i * 7919) % 70 + 5) as i64 * 100_000),
                 currency: "USD".into(),
                 next_step: open.then(|| NEXT[i % NEXT.len()].into()),
                 next_step_at: open.then(|| now + Duration::days((i as i64 % 15) - 4)),
@@ -441,7 +444,7 @@ impl Crm {
             .iter()
             .map(|s| {
                 let mut of: Vec<&CrmDeal> = self.deals.iter().filter(|d| d.stage == *s).collect();
-                of.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+                of.sort_by_key(|d| std::cmp::Reverse(d.updated_at));
                 PipelineStage {
                     stage: *s,
                     count: of.len() as i64,
@@ -530,7 +533,7 @@ impl Crm {
                 match qv("sort") {
                     Some("name") => v.sort_by_key(|c| c.name.to_lowercase()),
                     Some("fit") => v.sort_by_key(|c| std::cmp::Reverse(c.fit_score.unwrap_or(-1))),
-                    _ => v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)),
+                    _ => v.sort_by_key(|x| std::cmp::Reverse(x.updated_at)),
                 }
                 let (a, b) = page(v.len());
                 json!(v[a..b])
@@ -551,7 +554,7 @@ impl Crm {
                     .collect();
                 match qv("sort") {
                     Some("name") => v.sort_by_key(|c| c.name.to_lowercase()),
-                    _ => v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)),
+                    _ => v.sort_by_key(|x| std::cmp::Reverse(x.updated_at)),
                 }
                 let (a, b) = page(v.len());
                 json!(v[a..b])
@@ -571,7 +574,7 @@ impl Crm {
                     .collect();
                 match qv("sort") {
                     Some("name") => v.sort_by_key(|d| d.title.to_lowercase()),
-                    _ => v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)),
+                    _ => v.sort_by_key(|x| std::cmp::Reverse(x.updated_at)),
                 }
                 let (a, b) = page(v.len());
                 json!(v[a..b])
@@ -604,7 +607,7 @@ impl Crm {
     }
 
     /// The writes the screenshots use. `hire`: the fixture's bots and schedules gain the hired crew.
-    pub fn write(&mut self, method: &str, segs: &[&str], body: &str) -> Option<(Value, Option<(Vec<Bot>, Vec<Schedule>)>)> {
+    pub fn write(&mut self, method: &str, segs: &[&str], body: &str) -> Option<(Value, Option<Hire>)> {
         let now = self.now;
         Some(match (method, segs) {
             // A dry run and the real import answer alike (nothing is stored).
