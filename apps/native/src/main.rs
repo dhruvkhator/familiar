@@ -52,6 +52,7 @@ mod templates;
 mod text_input;
 mod titlebar;
 mod tray;
+mod triggers;
 
 use familiar_ui::AppearanceMode;
 use gpui::{

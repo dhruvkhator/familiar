@@ -366,6 +366,9 @@ impl Fixture {
         let path = target.split('?').next().unwrap_or("/");
         let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
         let ["api", rest @ ..] = segs.as_slice() else { return None };
+        if let Some(v) = self.parity.write(method, rest, body) {
+            return Some(v);
+        }
         let (v, hired) = self.crm.write(method, rest, body)?;
         if let Some((bots, schedules)) = hired {
             self.bots.extend(bots);
@@ -599,7 +602,7 @@ async fn shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Shell>
         return integrations_shot(page, window, shell, cx).await;
     }
     if page.starts_with("teammate-") {
-        return teammate_shot(page, shell, cx).await;
+        return teammate_shot(page, window, shell, cx).await;
     }
     match page {
         "chat" => {
@@ -745,15 +748,26 @@ async fn integrations_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &
     });
 }
 
-/// Ada's page on one tab, scrolled to what the shot is about: `teammate-connectors` (Settings → Connectors).
-async fn teammate_shot(page: &str, shell: &Entity<Shell>, cx: &mut AsyncApp) {
+/// Ada's page on one tab, scrolled to what the shot is about: `teammate-connectors` (Settings → Connectors),
+/// `teammate-triggers` (Settings → Webhooks that wake it), `teammate-trigger-url` (a new webhook's address, shown once).
+async fn teammate_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Shell>, cx: &mut AsyncApp) {
     let (target, y) = match page {
         "teammate-connectors" => ("ada/settings", 840.0),
+        "teammate-triggers" | "teammate-trigger-url" => ("ada/settings", 1180.0),
         _ => ("ada", 0.0),
     };
     cx.update(|cx| shell.update(cx, |s, cx| s.open(target, cx)));
     until(cx, Duration::from_secs(5), |cx| shell.read(cx).page_of(id(ADA)).is_some()).await;
     wait(cx, Duration::from_millis(900)).await;
+    if page == "teammate-trigger-url" {
+        let _ = window.update(cx, |_, window, cx| {
+            let triggers = shell.read(cx).page_of(id(ADA)).and_then(|p| p.read(cx).settings_tab()).and_then(|s| s.read(cx).triggers_view());
+            if let Some(t) = triggers {
+                t.update(cx, |t, cx| t.fill("Deploy finished", "A deploy just finished. Check the site and tell me if anything looks off.", true, window, cx));
+            }
+        });
+        wait(cx, Duration::from_millis(600)).await;
+    }
     cx.update(|cx| {
         if let Some(p) = shell.read(cx).page_of(id(ADA)) {
             p.update(cx, |p, cx| p.scroll_tab_to(y, cx));

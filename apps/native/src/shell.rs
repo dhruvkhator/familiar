@@ -309,6 +309,13 @@ impl Shell {
             let shown = route == Route::Integrations;
             p.update(cx, |p, cx| p.set_shown(shown, cx));
         }
+        // A teammate's page that leaves the screen wipes what it showed only once (a trigger's new address).
+        if let Route::Teammate(id) = self.route.current().clone()
+            && route != Route::Teammate(id.clone())
+            && let Some(page) = id.parse::<Uuid>().ok().and_then(|b| self.pages.get(&b).cloned())
+        {
+            page.update(cx, |p, cx| p.set_shown(false, cx));
+        }
         let shown = route.clone();
         if self.route.set(route) {
             self.scroll.set_offset(gpui::point(px(0.0), px(0.0)));

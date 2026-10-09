@@ -99,6 +99,8 @@ pub struct BotSettings {
     folders: Option<Vec<familiar_client::Folder>>,
     /// Edit mode: which connectors it may use.
     connectors: Option<Entity<crate::bot_connectors::BotConnectors>>,
+    /// Edit mode: the webhooks that wake it.
+    triggers: Option<Entity<crate::triggers::BotTriggers>>,
     /// "Can use this PC's desktop" (saved at once when switched).
     desktop: bool,
 }
@@ -209,6 +211,7 @@ impl BotSettings {
         })
         .detach();
         let connectors = (!create).then(|| cx.new(|cx| crate::bot_connectors::BotConnectors::new(data.clone(), toasts.clone(), bot, cx)));
+        let triggers = (!create).then(|| cx.new(|cx| crate::triggers::BotTriggers::new(data.clone(), toasts.clone(), bot, cx)));
         let mut this = Self {
             create,
             intro: false,
@@ -234,6 +237,7 @@ impl BotSettings {
             allowed: None,
             folders: None,
             connectors,
+            triggers,
             desktop: b.desktop,
         };
         this.load_catalog(cx);
@@ -263,6 +267,18 @@ impl BotSettings {
         })
         .detach();
         this
+    }
+
+    /// Its webhooks section (edit mode).
+    pub fn triggers_view(&self) -> Option<Entity<crate::triggers::BotTriggers>> {
+        self.triggers.clone()
+    }
+
+    /// The page left the screen: what was shown only once (a trigger's new address) is wiped.
+    pub fn hidden(&mut self, cx: &mut Context<Self>) {
+        if let Some(t) = self.triggers.clone() {
+            t.update(cx, |t, cx| t.hidden(cx));
+        }
     }
 
     /// Claude Code reported signed out (no plan check will come until it signs in).
@@ -1323,6 +1339,7 @@ impl Render for BotSettings {
                     .child(div().flex().flex_col().gap(px(6.0)).child(label("Model")).child(model_control)),
             )
             .when_some(self.connectors.clone(), |el, c| el.child(c))
+            .when_some(self.triggers.clone(), |el, t| el.child(t))
             .when_some(if create { None } else { self.allowed_view(cx) }, |el, v| el.child(v))
             .when(!create, |el| el.child(self.folders_view(cx)))
             .when(!create && cfg!(windows), |el| el.child(self.desktop_view(cx)))

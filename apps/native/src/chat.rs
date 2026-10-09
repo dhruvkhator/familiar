@@ -582,6 +582,19 @@ impl BotPage {
             .into_any_element()
     }
 
+    /// The shell shows or hides the page (it stays alive, cached): hidden, its Settings tab wipes what it showed only
+    /// once.
+    pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
+        if !shown && let Some(s) = self.settings.clone() {
+            s.update(cx, |s, cx| s.hidden(cx));
+        }
+    }
+
+    /// Settings tab, while it is open.
+    pub fn settings_tab(&self) -> Option<Entity<BotSettings>> {
+        self.settings.clone()
+    }
+
     /// Scroll the open tab (Learned, Activity, Settings…) to `y` px from its top (the bench's shots).
     pub fn scroll_tab_to(&mut self, y: f32, cx: &mut Context<Self>) {
         self.tab_scroll.set_offset(gpui::point(px(0.0), px(-y)));
