@@ -52,6 +52,19 @@ fn qs(params: &[(&str, Option<String>)]) -> String {
     if any { format!("?{}", s.finish()) } else { String::new() }
 }
 
+fn crm_list_qs(p: &CrmListParams) -> String {
+    qs(&[
+        ("q", p.q.clone()),
+        ("tag", p.tag.clone()),
+        ("stage", p.stage.clone()),
+        ("company_id", p.company_id.map(|v| v.to_string())),
+        ("dnc", p.dnc.map(|v| v.to_string())),
+        ("sort", p.sort.clone()),
+        ("limit", p.limit.map(|v| v.to_string())),
+        ("offset", p.offset.map(|v| v.to_string())),
+    ])
+}
+
 fn body<B: Serialize>(b: &B) -> Value {
     serde_json::to_value(b).unwrap_or(Value::Null)
 }
@@ -101,13 +114,17 @@ impl Client {
 
     // ---- transport ------------------------------------------------------
 
-    async fn send_once(&self, method: &Method, path: &str, body: Option<&Value>, auth: bool) -> Result<(u16, Bytes), ApiError> {
+    /// `text`: a raw `text/csv` body instead of JSON.
+    async fn send_once(&self, method: &Method, path: &str, body: Option<&Value>, text: Option<&str>, auth: bool) -> Result<(u16, Bytes), ApiError> {
         let mut req = self.0.http.request(method.clone(), format!("{}{}", self.0.base_url, path));
         if let Some(t) = self.token() {
             req = req.bearer_auth(t);
         }
         if let Some(b) = body {
             req = req.json(b);
+        }
+        if let Some(t) = text {
+            req = req.header(reqwest::header::CONTENT_TYPE, "text/csv").body(t.to_string());
         }
         let fut = req.send();
         tokio::pin!(fut);
@@ -148,7 +165,7 @@ impl Client {
         let attempts = if method == Method::GET { 2 } else { 1 };
         let mut i = 1;
         loop {
-            match self.send_once(&method, path, body, auth).await {
+            match self.send_once(&method, path, body, None, auth).await {
                 Err(ApiError::Network(e)) if i < attempts => {
                     tracing::debug!("retrying {path}: {e}");
                     i += 1;
@@ -536,6 +553,107 @@ impl Client {
     /// Issue a new webhook URL (the old one stops working).
     pub async fn rotate_trigger(&self, id: Uuid) -> Result<Trigger, ApiError> {
         self.mutate(Method::POST, &format!("/api/triggers/{id}/rotate"), Some(json!({})), true).await
+    }
+
+    // ---- CRM ------------------------------------------------------------
+
+    pub async fn crm_companies(&self, p: &CrmListParams) -> Result<Vec<CrmCompany>, ApiError> {
+        self.get(&format!("/api/crm/companies{}", crm_list_qs(p))).await
+    }
+    pub async fn crm_company(&self, id: Uuid) -> Result<CrmCompany, ApiError> {
+        self.get(&format!("/api/crm/companies/{id}")).await
+    }
+    /// Creates the company, or updates the one it matches (same domain, else same name).
+    pub async fn create_crm_company(&self, c: &NewCompany) -> Result<CrmCompany, ApiError> {
+        self.mutate(Method::POST, "/api/crm/companies", Some(body(c)), true).await
+    }
+    pub async fn update_crm_company(&self, id: Uuid, p: &CompanyPatch) -> Result<CrmCompany, ApiError> {
+        self.mutate(Method::PATCH, &format!("/api/crm/companies/{id}"), Some(body(p)), true).await
+    }
+    /// A soft delete: [`Client::undo_crm_change`] brings it back.
+    pub async fn delete_crm_company(&self, id: Uuid) -> Result<(), ApiError> {
+        self.mutate::<Value>(Method::DELETE, &format!("/api/crm/companies/{id}"), None, true).await.map(|_| ())
+    }
+
+    pub async fn crm_contacts(&self, p: &CrmListParams) -> Result<Vec<CrmContact>, ApiError> {
+        self.get(&format!("/api/crm/contacts{}", crm_list_qs(p))).await
+    }
+    pub async fn crm_contact(&self, id: Uuid) -> Result<CrmContact, ApiError> {
+        self.get(&format!("/api/crm/contacts/{id}")).await
+    }
+    /// Creates the contact, or updates the one it matches (same email, else LinkedIn link, else name at the company).
+    pub async fn create_crm_contact(&self, c: &NewContact) -> Result<CrmContact, ApiError> {
+        self.mutate(Method::POST, "/api/crm/contacts", Some(body(c)), true).await
+    }
+    pub async fn update_crm_contact(&self, id: Uuid, p: &ContactPatch) -> Result<CrmContact, ApiError> {
+        self.mutate(Method::PATCH, &format!("/api/crm/contacts/{id}"), Some(body(p)), true).await
+    }
+    pub async fn delete_crm_contact(&self, id: Uuid) -> Result<(), ApiError> {
+        self.mutate::<Value>(Method::DELETE, &format!("/api/crm/contacts/{id}"), None, true).await.map(|_| ())
+    }
+
+    pub async fn crm_deals(&self, p: &CrmListParams) -> Result<Vec<CrmDeal>, ApiError> {
+        self.get(&format!("/api/crm/deals{}", crm_list_qs(p))).await
+    }
+    pub async fn crm_deal(&self, id: Uuid) -> Result<CrmDeal, ApiError> {
+        self.get(&format!("/api/crm/deals/{id}")).await
+    }
+    /// Creates the deal, or updates the one at the same company with the same title.
+    pub async fn create_crm_deal(&self, d: &NewDeal) -> Result<CrmDeal, ApiError> {
+        self.mutate(Method::POST, "/api/crm/deals", Some(body(d)), true).await
+    }
+    /// Also how a deal moves between stages (`stage`).
+    pub async fn update_crm_deal(&self, id: Uuid, p: &DealPatch) -> Result<CrmDeal, ApiError> {
+        self.mutate(Method::PATCH, &format!("/api/crm/deals/{id}"), Some(body(p)), true).await
+    }
+    pub async fn delete_crm_deal(&self, id: Uuid) -> Result<(), ApiError> {
+        self.mutate::<Value>(Method::DELETE, &format!("/api/crm/deals/{id}"), None, true).await.map(|_| ())
+    }
+
+    /// The timeline, newest first.
+    pub async fn crm_activities(&self, p: &CrmActivityParams) -> Result<Vec<CrmActivity>, ApiError> {
+        let q = qs(&[
+            ("company_id", p.company_id.map(|v| v.to_string())),
+            ("contact_id", p.contact_id.map(|v| v.to_string())),
+            ("deal_id", p.deal_id.map(|v| v.to_string())),
+            ("limit", p.limit.map(|v| v.to_string())),
+            ("offset", p.offset.map(|v| v.to_string())),
+        ]);
+        self.get(&format!("/api/crm/activities{q}")).await
+    }
+    pub async fn log_crm_activity(&self, a: &NewActivity) -> Result<CrmActivity, ApiError> {
+        self.mutate(Method::POST, "/api/crm/activities", Some(body(a)), true).await
+    }
+    /// The board: every stage in order, with its count, value and deals.
+    pub async fn crm_pipeline(&self) -> Result<Vec<PipelineStage>, ApiError> {
+        self.get("/api/crm/pipeline").await
+    }
+    /// The change log, newest first.
+    pub async fn crm_changes(&self, p: &CrmChangeParams) -> Result<Vec<CrmChange>, ApiError> {
+        let q = qs(&[
+            ("entity", p.entity.clone()),
+            ("entity_id", p.entity_id.map(|v| v.to_string())),
+            ("bot_id", p.bot_id.map(|v| v.to_string())),
+            ("limit", p.limit.map(|v| v.to_string())),
+        ]);
+        self.get(&format!("/api/crm/changes{q}")).await
+    }
+    /// Undo a change (409 unless it is the newest of its record); answers with the new `undo` change.
+    pub async fn undo_crm_change(&self, id: Uuid) -> Result<CrmChange, ApiError> {
+        self.mutate(Method::POST, &format!("/api/crm/changes/{id}/undo"), Some(json!({})), true).await
+    }
+    /// `kind`: companies | contacts | deals. UTF-8 CSV with a header row.
+    pub async fn crm_export_csv(&self, kind: &str) -> Result<String, ApiError> {
+        let q = qs(&[("kind", Some(kind.to_string()))]);
+        let (_, b) = self.send(Method::GET, &format!("/api/crm/export.csv{q}"), None, true).await?;
+        Ok(String::from_utf8_lossy(&b).into_owned())
+    }
+    /// Import CSV text (at most 5 MB and 5000 rows). `dry_run` reports what would happen and changes nothing.
+    pub async fn crm_import(&self, kind: &str, csv: &str, dry_run: bool) -> Result<CrmImportResult, ApiError> {
+        let q = qs(&[("kind", Some(kind.to_string())), ("dry_run", Some(dry_run.to_string()))]);
+        let (_, b) = self.send_once(&Method::POST, &format!("/api/crm/import{q}"), None, Some(csv), true).await?;
+        self.0.cache.clear_inflight();
+        Self::decode(Self::parse_value(&b))
     }
 
     // ---- live browser view ----------------------------------------------

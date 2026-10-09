@@ -173,3 +173,46 @@ fn schedules_page_rows() {
     let patch = serde_json::to_value(SchedulePatch { label: Some("Standup".into()), ..Default::default() }).unwrap();
     assert_eq!(patch, json!({"label": "Standup"}));
 }
+
+#[test]
+fn crm_rows() {
+    let c: CrmCompany = de(json!({
+        "id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "name": "Acme", "domain": "acme.com", "website": null, "fit_score": 80,
+        "tags": ["icp"], "source_urls": ["https://acme.com/about"], "custom": {"k": 1}, "created_by_bot": null,
+        "created_at": "2026-10-09T10:00:00.123456+00:00", "updated_at": "2026-10-09T10:00:00+00:00", "deleted_at": null, "future": 1
+    }));
+    assert_eq!((c.name.as_str(), c.domain.as_deref(), c.fit_score), ("Acme", Some("acme.com"), Some(80)));
+    assert_eq!((c.tags.len(), c.source_urls.len(), c.created_by_bot), (1, 1, None));
+
+    let p: CrmContact = de(json!({"id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f11", "name": "Sam", "email": "sam@acme.com", "company_name": "Acme", "do_not_contact": true, "dnc_at": "2026-10-09T10:00:00Z"}));
+    assert!(p.do_not_contact && p.dnc_at.is_some());
+    assert_eq!(p.company_name.as_deref(), Some("Acme"));
+    let _: CrmContact = de(json!({}));
+
+    let d: CrmDeal = de(json!({"id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f12", "title": "Pilot", "stage": "meeting", "value_cents": 5000, "currency": "USD", "contact_name": null}));
+    assert_eq!((d.stage, d.value_cents), (DealStage::Meeting, Some(5000)));
+    assert_eq!(de::<CrmDeal>(json!({"stage": "from_the_future"})).stage, DealStage::Unknown);
+    assert_eq!(DealStage::Won.as_str(), "won");
+
+    let a: CrmActivity = de(json!({"kind": "email_sent", "summary": "Intro sent", "actor_kind": "bot", "bot_name": "Scout", "approval_id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f13"}));
+    assert_eq!((a.kind, a.bot_name.as_deref(), a.approval_id.is_some()), (ActivityKind::EmailSent, Some("Scout"), true));
+    assert_eq!(de::<CrmActivity>(json!({"kind": "carrier_pigeon"})).kind, ActivityKind::Unknown);
+
+    let ch: CrmChange = de(json!({"id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f14", "entity": "deal", "op": "update", "before": {"stage": "new"}, "after": {"stage": "won"}, "actor_kind": "user", "bot_id": null, "at": "2026-10-09T10:00:00Z", "undone_at": null}));
+    assert_eq!((ch.entity.as_str(), ch.op.as_str(), ch.before.unwrap()["stage"].as_str()), ("deal", "update", Some("new")));
+
+    let stages: Vec<PipelineStage> = de(json!([
+        {"stage": "new", "count": 2, "value_cents": 3500, "deals": [{"id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f12", "stage": "new", "title": "A", "company_id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "company_name": "Acme", "contact_name": null, "value_cents": null, "currency": "USD"}]},
+        {"stage": "won", "count": 0, "value_cents": 0, "deals": []}
+    ]));
+    assert_eq!((stages[0].count, stages[0].value_cents, stages[0].deals[0].company_name.as_deref()), (2, 3500, Some("Acme")));
+    assert_eq!(stages[1].stage, DealStage::Won);
+
+    let r: CrmImportResult = de(json!({"created": 1, "updated": 2, "skipped": 3, "errors": [{"row": 5, "message": "bad"}]}));
+    assert_eq!((r.created, r.updated, r.skipped, r.errors[0].row), (1, 2, 3, 5));
+
+    // request bodies only carry what is set
+    assert_eq!(serde_json::to_value(NewCompany { name: Some("Acme".into()), tags: Some(vec!["a".into()]), ..Default::default() }).unwrap(), json!({"name": "Acme", "tags": ["a"]}));
+    assert_eq!(serde_json::to_value(DealPatch { stage: Some("won".into()), ..Default::default() }).unwrap(), json!({"stage": "won"}));
+    assert_eq!(serde_json::to_value(ContactPatch { do_not_contact: Some(false), ..Default::default() }).unwrap(), json!({"do_not_contact": false}));
+}
