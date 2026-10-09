@@ -286,7 +286,15 @@ pub fn source_urls(v: &[String]) -> std::result::Result<Vec<String>, String> {
     Ok(out)
 }
 
-// ---- inputs (every field optional: patch semantics; an empty string clears a text field) --------------------------
+// ---- inputs (every field optional: patch semantics; an empty string clears a text field, `null` a number or date) ----
+
+/// A number or date field that can be cleared: absent = untouched (None), `null` = clear (Some(None)), a value =
+/// set it (Some(Some(v))). Goes with `#[serde(default)]`.
+pub type Clearable<T> = Option<Option<T>>;
+
+fn clearable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(d: D) -> std::result::Result<Clearable<T>, D::Error> {
+    Ok(Some(Option::<T>::deserialize(d)?))
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -298,7 +306,9 @@ pub struct CompanyInput {
     pub size: Option<String>,
     pub location: Option<String>,
     pub description: Option<String>,
-    pub fit_score: Option<i32>,
+    /// 0-100; `null` clears it.
+    #[serde(default, deserialize_with = "clearable")]
+    pub fit_score: Clearable<i32>,
     pub fit_reason: Option<String>,
     pub tags: Option<Vec<String>>,
     pub source_urls: Option<Vec<String>>,
@@ -330,11 +340,15 @@ pub struct DealInput {
     pub contact_id: Option<Uuid>,
     pub title: Option<String>,
     pub stage: Option<String>,
-    pub value_cents: Option<i64>,
+    /// `null` clears it.
+    #[serde(default, deserialize_with = "clearable")]
+    pub value_cents: Clearable<i64>,
     /// Three letters, e.g. `USD`.
     pub currency: Option<String>,
     pub next_step: Option<String>,
-    pub next_step_at: Option<DateTime<Utc>>,
+    /// `null` clears it.
+    #[serde(default, deserialize_with = "clearable")]
+    pub next_step_at: Clearable<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -456,11 +470,12 @@ fn clean_company(i: &CompanyInput, derive_domain: bool) -> Result<M> {
     put_text(&mut m, "size", &i.size, 200)?;
     put_text(&mut m, "location", &i.location, 200)?;
     put_text(&mut m, "description", &i.description, 4000)?;
-    if let Some(s) = i.fit_score {
-        if !(0..=100).contains(&s) {
-            return invalid("fit_score must be between 0 and 100");
+    match i.fit_score {
+        Some(Some(s)) if !(0..=100).contains(&s) => return invalid("fit_score must be between 0 and 100"),
+        Some(s) => {
+            m.insert("fit_score".into(), json!(s));
         }
-        m.insert("fit_score".into(), json!(s));
+        None => {}
     }
     put_text(&mut m, "fit_reason", &i.fit_reason, 2000)?;
     put_lists(&mut m, &i.tags, &i.source_urls)?;
@@ -512,11 +527,12 @@ fn clean_deal(i: &DealInput) -> Result<M> {
         }
         m.insert("stage".into(), json!(s));
     }
-    if let Some(v) = i.value_cents {
-        if v < 0 {
-            return invalid("value_cents must not be negative");
+    match i.value_cents {
+        Some(Some(v)) if v < 0 => return invalid("value_cents must not be negative"),
+        Some(v) => {
+            m.insert("value_cents".into(), json!(v));
         }
-        m.insert("value_cents".into(), json!(v));
+        None => {}
     }
     if let Some(c) = &i.currency {
         let c = c.trim().to_uppercase();
@@ -527,7 +543,7 @@ fn clean_deal(i: &DealInput) -> Result<M> {
     }
     put_text(&mut m, "next_step", &i.next_step, 500)?;
     if let Some(t) = i.next_step_at {
-        m.insert("next_step_at".into(), json!(t.to_rfc3339()));
+        m.insert("next_step_at".into(), json!(t.map(|t| t.to_rfc3339())));
     }
     Ok(m)
 }
@@ -1483,14 +1499,14 @@ mod tests {
         assert!(c(|i| i.name = Some("x".repeat(201))).is_err());
         assert!(c(|i| i.domain = Some("nope".into())).is_err());
         assert!(c(|i| i.website = Some("ftp://x.com".into())).is_err());
-        assert!(c(|i| i.fit_score = Some(101)).is_err());
-        assert!(c(|i| i.fit_score = Some(-1)).is_err());
+        assert!(c(|i| i.fit_score = Some(Some(101))).is_err());
+        assert!(c(|i| i.fit_score = Some(Some(-1))).is_err());
         assert!(c(|i| i.description = Some("x".repeat(4001))).is_err());
         assert!(c(|i| i.custom = Some(json!([1]))).is_err());
         let m = c(|i| {
             i.name = Some(" Acme ".into());
             i.website = Some("https://www.Acme.com/about".into());
-            i.fit_score = Some(100);
+            i.fit_score = Some(Some(100));
         })
         .unwrap();
         assert_eq!((m["name"].as_str(), m["domain"].as_str(), m["fit_score"].as_i64()), (Some("Acme"), Some("acme.com"), Some(100)));
@@ -1511,7 +1527,7 @@ mod tests {
         assert_eq!((m["email"].as_str(), m["x_handle"].as_str()), (Some("a@b.io"), Some("sam")));
 
         assert!(clean_deal(&DealInput { stage: Some("nope".into()), ..Default::default() }).is_err());
-        assert!(clean_deal(&DealInput { value_cents: Some(-1), ..Default::default() }).is_err());
+        assert!(clean_deal(&DealInput { value_cents: Some(Some(-1)), ..Default::default() }).is_err());
         assert!(clean_deal(&DealInput { currency: Some("US".into()), ..Default::default() }).is_err());
         assert!(clean_deal(&DealInput { next_step: Some("x".repeat(501)), ..Default::default() }).is_err());
         let m = clean_deal(&DealInput { currency: Some("eur".into()), stage: Some("won".into()), ..Default::default() }).unwrap();
@@ -1529,6 +1545,33 @@ mod tests {
         assert!(a(|i| i.summary = None).is_err());
         assert!(a(|i| i.body = Some("x".repeat(20_001))).is_err());
         assert!(a(|i| i.url = Some("javascript:1".into())).is_err());
+    }
+
+    #[test]
+    fn numbers_and_dates_clear_with_null() {
+        // absent = untouched, null = clear, a value = set
+        let c: CompanyInput = serde_json::from_value(json!({ "name": "Acme" })).unwrap();
+        assert_eq!(c.fit_score, None);
+        assert!(!clean_company(&c, false).unwrap().contains_key("fit_score"));
+        let c: CompanyInput = serde_json::from_value(json!({ "fit_score": null })).unwrap();
+        assert_eq!(c.fit_score, Some(None));
+        assert_eq!(clean_company(&c, false).unwrap()["fit_score"], Value::Null);
+        let c: CompanyInput = serde_json::from_value(json!({ "fit_score": 70 })).unwrap();
+        assert_eq!(clean_company(&c, false).unwrap()["fit_score"], json!(70));
+        assert!(serde_json::from_value::<CompanyInput>(json!({ "fit_score": "high" })).is_err());
+
+        let d: DealInput = serde_json::from_value(json!({ "value_cents": null, "next_step_at": null })).unwrap();
+        assert_eq!((d.value_cents, d.next_step_at), (Some(None), Some(None)));
+        let m = clean_deal(&d).unwrap();
+        assert_eq!((m["value_cents"].clone(), m["next_step_at"].clone()), (Value::Null, Value::Null));
+        let d: DealInput = serde_json::from_value(json!({ "value_cents": 500, "next_step_at": "2026-11-01T10:00:00Z" })).unwrap();
+        let m = clean_deal(&d).unwrap();
+        assert_eq!((m["value_cents"].as_i64(), m["next_step_at"].as_str()), (Some(500), Some("2026-11-01T10:00:00+00:00")));
+        let m = clean_deal(&serde_json::from_value(json!({ "title": "Pilot" })).unwrap()).unwrap();
+        assert!(!m.contains_key("value_cents") && !m.contains_key("next_step_at"));
+        // clearing needs no range check, setting still has one
+        assert!(clean_deal(&DealInput { value_cents: Some(None), ..Default::default() }).is_ok());
+        assert!(clean_company(&CompanyInput { fit_score: Some(Some(101)), ..Default::default() }, false).is_err());
     }
 
     #[test]

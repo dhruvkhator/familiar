@@ -1514,6 +1514,14 @@ async fn crm_crud_and_dedupe() {
     assert_eq!((len(&l), id(&l[0])), (1, cid.clone()));
     assert_eq!(len(&app.get(t, "/api/crm/companies?limit=1&offset=1").await.1), 1);
     assert_eq!(app.get(t, "/api/crm/companies?sort=nope").await.0, 400);
+    // a number: absent leaves it, null clears it, a value sets it
+    let (s, v) = app.patch(t, &format!("/api/crm/companies/{cid}"), json!({"location": "Berlin"})).await;
+    assert_eq!((s, v["fit_score"].clone()), (200, json!(80)));
+    let (s, v) = app.patch(t, &format!("/api/crm/companies/{cid}"), json!({"fit_score": null})).await;
+    assert_eq!((s, v["fit_score"].clone(), v["location"].as_str()), (200, Value::Null, Some("Berlin")));
+    assert_eq!(app.patch(t, &format!("/api/crm/companies/{cid}"), json!({"fit_score": "high"})).await.0, 400);
+    let (s, v) = app.patch(t, &format!("/api/crm/companies/{cid}"), json!({"fit_score": 80})).await;
+    assert_eq!((s, v["fit_score"].clone()), (200, json!(80)));
 
     // contacts: the same email in another case is one contact; rows carry the company's name
     let p = app.ok_post(t, "/api/crm/contacts", json!({"name": "Sam", "email": " Sam@Acme.COM ", "company_id": cid, "x_handle": "@sam"}), 201).await;
@@ -1553,6 +1561,18 @@ async fn crm_crud_and_dedupe() {
     assert_eq!(len(&app.get(t, "/api/crm/deals?stage=meeting").await.1), 1);
     assert_eq!(len(&app.get(t, "/api/crm/deals?stage=won").await.1), 0);
     assert_eq!(app.get(t, "/api/crm/deals?stage=nope").await.0, 400);
+    // the value and the next step's date: absent leaves them, null clears them, values set them
+    let (s, v) = app.patch(t, &format!("/api/crm/deals/{did}"), json!({"next_step": "demo on Monday"})).await;
+    assert_eq!((s, v["value_cents"].clone(), v["next_step_at"].is_string()), (200, json!(5000), true));
+    let (s, v) = app.patch(t, &format!("/api/crm/deals/{did}"), json!({"value_cents": null, "next_step_at": null})).await;
+    assert_eq!((s, v["value_cents"].clone(), v["next_step_at"].clone(), v["next_step"].as_str()), (200, Value::Null, Value::Null, Some("demo on Monday")));
+    assert_eq!(app.patch(t, &format!("/api/crm/deals/{did}"), json!({"value_cents": -5})).await.0, 400);
+    assert_eq!(app.patch(t, &format!("/api/crm/deals/{did}"), json!({"next_step_at": "next week"})).await.0, 400);
+    let (s, v) = app.patch(t, &format!("/api/crm/deals/{did}"), json!({"value_cents": 5000, "next_step_at": "2026-11-01T10:00:00Z"})).await;
+    assert_eq!((s, v["value_cents"].clone(), v["next_step_at"].is_string()), (200, json!(5000), true));
+    // each clear is a change the owner can undo
+    let (_, ch) = app.get(t, &format!("/api/crm/changes?entity=deal&entity_id={did}")).await;
+    assert!(ch.as_array().unwrap().iter().any(|c| c["before"]["value_cents"] == 5000 && c["after"]["value_cents"].is_null()), "{ch}");
 
     // activities: a deal's timeline entry also shows on its company and contact
     let act = app.ok_post(t, "/api/crm/activities", json!({"deal_id": did, "kind": "note", "summary": "Called", "body": "went well", "url": "https://x.io/1"}), 201).await;
@@ -1935,7 +1955,7 @@ async fn crm_teammate_owner_edits_win_and_limits() {
         name: Some("ACME Corp".into()),
         description: Some("Bot's words".into()),
         industry: Some("SaaS".into()),
-        fit_score: Some(85),
+        fit_score: Some(Some(85)),
         fit_reason: Some("Raised a round".into()),
         tags: Some(vec!["fintech".into()]),
         source_urls: src("https://news.example/acme"),
@@ -1977,6 +1997,36 @@ async fn crm_teammate_owner_edits_win_and_limits() {
         (d["stage"].as_str(), d["next_step"].as_str(), d["contact_do_not_contact"].clone()),
         (Some("won"), Some("send the invoice"), json!(false))
     );
+    // clearing: a teammate never empties a value the owner set, not even the next step's date it otherwise keeps up;
+    // through the tool, only with an explicit `clear` (a null is "leave it")
+    app.patch(t, &format!("/api/crm/deals/{did}"), json!({"value_cents": 900, "next_step_at": "2026-11-01T10:00:00Z"})).await;
+    let tool_args = |v: Value| serde_json::from_value::<familiar_core::crm::teammate::DealArgs>(v).unwrap();
+    let out = familiar_core::crm::teammate::upsert_deal(&db, &who, tool_args(json!({ "id": did, "value_cents": null, "next_step_at": null })))
+        .await
+        .unwrap();
+    assert!(out.contains("\"changed\":false"), "{out}");
+    let out = familiar_core::crm::teammate::upsert_deal(&db, &who, tool_args(json!({ "id": did, "clear": ["value_cents", "next_step_at"] })))
+        .await
+        .unwrap();
+    assert!(out.contains("\"kept_owner_values\":[\"next_step_at\",\"value_cents\"]"), "{out}");
+    let d = app.get(t, &format!("/api/crm/deals/{did}")).await.1;
+    assert_eq!((d["value_cents"].clone(), d["next_step_at"].is_string()), (json!(900), true));
+    // a date the teammate set itself, it may clear
+    familiar_core::crm::teammate::upsert_deal(&db, &who, tool_args(json!({ "id": did, "next_step_at": "2026-11-08T10:00:00Z" })))
+        .await
+        .unwrap();
+    familiar_core::crm::teammate::upsert_deal(&db, &who, tool_args(json!({ "id": did, "clear": ["next_step_at"] })))
+        .await
+        .unwrap();
+    let d = app.get(t, &format!("/api/crm/deals/{did}")).await.1;
+    assert_eq!(d["next_step_at"].clone(), Value::Null);
+    let err = familiar_core::crm::teammate::upsert_deal(&db, &who, tool_args(json!({ "id": did, "clear": ["next_step_at"], "next_step_at": "2026-12-01T10:00:00Z" })))
+        .await
+        .unwrap_err();
+    assert!(err.contains("both set and cleared"), "{err}");
+    let company_args = serde_json::from_value::<familiar_core::crm::teammate::CompanyArgs>(json!({ "id": cid, "clear": ["fit_score"] })).unwrap();
+    familiar_core::crm::teammate::upsert_company(&db, &who, company_args).await.unwrap();
+    assert_eq!(app.get(t, &format!("/api/crm/companies/{cid}")).await.1["fit_score"], Value::Null);
 
     // do-not-contact: found by email, X handle or LinkedIn, even after the contact is deleted
     let (p, _) = crm::upsert_contact(

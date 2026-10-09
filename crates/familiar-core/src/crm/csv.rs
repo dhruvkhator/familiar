@@ -212,7 +212,8 @@ async fn import_row(tx: &mut PgConnection, owner: Uuid, kind: Kind, f: &Fields) 
                 size: g("size"),
                 location: g("location"),
                 description: g("description"),
-                fit_score: num_cell(f, "fit_score")?,
+                // an empty cell is no cell: an import never clears
+                fit_score: num_cell(f, "fit_score")?.map(Some),
                 fit_reason: g("fit_reason"),
                 tags: tag_cell(f),
                 source_urls: url_cell(f),
@@ -264,10 +265,10 @@ async fn import_row(tx: &mut PgConnection, owner: Uuid, kind: Kind, f: &Fields) 
                 contact_id: contact,
                 title: g("title"),
                 stage: g("stage").map(|s| s.to_lowercase()),
-                value_cents: num_cell(f, "value_cents")?,
+                value_cents: num_cell(f, "value_cents")?.map(Some),
                 currency: g("currency"),
                 next_step: g("next_step"),
-                next_step_at,
+                next_step_at: next_step_at.map(Some),
             };
             Ok(super::upsert_deal_in(tx, owner, &Actor::User, &i).await?.1)
         }

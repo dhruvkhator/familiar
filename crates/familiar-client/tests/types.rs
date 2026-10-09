@@ -178,6 +178,47 @@ fn drafts_offers_and_decisions() {
         "payload": {"tool_name": "propose_draft", "status": "approved", "decided_by": "user", "edited": true}}));
     let TypedEvent::Approval(e) = ev.typed() else { panic!() };
     assert!(e.edited);
+    assert_eq!(e.draft_id, None);
+}
+
+#[test]
+fn crm_patches_clear_numbers_and_dates_with_null() {
+    let at: chrono::DateTime<Utc> = "2026-11-01T10:00:00Z".parse().unwrap();
+    // None: left out (untouched); Some(None): null (clear); Some(Some(v)): the value
+    assert_eq!(serde_json::to_value(CompanyPatch::default()).unwrap(), json!({}));
+    assert_eq!(serde_json::to_value(CompanyPatch { fit_score: Some(None), ..Default::default() }).unwrap(), json!({"fit_score": null}));
+    assert_eq!(
+        serde_json::to_value(CompanyPatch { fit_score: Some(Some(80)), name: Some("Acme".into()), ..Default::default() }).unwrap(),
+        json!({"name": "Acme", "fit_score": 80})
+    );
+    assert_eq!(
+        serde_json::to_value(DealPatch { value_cents: Some(None), next_step_at: Some(None), ..Default::default() }).unwrap(),
+        json!({"value_cents": null, "next_step_at": null})
+    );
+    assert_eq!(
+        serde_json::to_value(DealPatch { value_cents: Some(Some(5000)), next_step_at: Some(Some(at)), ..Default::default() }).unwrap(),
+        json!({"value_cents": 5000, "next_step_at": "2026-11-01T10:00:00Z"})
+    );
+    assert_eq!(serde_json::to_value(DealPatch { stage: Some("won".into()), ..Default::default() }).unwrap(), json!({"stage": "won"}));
+}
+
+#[test]
+fn sends_of_approved_drafts() {
+    let draft = "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10";
+    let a: Approval = de(json!({
+        "id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f11", "tool_name": "mcp__google-workspace__send_gmail_message",
+        "status": "approved", "decided_by": "rule", "reason": "Sent as approved (draft #6f1d1c1e)", "draft_id": draft,
+        "send_granted": false
+    }));
+    assert!(a.sent_as_approved() && !a.is_draft());
+    assert_eq!(a.draft_id.map(|d| d.to_string()).as_deref(), Some(draft));
+    let d: Approval = de(json!({"id": draft, "tool_name": "propose_draft", "status": "approved", "send_granted": true}));
+    assert!(d.send_granted && !d.sent_as_approved());
+    let ev: Event = de(json!({"id": 1, "seq": 3, "kind": "approval", "payload": {
+        "approval_id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f11", "draft_id": draft, "tool_name": "mcp__browser__browser_type",
+        "status": "approved", "decided_by": "rule", "reason": "Sent as approved (draft #6f1d1c1e)"}}));
+    let TypedEvent::Approval(e) = ev.typed() else { panic!() };
+    assert_eq!((e.draft_id.map(|d| d.to_string()), e.decided_by.as_deref()), (Some(draft.to_owned()), Some("rule")));
 }
 
 #[test]

@@ -72,7 +72,9 @@ query in both server and daemon filters by owner** (server: the session's user; 
   (`payload.truncated=true`). The daemon deletes events older than 30 days, daily.
 - `approvals(id, run_id, bot_id, tool_use_id, tool_name, input jsonb, reason, status
    pending|approved|denied|expired, decided_by user|rule|reviewer, response text null, decided_at, created_at)`
-  — also used for `ask_user` questions (tool_name `ask_user`, `input.question`, answer in `response`).
+  — also used for `ask_user` questions (tool_name `ask_user`, `input.question`, answer in `response`), drafts
+  (`propose_draft`; `send_granted` when its follow-up may send it once) and sends Familiar let through as approved
+  drafts (`draft_id`; see "Sending an approved draft" under CRM).
 - `rules(id, bot_id null = all bots, pattern, decision allow|deny|ask|review, note, created_at)`
 - `schedules(id, bot_id, thread_id, cron, prompt, kind scheduled|proactive, enabled, last_run_at, next_run_at)`
 - `memories(id, bot_id, content, source user|bot, created_at)`
@@ -357,6 +359,10 @@ webhook deliveries.
 
 **Owner API.** CRUD `/api/crm/{companies|contacts|deals}`, `/api/crm/activities`, `/api/crm/pipeline`,
 `/api/crm/changes` + `POST /api/crm/changes/{id}/undo`, `/api/crm/export.csv`, `/api/crm/import`, and the webhooks below.
+Write bodies have patch semantics: an absent field is left as it is, an empty text clears a text field, and `null`
+clears a number or date (`fit_score`, `value_cents`, `next_step_at`; `crm::Clearable<T>` = `Option<Option<T>>`). The
+Rust client mirrors it: `CompanyPatch.fit_score`, `DealPatch.value_cents` / `next_step_at` are `Option<Option<T>>`
+(`None` omitted, `Some(None)` sent as `null`). A CSV import never clears (an empty cell is no cell).
 
 **Teammate tools** (Familiar's MCP server, pre-allowed like every `mcp__familiar` tool): `crm_search {query?, kind?,
 stage?, tags?, company_id?, limit ≤ 50}`, `crm_get {kind, id}` (a company with its contacts, deals and last 20
@@ -364,7 +370,12 @@ activities; a contact with its deals; a deal with its timeline), `crm_pipeline` 
 `crm_upsert_company`, `crm_upsert_contact`, `crm_upsert_deal` (each `{id?}` to change one record, else create or
 update the match: same domain / same email (else LinkedIn link, else name at the company) / same company + title),
 `crm_move_deal {deal_id, stage, note}` (with the note; every stage move, however made, logs a `stage_change`), `crm_log_activity` (any kind but `stage_change`;
-`draft` = the `#id` of one of the teammate's own drafts links the activity to it). No delete tool.
+`draft` = the `#id` of one of the teammate's own drafts links the activity to it). No delete tool. A teammate empties
+a number or date only by naming it in `clear` (`crm_upsert_company`: `fit_score`; `crm_upsert_deal`: `value_cents`,
+`next_step_at`), never with a `null` (some models send `null` for every field they don't use, so `null` means "leave
+it" there); naming a field in `clear` and giving it a value is an error. Owner edits win as for any change: the fit
+score and the next step's date are the teammate's to keep up (update), but whatever the owner set, a teammate never
+empties.
 
 **Trust model** (`crm::teammate`):
 - *Fenced text.* CRM text is partly copied from web pages and emails, so a record can carry instructions aimed at the
@@ -378,7 +389,8 @@ update the match: same domain / same email (else LinkedIn link, else name at the
   (`actor_kind = 'user'`; an owner undo or CSV import counts). A held field keeps its value and the tool answer lists
   it under `kept_owner_values` ("say so in your summary instead"). Teammates may always: fill fields nobody set, change
   what a teammate set, maintain `fit_score` / `fit_reason` (companies) and `stage` / `next_step` / `next_step_at`
-  (deals), except that a deal the owner closed (won/lost) stays closed; add tags and `source_urls` (merged, never
+  (deals), except that a deal the owner closed (won/lost) stays closed and a value the owner set is never emptied by
+  a teammate (maintaining means updating, not erasing the owner's date or score); add tags and `source_urls` (merged, never
   removed, at most 20); set do-not-contact. To let a teammate change a held field, the owner makes the change.
 - *Do-not-contact.* Anyone sets it; only the owner clears it (a teammate gets an error; a CSV import only ever sets it,
   so re-importing an old export never lifts one or its reason). Who a do-not-contact person is never changes through a
@@ -400,6 +412,55 @@ update the match: same domain / same email (else LinkedIn link, else name at the
   needs `source_urls`. One run makes at most `MAX_WRITES_PER_RUN` = 200 changes (counted in `crm_changes` by `run_id`, indexed,
   with the run row locked so parallel calls count in order); past it every write fails with "stop changing the CRM,
   summarise, a later run can carry on".
+
+**Sending an approved draft: one approval per outgoing message** (`familiar_core::drafts`, migration
+`20261010000000_draft_send.sql`). The owner approving a draft (edits allowed) also approves sending it — once, exactly
+as approved, from that draft's own follow-up run. Without this every message was approved twice: the draft, then the
+connector's send (or the browser typing it).
+- *Bound to one run and one draft.* `drafts::sweep` sets `approvals.send_granted` on the draft only when its follow-up
+  message actually passes the text on (approved, no do-not-contact hit, no hidden characters, no media) and the draft's
+  `followup_run_id` is that run. `runner::decide_tool` asks `drafts::pre_approval` only in a `followup` run, after
+  the research-only refusal, the owner's deny rules, the shared-folder and desktop checks and the always-human check
+  (so all of those still win), and before allow rules, auto-review and the owner. No other run (a later chat on the same
+  thread resumes the same session, but it is another run) and no other draft can use it.
+- *Exactly as approved* (`drafts::send_matches`, the draft as the owner approved it, i.e. `edited_input` when they
+  edited it):
+  - **Connector email tools** listed in `drafts::EMAIL_TOOLS`, by the tool name after `mcp__<connector>__` (the
+    connector's name is the owner's choice; Familiar's own `familiar`, `browser` and `desktop` servers never count):
+    `send_gmail_message` (the google-workspace preset, `uvx workspace-mcp`: `to` a string) and `send_email` (the Gmail
+    MCP server `@gongrzhe/server-gmail-autoauth-mcp`: `to` a list). Only for an `email` draft. Recipients: the same
+    set of addresses as the approved `to` (lowercased, any order, `Name <addr>` and `,`/`;` lists understood; no
+    `+tag`/Gmail-dot folding — a different address is a different address); a display name, when the call gives one,
+    must be the approved one; one that doesn't parse as an address asks. `cc`, `bcc`, `attachments` (and `htmlBody`)
+    must be absent or empty; the format field, when present, plain text (`body_format: plain`, `mimeType: text/plain`).
+    Subject: equal (surrounding spaces aside) to the approved one; a draft without one may not gain one. Free: the
+    sending account (`user_google_email`, one the owner connected) and threading fields (`thread_id`, `in_reply_to`,
+    `references`, `threadId`, `inReplyTo`). Any other field asks. Header injection: a line break or other control
+    character in a recipient, the subject, an "empty" field or a free field (which could start a `Bcc:` header)
+    means no match. Draft-creating tools (`draft_gmail_message`), Slack
+    and anything unrecognised ask as before.
+  - **The browser typing the approved text** (`mcp__browser__browser_type`, any draft kind): `text` equal, `element`
+    / `ref` / `slowly` free, `submit` must be absent or false (Enter can post or send, which is the unverifiable
+    part), and text with a line break may not be typed `slowly` (key by key a line break is an Enter press; otherwise
+    the text is filled in whole). Typing is not sending: the **click** on Post/Send still asks. Familiar can't tell what a click (or Enter)
+    lands on — the conversation, the account, a different button — so allowing "one click after the type" would hand
+    every approved draft a free unverifiable click on whatever the page offers. That click's card says the draft's text
+    was just typed in as approved and to check the live view.
+  - *Text normalisation*: `\r\n` = `\n`, and line breaks at the very end are ignored (models often add one; nobody sees
+    it). Nothing else: no trimming of spaces, no case or Unicode folding, no inner whitespace changes.
+  - *Media*: a draft with media gets no pre-approval at all (the files live in the teammate's workspace and can change
+    after the owner looked at them, even between the check and the connector reading them; and its text alone is not
+    what was approved), and a call with any attachment asks.
+- *One shot.* The first matching call uses the pre-approval up: Familiar records it as its own `approvals` row
+  (`status approved`, `decided_by rule`, `reason` "Sent as approved (draft #id)", `draft_id` = the draft, the call's
+  tool and input), so the Approvals history and the run's activity (an `approval` event with `approval_id` and
+  `draft_id`) show exactly what went out. A unique index on `draft_id` makes it one per draft even when two calls race;
+  a second send of the same text, or a retry after the first failed, asks. The pre-approval ends with its run (bound
+  to the run id). CRM activity logging is unchanged (the teammate logs `email_sent`/`dm_sent` with the draft id).
+- *Do-not-contact first.* Right before using it, `crm::teammate::draft_dnc` runs again on the approved draft; a hit (or
+  a failed check) asks the owner instead, and the card says why. A call that relates to a draft but differs from it
+  asks with a line saying how ("Not exactly draft #id as you approved it: the recipients differ…").
+- The follow-up message tells the teammate which one send won't ask again (and that the click still does).
 
 **Webhooks** (`crm::webhooks`, API `routes/crm_webhooks.rs`, owner only: teammates have no API access). `GET/POST
 /api/crm/webhooks`, `GET/PATCH/DELETE /api/crm/webhooks/{id}`, `POST /api/crm/webhooks/{id}/test` (a `ping`, sent at
