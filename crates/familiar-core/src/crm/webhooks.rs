@@ -8,7 +8,8 @@
 //!   is `failed`; another 4xx, a payload over the limit or a secret that can't be read fails at once ([`Failure`]).
 //! - Where a webhook may point ([`refused`]), checked when it is saved and again after DNS at every delivery, with the
 //!   connection pinned to the addresses that were checked (no DNS rebinding in between): `https` to public addresses;
-//!   this computer (loopback) over `http` or `https`; never private LAN, link-local (cloud metadata), multicast,
+//!   this computer (loopback) over `http` or `https` in the desktop app only ([`set_allow_loopback`]; a shared server
+//!   refuses it unless told otherwise); never private LAN, link-local (cloud metadata), multicast,
 //!   unspecified, documentation or other reserved addresses, whatever the scheme. Private LAN addresses are refused even
 //!   with https: the payload is customer data, LAN devices are the usual target of a forged request, and a receiver on
 //!   the LAN can be reached through a public https endpoint or a tunnel on this computer instead.
@@ -87,10 +88,32 @@ fn loopback(ip: IpAddr) -> bool {
     }
 }
 
+static ALLOW_LOOPBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Let webhooks go to this computer (loopback). On in the desktop app, where the computer is the owner's own and a local
+/// CRM is a normal receiver; off by default, because on a shared self-hosted server "this computer" is the server, and a
+/// user could aim webhooks (and the Test button's answers) at its internal services. A single-owner headless install
+/// opts in with `FAMILIAR_WEBHOOKS_ALLOW_LOOPBACK=1`.
+pub fn set_allow_loopback(on: bool) {
+    ALLOW_LOOPBACK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn loopback_allowed() -> bool {
+    ALLOW_LOOPBACK.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var("FAMILIAR_WEBHOOKS_ALLOW_LOOPBACK").is_ok_and(|v| v.trim() == "1")
+}
+
 /// Why `ip` may not receive a webhook over `https` (true) or `http` (false); None = it may.
 pub fn refused(ip: IpAddr, https: bool) -> Option<&'static str> {
+    refused_with(ip, https, loopback_allowed())
+}
+
+fn refused_with(ip: IpAddr, https: bool, allow_loopback: bool) -> Option<&'static str> {
     if loopback(ip) {
-        return None;
+        return (!allow_loopback).then_some(
+            "this computer, which only the desktop app may send webhooks to (single-owner servers: set \
+             FAMILIAR_WEBHOOKS_ALLOW_LOOPBACK=1)",
+        );
     }
     if !crate::permissions::is_public(ip) {
         return Some(
@@ -282,7 +305,10 @@ pub async fn send(url: &str, secret: &str, delivery: Uuid, event: &str, body: &[
             } else if e.is_connect() {
                 "could not connect".to_string()
             } else {
-                e.without_url().to_string()
+                // Not the library's text: it can describe the receiver (TLS details, protocol errors) to whoever reads
+                // the delivery log. The daemon's own log keeps the detail.
+                tracing::debug!("webhook request failed: {}", e.without_url());
+                "the request failed (TLS or protocol error)".to_string()
             })
         })?;
     let status = resp.status().as_u16();
@@ -529,7 +555,23 @@ mod tests {
     }
 
     #[test]
+    fn loopback_only_when_allowed() {
+        for ip in ["127.0.0.1", "127.9.9.9", "::1", "::ffff:127.0.0.1"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(refused_with(ip, false, false).unwrap().contains("only the desktop app"), "{ip}");
+            assert!(refused_with(ip, true, false).is_some(), "{ip}");
+            assert_eq!(refused_with(ip, false, true), None, "{ip}");
+        }
+        // The switch changes nothing else.
+        let lan: IpAddr = "10.0.0.5".parse().unwrap();
+        assert!(refused_with(lan, true, true).is_some());
+        assert_eq!(refused_with("8.8.8.8".parse().unwrap(), true, false), None);
+    }
+
+    #[test]
     fn address_rules() {
+        // As in the desktop app (the tests share one process; none of them turns it off).
+        set_allow_loopback(true);
         let ok = |u: &str| check_url(u).is_ok();
         for u in [
             "https://hooks.zapier.com/hooks/catch/1/abc/", "https://8.8.8.8/hook", "https://[2606:4700:4700::1111]/x",
@@ -565,7 +607,8 @@ mod tests {
 
     #[tokio::test]
     async fn names_are_checked_after_dns() {
-        // localhost is this computer: allowed over http
+        // localhost is this computer: allowed over http (in the desktop app)
+        set_allow_loopback(true);
         let u = check_url("http://localhost:9/hook").unwrap();
         let addrs = resolve(&u).await.unwrap();
         assert!(addrs.iter().all(|a| a.ip().is_loopback() && a.port() == 9), "{addrs:?}");

@@ -39,6 +39,8 @@ async fn start(secret: bool) -> Option<App> {
         eprintln!("SKIP: TEST_DATABASE_URL not set");
         return None;
     };
+    // As in the desktop app: the webhook tests receive on this computer.
+    familiar_core::crm::webhooks::set_allow_loopback(true);
     let db = format!("t_{}", Uuid::new_v4().simple());
     let mut c = PgConnection::connect(&admin).await.expect("connect admin db");
     sqlx::query(sqlx::AssertSqlSafe(format!("create database {db}")))

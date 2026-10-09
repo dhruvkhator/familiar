@@ -423,7 +423,10 @@ waiting deliveries.
   compare in constant time, and reject a `t` more than 5 minutes off.
 - **Where a webhook may point**, checked when it is saved and again at every delivery after DNS, with the connection
   pinned to the addresses that were checked (no DNS rebinding between check and connect): `https` to public addresses;
-  this computer (loopback, `localhost`) over `http` or `https`; never private LAN (RFC 1918, CGNAT, IPv6 ULA) — not
+  this computer (loopback, `localhost`) over `http` or `https`, in the desktop app only — a self-hosted server refuses
+  loopback (there "this computer" is the server, whose internal services a user could otherwise probe through the
+  Test button) unless a single-owner install sets `FAMILIAR_WEBHOOKS_ALLOW_LOOPBACK=1`; failed deliveries record
+  generic reasons ("could not connect", "HTTP 503"), never the HTTP library's error text; never private LAN (RFC 1918, CGNAT, IPv6 ULA) — not
   even with https, since the payload is customer data and LAN devices are the classic target of forged requests (a LAN
   receiver can be reached through a public https endpoint or a tunnel on this computer); never link-local (cloud
   metadata), multicast, unspecified, broadcast, documentation, benchmarking or reserved addresses, including IPv4 in

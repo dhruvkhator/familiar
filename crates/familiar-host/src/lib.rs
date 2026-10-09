@@ -107,6 +107,8 @@ impl Host {
     /// [`Host::boot_watch`]. Boot: create `~/.familiar/config.toml` on first run, load it, start the built-in database
     /// when `database_url` is unset, serve the API, start the daemon. Every failure lands in the boot status.
     pub fn start(rt: Handle) -> Host {
+        // The desktop app runs for one owner on their own computer: a CRM on it may receive webhooks.
+        familiar_core::crm::webhooks::set_allow_loopback(true);
         let host = Host {
             inner: Arc::new(Inner {
                 rt,
