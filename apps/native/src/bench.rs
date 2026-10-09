@@ -547,7 +547,7 @@ async fn scenario(shell: &Entity<Shell>, data: &Entity<AppData>, fx: &Arc<Mutex<
     let mut out = String::new();
     let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
     let _ = writeln!(out, "familiar-native bench ({profile} build, {})", chrono::Local::now().format("%Y-%m-%d %H:%M"));
-    let ready = until(cx, Duration::from_secs(10), |cx| {
+    let ready = until(cx, Duration::from_secs(30), |cx| {
         let d = data.read(cx);
         d.overview.is_some() && d.runs_loaded && d.schedules_loaded
     })

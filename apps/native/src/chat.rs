@@ -2,7 +2,11 @@
 //! selected thread's transcript (messages oldest → newest, the pending optimistic bubble, then the latest run's card
 //! with its live events, streamed text and approvals) and the composer. A teammate hired from a template shows its
 //! Set up checklist above the chat until that is done.
+//!
+//! The transcript is a virtual list (only the rows in view are built and laid out), messages are parsed once (a
+//! [`markdown::DocCache`] in step with the loaded list) and the streaming reply re-parses only its last block.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use familiar_client::{Event, Message, Role, Run, RunKind, RunStatus, Thread};
@@ -15,9 +19,9 @@ use familiar_ui::motion::{AnimationExt as _, EASE, MotionSpec};
 use familiar_ui::theme::{RADIUS_CARD, RADIUS_CHIP, SIDEBAR_WIDTH, Theme, Tone, text};
 use familiar_ui::toast::ToastStack;
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
-    prelude::FluentBuilder as _, px,
+    AnyElement, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ListAlignment,
+    ListState, ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Window, div, list, prelude::FluentBuilder as _, px,
 };
 use gpui_base::input::{InputEvent, TextareaState};
 use gpui_tokio::Tokio;
@@ -37,6 +41,29 @@ use crate::text_input;
 
 /// The caret of the streaming text.
 const CARET_BLINK: MotionSpec = MotionSpec::new(1000, EASE);
+
+/// Entrances play for rows this new; a row scrolled back into view (built again) doesn't replay its entrance.
+const FRESH: Duration = Duration::from_millis(480);
+
+/// One row of the transcript list.
+#[derive(Debug, Clone, PartialEq)]
+enum Row {
+    /// No thread yet: "Chat with …".
+    NoThread,
+    Loading,
+    /// A thread with nothing in it: "Say hello".
+    Empty,
+    /// `messages[i]`, with its id.
+    Message(usize, Uuid),
+    /// `outgoing[i]`, with its length (its key).
+    Outgoing(usize, usize),
+    /// The latest run, working.
+    Run(Uuid),
+    /// The latest run failed or was stopped.
+    Failed(Uuid),
+    /// The space under the last row.
+    End,
+}
 
 /// A message posted but not yet seen back from the server.
 struct Outgoing {
@@ -64,7 +91,15 @@ pub struct BotPage {
     composer: Entity<TextareaState>,
     outgoing: Vec<Outgoing>,
     sending: bool,
-    scroll: ScrollHandle,
+    /// The transcript: a virtual list of [`Row`]s.
+    list: ListState,
+    shown: Vec<Row>,
+    /// When each row was first built (entrances play once).
+    appeared: HashMap<SharedString, Instant>,
+    /// The loaded messages, parsed.
+    docs: markdown::DocCache,
+    /// The streaming reply, parsed as it grows.
+    live_doc: markdown::Streamed,
     thread_scroll: ScrollHandle,
     /// What the transcript showed last frame; a change while at the bottom scrolls to the new bottom.
     content_rev: (usize, usize, usize, usize, bool),
@@ -129,7 +164,11 @@ impl BotPage {
             composer,
             outgoing: Vec::new(),
             sending: false,
-            scroll: ScrollHandle::new(),
+            list: ListState::new(0, ListAlignment::Top, px(600.0)),
+            shown: Vec::new(),
+            appeared: HashMap::new(),
+            docs: markdown::DocCache::default(),
+            live_doc: markdown::Streamed::default(),
             thread_scroll: ScrollHandle::new(),
             content_rev: Default::default(),
             force_bottom: true,
@@ -218,6 +257,7 @@ impl BotPage {
         self.events.clear();
         self.events_run = None;
         self.outgoing.clear();
+        self.appeared.clear();
         self.force_bottom = true;
         self.reload_thread(cx);
     }
@@ -235,6 +275,7 @@ impl BotPage {
                 return;
             }
             list.sort_by_key(|m| m.created_at);
+            this.docs.sync(list.iter().filter(|m| m.role != Role::User).map(|m| (m.id, m.content.as_str())));
             this.messages = list;
             this.messages_loaded = true;
             this.prune_outgoing();
@@ -665,8 +706,14 @@ impl BotPage {
             .into_any_element()
     }
 
-    fn user_bubble(id: SharedString, content: String, pending: bool, theme: &Theme) -> AnyElement {
-        anim::appear(
+    /// `el` with its entrance while the row is fresh (see [`FRESH`]); after that, as the entrance leaves it.
+    fn entrance<E: gpui::Styled + IntoElement + 'static>(&mut self, id: SharedString, el: E) -> AnyElement {
+        let first = *self.appeared.entry(id.clone()).or_insert_with(Instant::now);
+        if first.elapsed() < FRESH { anim::appear(id, el).into_any_element() } else { el.into_any_element() }
+    }
+
+    fn user_bubble(&mut self, id: SharedString, content: String, pending: bool, theme: &Theme) -> AnyElement {
+        self.entrance(
             id,
             div().flex().justify_end().child(
                 div()
@@ -681,11 +728,11 @@ impl BotPage {
                     .child(content),
             ),
         )
-        .into_any_element()
     }
 
     /// The assistant side: mascot, "name · when", and a bubble.
     fn assistant_row(
+        &mut self,
         id: SharedString,
         header: String,
         avatar: familiar_ui::mascot::Avatar,
@@ -693,7 +740,7 @@ impl BotPage {
         theme: &Theme,
         bubble: impl IntoElement,
     ) -> AnyElement {
-        anim::appear(
+        self.entrance(
             id.clone(),
             div()
                 .flex()
@@ -723,50 +770,57 @@ impl BotPage {
                         ),
                 ),
         )
-        .into_any_element()
     }
 
-    fn message(&self, m: &Message, name: &SharedString, avatar: familiar_ui::mascot::Avatar, theme: &Theme) -> AnyElement {
+    fn message(&mut self, ix: usize, name: &SharedString, avatar: familiar_ui::mascot::Avatar, theme: &Theme) -> AnyElement {
+        let Some(m) = self.messages.get(ix) else { return div().into_any_element() };
         let id = SharedString::from(format!("msg-{}", m.id));
         if m.role == Role::User {
-            return Self::user_bubble(id, m.content.clone(), false, theme);
+            let content = m.content.clone();
+            return self.user_bubble(id, content, false, theme);
         }
         let who: SharedString = if m.role == Role::System { "System".into() } else { name.clone() };
-        Self::assistant_row(
-            id,
-            format!("{who} · {}", ago(Some(m.created_at))),
-            avatar,
-            MascotState::Idle,
-            theme,
-            markdown::render(&m.content, theme),
-        )
+        let header = format!("{who} · {}", ago(Some(m.created_at)));
+        let body = match self.docs.get(m.id) {
+            Some(doc) => doc.render(theme),
+            None => markdown::render(&m.content, theme),
+        };
+        self.assistant_row(id, header, avatar, MascotState::Idle, theme, body)
     }
 
     /// The live bubble: streamed thinking (italic) and text with a blinking caret, or "Working…".
-    fn live_bubble(&self, run: Uuid, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let buf = self.data.read(cx).live.get(&run).cloned().unwrap_or_default();
+    fn live_bubble(&mut self, run: Uuid, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let (working, thinking, text) = {
+            let buf = self.data.read(cx).live.get(&run);
+            let text = buf.map(|b| b.text.as_str()).unwrap_or_default();
+            let thinking = buf.map(|b| b.thinking.trim()).unwrap_or_default();
+            if !text.is_empty() {
+                self.live_doc.update(text);
+            }
+            (text.is_empty() && buf.is_none_or(|b| b.thinking.is_empty()), data::tail(thinking, 600), !text.is_empty())
+        };
         let mut col = div().flex().flex_col().gap(px(6.0));
-        if buf.text.is_empty() && buf.thinking.is_empty() {
+        if working {
             col = col.child(div().text_size(px(text::SMALL)).text_color(theme.muted).child("Working…"));
         }
-        if !buf.thinking.trim().is_empty() {
+        if !thinking.is_empty() {
             col = col.child(
                 div()
                     .text_size(px(text::SMALL))
                     .text_color(theme.muted)
                     .italic()
                     .line_clamp(3)
-                    .child(data::tail(buf.thinking.trim(), 600)),
+                    .child(thinking),
             );
         }
-        if !buf.text.is_empty() {
+        if text {
             crate::perf::painted("delta");
             col = col.child(
                 div()
                     .flex()
                     .flex_wrap()
                     .items_end()
-                    .child(markdown::render(&buf.text, theme))
+                    .child(self.live_doc.render(theme))
                     .child(
                         div()
                             .w(px(7.0))
@@ -830,12 +884,12 @@ impl BotPage {
             let (data, toasts) = (self.data.clone(), self.toasts.clone());
             body = body.children(self.approvals.render(&pending, &data, &toasts, window, cx));
         }
-        anim::appear(SharedString::from(format!("run-{}", run.id)), card(cx).px(px(14.0)).py(px(12.0)).child(body))
-            .into_any_element()
+        let card = card(cx).px(px(14.0)).py(px(12.0)).child(body);
+        self.entrance(SharedString::from(format!("run-{}", run.id)), card)
     }
 
     /// A failed or stopped run: one compact line under the message, with Retry (posts the same message again).
-    fn failed_notice(&self, run: &Run, cx: &mut Context<Self>) -> AnyElement {
+    fn failed_notice(&mut self, run: &Run, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let stopped = run.status == RunStatus::Cancelled;
         let summary = match run.error.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
@@ -849,7 +903,8 @@ impl BotPage {
             .filter(|p| !p.trim().is_empty())
             .or_else(|| self.messages.iter().rev().find(|m| m.role == Role::User).map(|m| m.content.clone()));
         let this = cx.entity();
-        anim::appear(
+        let sending = self.sending;
+        self.entrance(
             SharedString::from(format!("failed-{}", run.id)),
             div().flex().justify_end().child(
                 div()
@@ -882,16 +937,52 @@ impl BotPage {
                                 .size(ButtonSize::Small)
                                 .ghost()
                                 .icon(icons::REFRESH)
-                                .disabled(self.sending)
+                                .disabled(sending)
                                 .on_click(move |_, window, cx| this.update(cx, |p, cx| p.post(content.clone(), window, cx))),
                         )
                     }),
             ),
         )
-        .into_any_element()
     }
 
-    fn transcript(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// The transcript's rows, as of now.
+    fn rows_now(&self) -> Vec<Row> {
+        let mut rows = Vec::new();
+        if self.selected.is_none() && self.threads_loaded {
+            rows.push(Row::NoThread);
+        } else if !self.messages_loaded && self.selected.is_some() {
+            rows.push(Row::Loading);
+        } else {
+            if self.messages.is_empty() && self.runs.is_empty() && self.outgoing.is_empty() {
+                rows.push(Row::Empty);
+            }
+            rows.extend(self.messages.iter().enumerate().map(|(i, m)| Row::Message(i, m.id)));
+            rows.extend(self.outgoing.iter().enumerate().map(|(i, o)| Row::Outgoing(i, o.content.len())));
+            // Like a normal chat: the live card only while the run works; a finished run leaves just its reply, a
+            // failed or stopped one a one-line notice with Retry. Run details live in the teammate's activity.
+            if let Some(run) = self.runs.first() {
+                if run.status.is_active() {
+                    rows.push(Row::Run(run.id));
+                } else if matches!(run.status, RunStatus::Failed | RunStatus::Cancelled) {
+                    rows.push(Row::Failed(run.id));
+                }
+            }
+        }
+        rows.push(Row::End);
+        rows
+    }
+
+    /// The transcript's furthest scroll offset, and how far down it is.
+    fn list_offsets(list: &ListState) -> (f32, f32) {
+        (f32::from(list.max_offset_for_scrollbar().y), -f32::from(list.scroll_px_offset_for_scrollbar().y))
+    }
+
+    /// Row `ix` of the transcript (the list asks only for the rows in view).
+    fn row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(row) = self.shown.get(ix).cloned() else { return div().into_any_element() };
+        if row == Row::End {
+            return div().h(px(24.0)).into_any_element();
+        }
         let theme = Theme::of(cx).clone();
         let (name, avatar) = {
             let d = self.data.read(cx);
@@ -900,9 +991,8 @@ impl BotPage {
                 None => ("".into(), familiar_ui::mascot::default_avatar(&self.bot.to_string())),
             }
         };
-        let mut col = div().flex().flex_col().gap(px(18.0));
-        if self.selected.is_none() && self.threads_loaded {
-            col = col.child(anim::appear(
+        let body = match row {
+            Row::NoThread => anim::appear(
                 "chat-none",
                 div()
                     .flex()
@@ -918,49 +1008,64 @@ impl BotPage {
                             .child(SharedString::from(format!("Chat with {name}"))),
                     )
                     .child(div().text_color(theme.muted).child("Say hello below to start a thread.")),
-            ));
-        } else if !self.messages_loaded && self.selected.is_some() {
-            for (i, (user, width)) in [(true, 220.0), (false, 420.0), (true, 160.0), (false, 360.0)].into_iter().enumerate() {
-                col = col.child(
-                    div()
-                        .flex()
-                        .when(user, |el| el.justify_end())
-                        .gap(px(12.0))
-                        .when(!user, |el| el.child(Skeleton::new(30.0).width(30.0).radius(15.0)))
-                        .child(Skeleton::new(if i % 2 == 0 { 40.0 } else { 64.0 }).width(width).radius(RADIUS_CARD)),
-                );
-            }
-        } else {
-            if self.messages.is_empty() && self.runs.is_empty() && self.outgoing.is_empty() {
-                col = col.child(anim::appear(
-                    "chat-empty",
-                    empty(
-                        SharedString::from(format!("Say hello to {name}")),
-                        Some("Ask for something, or tell it what to keep an eye on.".into()),
-                        cx,
-                    ),
-                ));
-            }
-            for m in &self.messages {
-                col = col.child(self.message(m, &name, avatar, &theme));
-            }
-            for (i, o) in self.outgoing.iter().enumerate() {
-                col = col.child(Self::user_bubble(
-                    SharedString::from(format!("out-{i}-{}", o.content.len())),
-                    o.content.clone(),
-                    true,
-                    &theme,
-                ));
-            }
-            // Like a normal chat: the live card only while the run works; a finished run leaves just its reply, a
-            // failed or stopped one a one-line notice with Retry. Run details live in the teammate's activity.
-            if let Some(run) = self.runs.first().cloned() {
-                if run.status.is_active() {
-                    col = col.child(self.run_card(&run, window, cx));
-                } else if matches!(run.status, RunStatus::Failed | RunStatus::Cancelled) {
-                    col = col.child(self.failed_notice(&run, cx));
+            )
+            .into_any_element(),
+            Row::Loading => {
+                let mut col = div().flex().flex_col().gap(px(18.0));
+                for (i, (user, width)) in [(true, 220.0), (false, 420.0), (true, 160.0), (false, 360.0)].into_iter().enumerate() {
+                    col = col.child(
+                        div()
+                            .flex()
+                            .when(user, |el| el.justify_end())
+                            .gap(px(12.0))
+                            .when(!user, |el| el.child(Skeleton::new(30.0).width(30.0).radius(15.0)))
+                            .child(Skeleton::new(if i % 2 == 0 { 40.0 } else { 64.0 }).width(width).radius(RADIUS_CARD)),
+                    );
                 }
+                col.into_any_element()
             }
+            Row::Empty => anim::appear(
+                "chat-empty",
+                empty(
+                    SharedString::from(format!("Say hello to {name}")),
+                    Some("Ask for something, or tell it what to keep an eye on.".into()),
+                    cx,
+                ),
+            )
+            .into_any_element(),
+            Row::Message(i, _) => self.message(i, &name, avatar, &theme),
+            Row::Outgoing(i, _) => match self.outgoing.get(i).map(|o| o.content.clone()) {
+                Some(content) => {
+                    let id = SharedString::from(format!("out-{i}-{}", content.len()));
+                    self.user_bubble(id, content, true, &theme)
+                }
+                None => div().into_any_element(),
+            },
+            Row::Run(id) | Row::Failed(id) => match self.runs.first().cloned().filter(|r| r.id == id) {
+                Some(run) if run.status.is_active() => self.run_card(&run, window, cx),
+                Some(run) => self.failed_notice(&run, cx),
+                None => div().into_any_element(),
+            },
+            Row::End => div().into_any_element(),
+        };
+        // The column the rows sit in: centred, at most 720 wide, 18 apart, 24 from the top.
+        div()
+            .w_full()
+            .flex()
+            .justify_center()
+            .px(px(28.0))
+            .pt(px(if ix == 0 { 24.0 } else { 18.0 }))
+            .child(div().w_full().max_w(px(720.0)).child(body))
+            .into_any_element()
+    }
+
+    fn transcript(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        // Rows that changed identity are spliced into the list; the rows in view are re-measured every frame.
+        let rows = self.rows_now();
+        if rows != self.shown {
+            let same = self.shown.iter().zip(&rows).take_while(|(a, b)| a == b).count();
+            self.list.splice(same..self.shown.len(), rows.len() - same);
+            self.shown = rows;
         }
 
         // What a click on this teammate or thread waited for is on screen.
@@ -978,35 +1083,26 @@ impl BotPage {
             live_len,
             self.runs.first().is_some_and(|r| r.status.is_active()),
         );
-        let max = f32::from(self.scroll.max_offset().y);
-        let at = -f32::from(self.scroll.offset().y);
+        let (max, at) = Self::list_offsets(&self.list);
         if self.force_bottom || (rev != self.content_rev && max - at <= 80.0) {
-            self.scroll.scroll_to_bottom();
+            self.list.scroll_to_end();
             self.force_bottom = false;
         }
         self.content_rev = rev;
 
+        let page = cx.entity();
+        let state = self.list.clone();
         edge_faded(
             20.0,
             true,
             true,
-            div()
-                .id("transcript")
-                .size_full()
-                .overflow_y_scroll()
-                .track_scroll(&self.scroll)
-                .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
-                .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .justify_center()
-                        .px(px(28.0))
-                        .py(px(24.0))
-                        .child(div().w_full().max_w(px(720.0)).child(col)),
-                ),
+            list(self.list.clone(), move |ix, window, cx| page.update(cx, |p, cx| p.row(ix, window, cx))).size_full(),
         )
-        .fade_overflow_y(&self.scroll)
+        // Read at paint, once the list has clamped its offset for this frame.
+        .fade_overflow_y_with(move |_| {
+            let (max, at) = Self::list_offsets(&state);
+            (at > 0.5, max - at > 0.5)
+        })
         .into_any_element()
     }
 
@@ -1103,7 +1199,7 @@ impl Render for BotPage {
             None => {
                 // With the computer open on a narrow window, the thread list makes room.
                 let threads = (main_w - shown_w - 236.0 >= 460.0).then(|| self.thread_list(cx));
-                let transcript = self.transcript(window, cx);
+                let transcript = self.transcript(cx);
                 let jump = self.jump_button(cx);
                 let composer = self.composer(window, cx);
                 div().flex().flex_1().min_w_0().h_full().children(threads).child(
@@ -1131,8 +1227,7 @@ impl Render for BotPage {
 impl BotPage {
     /// "Latest" pill, shown while the reader is scrolled well above the bottom.
     fn jump_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let max = f32::from(self.scroll.max_offset().y);
-        let at = -f32::from(self.scroll.offset().y);
+        let (max, at) = Self::list_offsets(&self.list);
         if max - at <= 240.0 {
             return None;
         }
