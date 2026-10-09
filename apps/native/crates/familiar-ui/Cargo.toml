@@ -24,6 +24,8 @@ resvg = { version = "0.46", default-features = false }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
+    # CreateWaitableTimerExW takes SECURITY_ATTRIBUTES: without this the crate only built inside the app's workspace.
+    "Win32_Security",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }

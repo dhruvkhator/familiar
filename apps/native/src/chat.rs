@@ -274,6 +274,12 @@ impl BotPage {
             }
             list.sort_by_key(|m| m.created_at);
             this.docs.sync(list.iter().filter(|m| m.role != Role::User).map(|m| (m.id, m.content.as_str())));
+            // The virtual list builds older rows only when they scroll into view; mark every loaded message as seen now
+            // so only rows shown within FRESH of the load (and messages that arrive later) play their entrance.
+            let now = Instant::now();
+            for m in &list {
+                this.appeared.entry(SharedString::from(format!("msg-{}", m.id))).or_insert(now);
+            }
             this.messages = list;
             this.messages_loaded = true;
             this.prune_outgoing();
@@ -299,6 +305,10 @@ impl BotPage {
                 return;
             }
             this.runs = runs;
+            let now = Instant::now();
+            for r in &this.runs {
+                this.appeared.entry(SharedString::from(format!("run-{}", r.id))).or_insert(now);
+            }
             let live = this.runs.first().filter(|r| r.status.is_active()).map(|r| r.id);
             if live != this.events_run {
                 this.events_run = live;

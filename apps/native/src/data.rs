@@ -230,6 +230,9 @@ impl AppData {
     {
         if let Some(v) = self.client.peek::<T>(&path) {
             apply(self, v, cx);
+            // Views that act on data (opening `--open <name>`, closing a deleted teammate) hear about cached values too,
+            // so they work even when the refresh below fails.
+            self.updated(part, cx);
         }
         let client = self.client.clone();
         let task = Tokio::spawn(cx, async move { client.get::<T>(&path).await });

@@ -6,7 +6,7 @@
 //! live text only on Today, which shows it).
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use familiar_client::{Run, RunKind};
 use familiar_ui::anim::{self, Crossfade, Expand};
@@ -38,6 +38,8 @@ use crate::templates::{Picked, TemplatePicker};
 
 /// Resting on a teammate this long (sidebar row, Today's cards) fetches their chat before the click.
 const PREFETCH_AFTER: Duration = Duration::from_millis(120);
+/// A teammate prefetched this recently is not fetched again on the next rest (the pointer wandering over the list).
+const PREFETCH_AGAIN_AFTER: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Route {
@@ -74,6 +76,8 @@ pub struct Shell {
     settled: bool,
     /// The teammate under the pointer, and the wait before their chat is fetched (dropping it cancels the wait).
     hovering: Option<(Uuid, Task<()>)>,
+    /// When each teammate's chat was last prefetched.
+    prefetched: HashMap<Uuid, Instant>,
 }
 
 impl Shell {
@@ -152,6 +156,7 @@ impl Shell {
             open_tab: None,
             settled: true,
             hovering: None,
+            prefetched: HashMap::new(),
         }
     }
 
@@ -216,12 +221,16 @@ impl Shell {
     /// The pointer rests on a teammate (a sidebar row, Today's cards): unless their page is already open, fetch their
     /// chat into the cache after [`PREFETCH_AFTER`], so the click shows it at once (and refreshes it as usual).
     pub fn hover_teammate(&mut self, bot: Uuid, cx: &mut Context<Self>) {
-        if self.pages.contains_key(&bot) || self.hovering.as_ref().is_some_and(|(b, _)| *b == bot) {
+        if self.pages.contains_key(&bot)
+            || self.hovering.as_ref().is_some_and(|(b, _)| *b == bot)
+            || self.prefetched.get(&bot).is_some_and(|at| at.elapsed() < PREFETCH_AGAIN_AFTER)
+        {
             return;
         }
         let client = self.data.read(cx).client.clone();
-        let wait = cx.spawn(async move |_, cx| {
+        let wait = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PREFETCH_AFTER).await;
+            let _ = this.update(cx, |this, _| this.prefetched.insert(bot, Instant::now()));
             // Once started, the fetch finishes even if the pointer moves on: it only warms the cache.
             Tokio::spawn(cx, crate::chat::prefetch(client, bot)).detach();
         });

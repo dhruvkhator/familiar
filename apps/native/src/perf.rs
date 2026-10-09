@@ -43,6 +43,9 @@ thread_local! {
     static STATS: RefCell<Stats> = RefCell::new(Stats::default());
 }
 
+/// At most this many frame times and interval results are kept between takes.
+const MAX_KEPT: usize = 100_000;
+
 /// Call first thing in `main`. `bench` turns the probes on without a log file (the bench reports itself).
 pub fn init(bench: bool) {
     START.get_or_init(|| (Instant::now(), process_age()));
@@ -163,13 +166,19 @@ fn frame_end() {
     let mut lines = Vec::new();
     STATS.with(|s| {
         let mut s = s.borrow_mut();
-        if let Some(start) = s.frame_start.take() {
+        // Capped: only the bench and the 5 s log summary drain these, and a gallery window or a long session with the
+        // log on would otherwise grow them forever.
+        if let Some(start) = s.frame_start.take()
+            && s.frames.len() < MAX_KEPT
+        {
             s.frames.push(now.duration_since(start).as_secs_f32() * 1000.0);
         }
         for name in std::mem::take(&mut s.ending) {
             if let Some(at) = s.began.remove(name) {
                 let ms = now.duration_since(at).as_secs_f64() * 1000.0;
-                s.results.push((name, ms));
+                if s.results.len() < MAX_KEPT {
+                    s.results.push((name, ms));
+                }
                 lines.push(format!("{name} {ms:.1} ms"));
             }
         }

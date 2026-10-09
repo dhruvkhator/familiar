@@ -212,7 +212,8 @@ impl Theme {
             sunken,
             line: hex(0xe9e8e6),
             ink: hex(0x333641),
-            muted: hex(0x777885),
+            // 4.6:1 on the page, 5.0:1 on cards (WCAG AA for body text); same value in the web app's index.css.
+            muted: hex(0x6e6f7c),
             accent,
             accent_ink: hex(0xffffff),
             accent_soft: hex(0xeeeffa),
