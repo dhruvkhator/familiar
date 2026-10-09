@@ -190,7 +190,7 @@ impl Parity {
             created_at: now - Duration::days(days),
         };
         let rules = vec![
-            rule(1, None, "Bash(git status*)", RuleDecision::Allow, Some("Only looks, never changes anything"), 30),
+            rule(1, None, "Bash(git status*)", RuleDecision::Allow, Some("So it can check where things stand while it works"), 30),
             rule(2, None, "WebFetch", RuleDecision::Review, None, 28),
             rule(3, None, "mcp__github__create_pull_request", RuleDecision::Ask, Some("I want to see every pull request first"), 20),
             rule(4, Some(answers), "Edit(docs/*)", RuleDecision::Allow, None, 12),

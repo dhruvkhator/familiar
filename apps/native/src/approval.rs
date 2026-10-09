@@ -358,7 +358,7 @@ pub fn rule_words(rule: &str) -> String {
         r if r.starts_with("mcp__") => {
             let mut parts = r.trim_start_matches("mcp__").splitn(2, "__");
             let (server, tool) = (parts.next().unwrap_or_default(), parts.next().unwrap_or_default());
-            format!("use {}'s {} (it only reads)", server, tool.replace('_', " "))
+            format!("use {}'s {}", server, tool.replace('_', " "))
         }
         r => format!("use {r}"),
     }
@@ -1269,7 +1269,7 @@ mod tests {
     fn always_allow_reads_plainly() {
         assert_eq!(rule_words("Bash(ls -la)"), "run exactly `ls -la` (that command, nothing longer or chained)");
         assert_eq!(rule_words("Write"), "create and overwrite files in its workspace");
-        assert_eq!(rule_words("mcp__github__get_issue"), "use github's get issue (it only reads)");
+        assert_eq!(rule_words("mcp__github__get_issue"), "use github's get issue");
         assert_eq!(rule_words("Bash(git status *)"), "run commands like `git status *`");
     }
 }

@@ -38,14 +38,20 @@ const TIERS: [(RuleDecision, &str, &str); 4] = [
     (RuleDecision::Deny, "Hand it to me", "It stops and tells you to do it yourself."),
 ];
 
-/// What always needs you, whatever the rules say.
-const LOCKED: [&str; 6] = [
-    "Deleting files recursively (rm -rf, Remove-Item -Recurse)",
-    "Installing software (npm -g, pip, winget, choco)",
-    "Running as administrator (sudo, runas)",
-    "Force-pushing or hard-resetting git history",
+/// What always needs you, whatever the rules say: the engine's `always_human` (familiar-core's permissions.rs), in
+/// words. Keep the two in step.
+const LOCKED: [&str; 11] = [
+    "Deleting in bulk: rm -r, Remove-Item -Recurse, del /s, find -delete",
+    "Installing or removing software: npm -g, pip, uv, cargo install, winget, choco, brew, apt",
+    "Running as administrator: sudo, su, runas",
+    "Running code written on the spot: python -c, node -e, Invoke-Expression, Invoke-Command",
     "Downloading a script and running it",
-    "Editing the registry or scheduled tasks",
+    "Force-pushing, hard resets and git clean -f",
+    "Changing permissions recursively: chmod -R, chown -R, icacls /t, takeown",
+    "System changes: format, diskpart, shutdown, reboot, msiexec, dd to a disk",
+    "Editing the registry",
+    "Changing scheduled tasks: schtasks, crontab",
+    "Talking to the browser's debugging port directly",
 ];
 
 /// Patterns to start from.
@@ -234,9 +240,17 @@ impl RulesPage {
         cx.notify();
         let client = self.client(cx);
         let (old, body) = (r.id, NewRule { bot_id: r.bot_id, pattern: Some(r.pattern.clone()), decision: Some(decision.as_str().into()), note: r.note.clone() });
+        // Never two rules at once that together allow more than either: leaving `allow`, the old rule goes first (the
+        // moment between only adds prompts); otherwise the new one comes first (a stricter rule still wins meanwhile).
+        let first_delete = delete_first(r.decision);
         let task = Tokio::spawn(cx, async move {
-            client.create_rule(&body).await?;
-            client.delete_rule(old).await
+            if first_delete {
+                client.delete_rule(old).await?;
+                client.create_rule(&body).await.map(|_| ())
+            } else {
+                client.create_rule(&body).await?;
+                client.delete_rule(old).await
+            }
         });
         cx.spawn(async move |this, cx| {
             let r = task.await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.message()));
@@ -435,7 +449,7 @@ impl RulesPage {
                     ),
             )
             .child(div().flex().flex_col().gap(px(6.0)).child(label("Note")).child(text_input::field("rule-note", &note, 38.0, window, cx)))
-            .when(danger, |el| el.child(danger_note(&theme)))
+            .when(danger, |el| el.child(danger_note(&typed, &theme)))
             .when_some(self.add_error.clone(), |el, e| el.child(div().text_size(px(text::SMALL)).text_color(theme.bad).child(e)))
             .child({
                 let cancel = cx.entity();
@@ -512,7 +526,7 @@ impl RulesPage {
                             }),
                     ),
             )
-            .when(dangerous(&r.pattern, r.decision), |el| el.child(danger_note(&theme)));
+            .when(dangerous(&r.pattern, r.decision), |el| el.child(danger_note(&r.pattern, &theme)));
         if self.confirm_delete == Some(id) {
             let (yes, no) = (cx.entity(), cx.entity());
             let after = match r.decision {
@@ -653,7 +667,7 @@ impl Render for RulesPage {
                         .child(icon(icons::LOCK).size(px(16.0)).text_color(theme.accent))
                         .child(div().font_weight(FontWeight::MEDIUM).child("Always your call")),
                 )
-                .child(div().text_size(px(text::SMALL)).text_color(theme.muted).child("These never run without you, whatever the rules say."))
+                .child(div().text_size(px(text::SMALL)).text_color(theme.muted).child("These always ask you, whatever the rules say, including inside longer commands (a shell running another, a pipe, a chain):"))
                 .child(locked),
         )
     }
@@ -681,7 +695,7 @@ fn group_head(who: Option<(Uuid, familiar_ui::mascot::Avatar)>, label: &str, the
         .into_any_element()
 }
 
-fn danger_note(theme: &Theme) -> AnyElement {
+fn danger_note(pattern: &str, theme: &Theme) -> AnyElement {
     div()
         .flex()
         .items_start()
@@ -691,13 +705,40 @@ fn danger_note(theme: &Theme) -> AnyElement {
         .rounded(px(RADIUS_CONTROL))
         .bg(theme.bad_soft)
         .child(div().pt(px(1.0)).child(icon(icons::DANGER_TRIANGLE).size(px(14.0)).text_color(theme.bad)))
-        .child(div().flex_1().min_w_0().text_size(px(text::SMALL)).text_color(theme.bad).child(
-            "This lets it run any command on your PC without asking (only the actions below still need you). Prefer narrow patterns like Bash(git status*).",
-        ))
+        .child(div().flex_1().min_w_0().text_size(px(text::SMALL)).text_color(theme.bad).child(danger_words(pattern)))
         .into_any_element()
 }
 
 // ---- pure ---------------------------------------------------------------------------------------------------------
+
+/// The warning on a rule that allows too much: any tool at all, or any command.
+pub fn danger_words(pattern: &str) -> &'static str {
+    if any_tool(pattern) {
+        "This lets it use every tool without asking: run any command, change files, use the browser, your connectors and \
+         your desktop. Only what's under \"Always your call\" still asks you. Prefer narrow patterns like Edit or \
+         mcp__github__list_issues."
+    } else {
+        "This lets it run any command on your PC without asking. Only what's under \"Always your call\" still asks you. \
+         Prefer narrow patterns that name a command, like Bash(npm run test)."
+    }
+}
+
+/// The pattern covers every tool (not just commands): its name part matches any tool name.
+pub fn any_tool(pattern: &str) -> bool {
+    let p = pattern.trim();
+    let (name, arg) = match p.split_once('(') {
+        Some((n, rest)) => (n, rest.strip_suffix(')')),
+        None => (p, None),
+    };
+    // Unrelated tool names; with an argument, it must also match any argument.
+    glob(name, "Edit") && glob(name, "mcp__x__y") && arg.is_none_or(|a| glob(a, "C:\\any\\file.txt") && glob(a, "x7q; rm"))
+}
+
+/// Changing a rule's tier: remove the old rule before adding the new one when the old one allowed something (so the
+/// two never stand together with the old allow in force), else add the new one first.
+pub fn delete_first(old: RuleDecision) -> bool {
+    old == RuleDecision::Allow
+}
 
 /// A rule that lets a teammate run any command without asking: it matches Bash with any command, the way the engine
 /// matches rules (`*` in the tool name or the argument matches anything: `*`, `Bash`, `Bash(*)`, `B*`, `*(*)`…).
@@ -843,6 +884,18 @@ mod tests {
         }
         assert_eq!(pattern_words("B*"), "run any command, and use any tool named like “B*”");
         assert_eq!(pattern_words("Web*"), "use tools named like “Web*”");
+        // Every tool, or just any command: the warning says which.
+        for p in ["*", "*(*)", "**"] {
+            assert!(any_tool(p), "{p}");
+            assert!(danger_words(p).contains("every tool"), "{p}");
+        }
+        for p in ["Bash", "B*", "Bash(*)"] {
+            assert!(!any_tool(p), "{p}");
+            assert!(danger_words(p).contains("any command"), "{p}");
+        }
+        // Leaving "Do it", the old rule goes first; otherwise the new one comes first.
+        assert!(delete_first(RuleDecision::Allow));
+        assert!(!delete_first(RuleDecision::Ask) && !delete_first(RuleDecision::Deny) && !delete_first(RuleDecision::Review));
         assert_eq!(TIERS.iter().map(|(d, _, _)| d.as_str()).collect::<Vec<_>>(), ["allow", "review", "ask", "deny"]);
     }
 }
