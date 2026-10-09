@@ -1,15 +1,17 @@
 //! The default launch: a sidebar of teammates (mascots + live status) and the main area — Today, Needs you, or a
 //! teammate's page — with route crossfades. Everything comes from the live [`AppData`] entity.
+//!
+//! Redraws stay local: the [`Sidebar`] and a teammate's page are their own views, drawn cached (each redraws when it
+//! is notified, not whenever the shell does), and the shell redraws for the data it shows ([`DataEvent::Updated`];
+//! live text only on Today, which shows it).
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use familiar_client::{Run, RunKind};
 use familiar_ui::anim::{self, Crossfade, Expand};
-use familiar_ui::appearance::{self, AppearanceMode};
 use familiar_ui::components::{
-    Button, ButtonSize, HoverCard, Led, LedStatus, SectionHeader, SidebarItem, Skeleton, StatusChip, card, chip,
-    divider, empty, group_label,
+    Button, ButtonSize, HoverCard, SectionHeader, Skeleton, StatusChip, card, chip, divider, empty,
 };
 use familiar_ui::edge_fade::edge_faded;
 use familiar_ui::icons::{self, icon};
@@ -19,17 +21,18 @@ use familiar_ui::theme::{RADIUS_CARD, SIDEBAR_WIDTH, Theme, Tone, text};
 use familiar_ui::toast::ToastStack;
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
-    prelude::FluentBuilder as _, px,
+    ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, StyleRefinement,
+    Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 use uuid::Uuid;
 
 use crate::approval::ApprovalCards;
+use crate::sidebar::{self, Sidebar};
 use crate::bot_settings::{BotSettings, CreateEvent};
 use crate::chat::{BotPage, TAB_SETTINGS};
 use crate::schedules::SchedulesPage;
 use crate::settings::AppSettings;
-use crate::data::{AppData, Status, Teammate, ago, excerpt, run_status, tail, until};
+use crate::data::{AppData, DataEvent, Status, Teammate, ago, excerpt, run_status, tail, until};
 use crate::templates::{Picked, TemplatePicker};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,8 +49,8 @@ pub struct Shell {
     data: Entity<AppData>,
     route: Crossfade<Route>,
     toasts: Entity<ToastStack>,
+    sidebar: Entity<Sidebar>,
     scroll: ScrollHandle,
-    side_scroll: ScrollHandle,
     expanded: HashMap<Uuid, Expand>,
     approvals: ApprovalCards,
     /// The inbox's large cards (their own answer boxes).
@@ -63,53 +66,74 @@ pub struct Shell {
     form_gen: usize,
     /// Open this teammate's page on its Settings tab (from `--open <name>/settings`).
     open_tab: Option<Uuid>,
+    /// No route crossfade is running: pages may be drawn cached.
+    settled: bool,
 }
 
 impl Shell {
     pub fn new(data: Entity<AppData>, open: Option<String>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         familiar_ui::observe_window(window, cx);
         let mut open = open;
-        cx.observe(&data, move |this: &mut Self, data, cx| {
-            if open.is_some() && data.read(cx).overview.is_some() {
-                let want = open.take().unwrap_or_default();
-                this.open(&want, cx);
-            }
-            // A deleted teammate's page closes.
-            if let Route::Teammate(id) = this.route.current().clone() {
-                let d = data.read(cx);
-                if d.overview.is_some() && !d.bots().iter().any(|b| b.id.to_string() == id.as_ref()) {
-                    if let Ok(uuid) = id.parse::<Uuid>() {
-                        this.pages.remove(&uuid);
+        cx.subscribe(&data, move |this: &mut Self, data, ev: &DataEvent, cx| match ev {
+            DataEvent::Updated(_) => {
+                if open.is_some() && data.read(cx).overview.is_some() {
+                    let want = open.take().unwrap_or_default();
+                    this.open(&want, cx);
+                }
+                // A deleted teammate's page closes.
+                if let Route::Teammate(id) = this.route.current().clone() {
+                    let d = data.read(cx);
+                    if d.overview.is_some() && !d.bots().iter().any(|b| b.id.to_string() == id.as_ref()) {
+                        if let Ok(uuid) = id.parse::<Uuid>() {
+                            this.pages.remove(&uuid);
+                        }
+                        this.navigate(Route::Today, cx);
                     }
-                    this.navigate(Route::Today, cx);
+                }
+                cx.notify()
+            }
+            // Live text: only Today shows it (the tail of each active run), the teammate's page redraws itself.
+            DataEvent::Delta(run) => {
+                if *this.route.current() == Route::Today && data.read(cx).runs.iter().any(|r| r.id == *run && r.status.is_active()) {
+                    cx.notify()
                 }
             }
-            cx.notify()
+            DataEvent::Changed(_) => {}
         })
         .detach();
         // "Review…" on a compact approval card opens the inbox.
         let weak = cx.entity().downgrade();
+        let weak_shell = weak.clone();
         cx.set_global(crate::approval::InboxOpener(std::rc::Rc::new(move |cx: &mut App| {
             if let Some(shell) = weak.upgrade() {
                 shell.update(cx, |s, cx| s.navigate(Route::NeedsYou, cx));
             }
         })));
-        // Relative times ("5m ago", "in 2h") move on their own: re-render every 30 s like the web's clock.
+        // Relative times ("5m ago", "in 2h") move on their own: re-render every 30 s like the web's clock (the sidebar
+        // and the pages too: a teammate's "Done" fades to "Idle", the computer goes offline).
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(Duration::from_secs(30)).await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                let ticked = this.update(cx, |s, cx| {
+                    cx.notify();
+                    s.sidebar.update(cx, |_, cx| cx.notify());
+                    for page in s.pages.values() {
+                        page.update(cx, |_, cx| cx.notify());
+                    }
+                });
+                if ticked.is_err() {
                     break;
                 }
             }
         })
         .detach();
+        let sidebar = cx.new(|cx| Sidebar::new(data.clone(), weak_shell, cx));
         Self {
             data,
             route: Crossfade::new(Route::Today),
             toasts: cx.new(|_| ToastStack::new()),
+            sidebar,
             scroll: ScrollHandle::new(),
-            side_scroll: ScrollHandle::new(),
             expanded: HashMap::new(),
             approvals: ApprovalCards::default(),
             inbox: ApprovalCards::big(),
@@ -120,6 +144,7 @@ impl Shell {
             new_bot: None,
             form_gen: 0,
             open_tab: None,
+            settled: true,
         }
     }
 
@@ -168,8 +193,10 @@ impl Shell {
             let shown = route == Route::Settings;
             s.update(cx, |s, cx| s.set_shown(shown, cx));
         }
+        let shown = route.clone();
         if self.route.set(route) {
             self.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+            self.sidebar.update(cx, |s, cx| s.set_route(shown, cx));
             cx.notify();
         }
     }
@@ -183,181 +210,7 @@ impl Shell {
     pub fn hover_teammate(&mut self, _bot: Uuid, _cx: &mut Context<Self>) {}
 
     fn loading(&self, cx: &App) -> bool {
-        let d = self.data.read(cx);
-        d.overview.is_none() && d.status == Status::Connecting
-    }
-
-
-    fn sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx).clone();
-        let this = cx.entity();
-        let current = self.route.current().clone();
-        let dark = theme.is_dark();
-        let pending = self.data.read(cx).pending.len();
-        let nav = |id: &'static str, label: &'static str, glyph: &'static str, route: Route, badge: usize| {
-            let this = this.clone();
-            let selected = current == route;
-            SidebarItem::new(id, label).icon(glyph).selected(selected).badge(badge).on_click(move |_, _, cx| {
-                this.update(cx, |shell, cx| shell.navigate(route.clone(), cx))
-            })
-        };
-        let mut teammates = div().flex().flex_col().gap(px(2.0));
-        if self.loading(cx) {
-            for i in 0..4 {
-                teammates = teammates.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(10.0))
-                        .h(px(48.0))
-                        .px(px(8.0))
-                        .child(Skeleton::new(30.0).width(30.0).radius(15.0))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(6.0))
-                                .child(Skeleton::new(10.0).width(90.0 - i as f32 * 8.0))
-                                .child(Skeleton::new(8.0).width(56.0)),
-                        ),
-                );
-            }
-        } else {
-            let list = self.data.read(cx).teammates();
-            if list.is_empty() {
-                teammates = teammates.child(
-                    div().px(px(12.0)).text_size(px(text::SMALL)).text_color(theme.muted).child("No teammates yet."),
-                );
-            }
-            for (i, t) in list.into_iter().enumerate() {
-                let this = this.clone();
-                let route = Route::Teammate(t.id.clone());
-                let color = (t.state == MascotState::NeedsYou).then_some(theme.warn);
-                teammates = teammates.child(anim::stagger(
-                    SharedString::from(format!("side-in-{}", t.id)),
-                    i,
-                    div().child(
-                        SidebarItem::new(SharedString::from(format!("side-{}", t.id)), t.name.clone())
-                            .leading(Mascot::new(format!("side-{}", t.id), t.avatar, t.state, 30.0))
-                            .sublabel(t.state.label(), color)
-                            .selected(current == route)
-                            .on_click(move |_, _, cx| this.update(cx, |s, cx| s.navigate(route.clone(), cx))),
-                    ),
-                ));
-            }
-        }
-        let pc_online = self.data.read(cx).pc_online();
-        let this_toggle = cx.entity();
-        div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .w(px(SIDEBAR_WIDTH))
-            .h_full()
-            .bg(theme.surface)
-            .border_r_1()
-            .border_color(theme.line)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px(px(16.0))
-                    // Under the app's own title bar the sidebar already starts lower.
-                    .pt(px(if crate::titlebar::CUSTOM { 4.0 } else { 16.0 }))
-                    .pb(px(12.0))
-                    .child(
-                        div()
-                            .text_size(px(18.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme.ink)
-                            .child("Familiar"),
-                    )
-                    .child(
-                        Button::icon_only("theme-toggle", if dark { icons::SUN } else { icons::MOON })
-                            .tooltip(if dark { "Light appearance" } else { "Dark appearance" })
-                            .on_click(move |_, _, cx| {
-                                let next = if dark { AppearanceMode::Light } else { AppearanceMode::Dark };
-                                appearance::set_mode(next, cx);
-                                crate::prefs::update(|p| p.theme = next);
-                                this_toggle.update(cx, |_, cx| cx.notify());
-                            }),
-                    ),
-            )
-            .child(
-                edge_faded(
-                    18.0,
-                    true,
-                    true,
-                    div()
-                        .id("side-scroll")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_y_scroll()
-                        .track_scroll(&self.side_scroll)
-                        .px(px(8.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(20.0))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(2.0))
-                                .child(nav("nav-today", "Today", icons::HOME, Route::Today, 0))
-                                .child(nav("nav-needs", "Needs you", icons::BELL, Route::NeedsYou, pending))
-                                .child(nav("nav-schedules", "Schedules", icons::CALENDAR, Route::Schedules, 0)),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(6.0))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .pr(px(4.0))
-                                        .child(group_label("Teammates", cx))
-                                        .child({
-                                            let this = cx.entity();
-                                            Button::icon_only("new-teammate", icons::PLUS)
-                                                .size(ButtonSize::Small)
-                                                .tooltip("New teammate")
-                                                .on_click(move |_, _, cx| {
-                                                    this.update(cx, |s, cx| s.navigate(Route::NewTeammate, cx))
-                                                })
-                                        }),
-                                )
-                                .child(teammates),
-                        ),
-                )
-                .fade_overflow_y(&self.side_scroll)
-                .into_any_element(),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .p(px(8.0))
-                    .border_t_1()
-                    .border_color(theme.line)
-                    .child(nav("nav-settings", "Settings", icons::SETTINGS, Route::Settings, 0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(10.0))
-                            .px(px(14.0))
-                            .h(px(36.0))
-                            .text_size(px(text::SMALL))
-                            .text_color(theme.ink)
-                            .child(Led::new(if pc_online { LedStatus::Online } else { LedStatus::Offline }))
-                            .child(if pc_online { "Computer online" } else { "Computer offline" }),
-                    ),
-            )
+        sidebar::loading(&self.data, cx)
     }
 
     fn page(&mut self, route: &Route, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -904,7 +757,13 @@ impl Shell {
             self.open_tab = None;
             page.update(cx, |p, cx| p.set_tab(TAB_SETTINGS, window, cx));
         }
-        page.into_any_element()
+        // Cached: the page redraws when it is notified (its data, its live text, its own animations), not with the
+        // shell. Mid-crossfade it is drawn afresh, since a cached view keeps the opacity it was painted with.
+        if self.settled {
+            page.cached(StyleRefinement::default().size_full()).into_any_element()
+        } else {
+            page.into_any_element()
+        }
     }
 
     /// A scrolling, centred column for the overview pages.
@@ -984,13 +843,16 @@ fn local_hour() -> u32 {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        anim::frame(window);
         crate::perf::count("Shell");
         if !self.loading(cx) {
             crate::perf::milestone_painted("shell_usable");
         }
         let theme = Theme::of(cx).clone();
-        let sidebar = self.sidebar(cx).into_any_element();
+        let sidebar = self
+            .sidebar
+            .clone()
+            .cached(StyleRefinement::default().flex_none().w(px(SIDEBAR_WIDTH)).h_full())
+            .into_any_element();
         let page = self.render_route(window, cx);
         div()
             .size_full()
@@ -1013,6 +875,7 @@ impl Shell {
     fn render_route(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let mut route = std::mem::replace(&mut self.route, Crossfade::new(Route::Today));
         let reduced = familiar_ui::motion::reduced_motion(cx);
+        self.settled = route.settled(reduced);
         let element = route.render("route", reduced, window, cx, |r, window, cx| self.page(r, window, cx));
         self.route = route;
         element

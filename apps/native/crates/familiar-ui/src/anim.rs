@@ -18,11 +18,14 @@
 //!
 //! gpui `with_animation` drives its own frames. The hand-driven primitives here (springs, hover fades, crossfades,
 //! height tweens) are pure functions of wall time read during render; while one is mid-flight it calls
-//! `window.request_animation_frame()`, which redraws the window next frame. Call [`frame`] once at the top of each
-//! window's root render: it ticks the per-frame bookkeeping (pruning state for elements that unmounted).
+//! `window.request_animation_frame()`, which redraws the view that drew it next frame. Call [`frame`] once at the top of
+//! each window's root render: it ticks the per-frame bookkeeping (pruning state for elements that unmounted).
+//!
+//! Views may be cached (`Entity::cached`): a view that isn't redrawn keeps its springs, and hover fades redraw the whole
+//! window while they move (a fade can sit inside any view).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -52,8 +55,11 @@ pub const PULSE: MotionSpec = MotionSpec::new(1800, CubicBezier::new(0.0, 0.0, 0
 /// Tick the per-frame bookkeeping. Call once at the top of every window's root `render`.
 pub fn frame(window: &mut Window) {
     let hover_flight = motion::hover_fades_active();
-    let spring_flight = SPRINGS.with(|s| s.borrow_mut().tick());
-    if hover_flight || spring_flight {
+    let spring_flight = SPRINGS.with(|s| s.borrow_mut().tick(Instant::now()));
+    if hover_flight {
+        // The fading element may be in a cached view that nothing else redraws: redraw everything next frame.
+        window.on_next_frame(|window, _| window.refresh());
+    } else if spring_flight {
         window.request_animation_frame();
     }
 }
@@ -109,7 +115,12 @@ struct SpringEntry {
     target: f32,
     last: Instant,
     seen: u64,
+    /// The view that draws it (`EntityId::as_u64`).
+    view: u64,
 }
+
+/// A spring nothing has read for this long is dropped even if its view was never drawn again.
+const SPRING_FORGET: Duration = Duration::from_secs(60);
 
 impl SpringEntry {
     fn settled(&self) -> bool {
@@ -138,17 +149,29 @@ impl SpringEntry {
 struct SpringStore {
     entries: HashMap<SharedString, SpringEntry>,
     frame: u64,
+    /// Views that read springs this frame, and in the last one.
+    views: HashSet<u64>,
+    last_views: HashSet<u64>,
 }
 
 impl SpringStore {
-    fn value(&mut self, key: &SharedString, target: f32, cfg: SpringConfig, reduced: bool, now: Instant) -> (f32, bool) {
+    fn value(&mut self, key: &SharedString, target: f32, cfg: SpringConfig, reduced: bool, now: Instant, view: u64) -> (f32, bool) {
         let frame = self.frame;
+        self.views.insert(view);
         let entry = self
             .entries
             .entry(key.clone())
             // First sight starts at rest on its target: mounting never animates, only changes do.
-            .or_insert(SpringEntry { x: target, v: 0.0, target, last: now, seen: frame });
+            .or_insert(SpringEntry { x: target, v: 0.0, target, last: now, seen: frame, view });
         entry.seen = frame;
+        entry.view = view;
+        // A spring at rest has nothing to catch up on: after frames unread (its view cached) it moves one frame's worth,
+        // not the whole gap.
+        if entry.settled()
+            && let Some(frame_ago) = now.checked_sub(Duration::from_millis(16))
+        {
+            entry.last = entry.last.max(frame_ago);
+        }
         entry.target = target;
         if reduced {
             entry.x = target;
@@ -160,15 +183,20 @@ impl SpringStore {
         (entry.x, !entry.settled())
     }
 
-    fn tick(&mut self) -> bool {
+    /// A new frame. A spring missing from the last frame is gone when its view drew that frame without it; a view
+    /// that drew nothing (cached) keeps its springs, until they go unread for [`SPRING_FORGET`].
+    fn tick(&mut self, now: Instant) -> bool {
         self.frame += 1;
         let frame = self.frame;
+        self.last_views = std::mem::take(&mut self.views);
+        let drawn = &self.last_views;
         let mut active = false;
         self.entries.retain(|_, e| {
-            if e.seen + 1 < frame {
+            let missed = e.seen + 1 < frame;
+            if missed && (drawn.contains(&e.view) || now.saturating_duration_since(e.last) > SPRING_FORGET) {
                 return false; // unmounted
             }
-            active |= !e.settled();
+            active |= !missed && !e.settled();
             true
         });
         active
@@ -183,7 +211,8 @@ thread_local! {
 pub fn spring(key: impl Into<SharedString>, target: f32, cfg: SpringConfig, window: &mut Window, cx: &App) -> f32 {
     let key = key.into();
     let reduced = motion::reduced_motion(cx);
-    let (x, moving) = SPRINGS.with(|s| s.borrow_mut().value(&key, target, cfg, reduced, Instant::now()));
+    let view = window.current_view().as_u64();
+    let (x, moving) = SPRINGS.with(|s| s.borrow_mut().value(&key, target, cfg, reduced, Instant::now(), view));
     if moving {
         window.request_animation_frame();
     }
@@ -224,6 +253,11 @@ impl<K: Clone + PartialEq + Debug> Crossfade<K> {
 
     pub fn current(&self) -> &K {
         &self.current
+    }
+
+    /// No transition is running: only the current content is drawn, at full opacity.
+    pub fn settled(&self, reduced: bool) -> bool {
+        reduced || self.previous.is_none() || self.switched.elapsed() >= CROSSFADE.total().mul_f32(motion::speed_scale())
     }
 
     /// Navigate. Returns whether the key changed.
@@ -436,18 +470,18 @@ mod tests {
         let mut store = SpringStore::default();
         let key: SharedString = "card".into();
         let t0 = Instant::now();
-        let (x, moving) = store.value(&key, 0.0, SPRING_HOVER, false, t0);
+        let (x, moving) = store.value(&key, 0.0, SPRING_HOVER, false, t0, 1);
         assert_eq!((x, moving), (0.0, false), "mounting does not animate");
-        let (x, moving) = store.value(&key, 1.0, SPRING_HOVER, false, t0 + Duration::from_millis(16));
+        let (x, moving) = store.value(&key, 1.0, SPRING_HOVER, false, t0 + Duration::from_millis(16), 1);
         assert!(moving && x > 0.0 && x < 1.0, "moving toward target: {x}");
         let mut peak: f32 = 0.0;
         let mut t = t0 + Duration::from_millis(16);
         for _ in 0..120 {
             t += Duration::from_millis(16);
-            let (x, _) = store.value(&key, 1.0, SPRING_HOVER, false, t);
+            let (x, _) = store.value(&key, 1.0, SPRING_HOVER, false, t, 1);
             peak = peak.max(x);
         }
-        let (x, moving) = store.value(&key, 1.0, SPRING_HOVER, false, t + Duration::from_millis(16));
+        let (x, moving) = store.value(&key, 1.0, SPRING_HOVER, false, t + Duration::from_millis(16), 1);
         assert_eq!((x, moving), (1.0, false), "settles exactly");
         assert!(peak > 1.0 && peak < 1.08, "a whisper of overshoot, not a wobble: {peak}");
     }
@@ -457,19 +491,52 @@ mod tests {
         let mut store = SpringStore::default();
         let key: SharedString = "row".into();
         let t0 = Instant::now();
-        store.value(&key, 0.0, SPRING_SELECT, true, t0);
-        assert_eq!(store.value(&key, 1.0, SPRING_SELECT, true, t0), (1.0, false));
+        store.value(&key, 0.0, SPRING_SELECT, true, t0, 1);
+        assert_eq!(store.value(&key, 1.0, SPRING_SELECT, true, t0, 1), (1.0, false));
     }
 
     #[test]
-    fn unread_springs_are_pruned() {
+    fn springs_unmounted_from_a_drawn_view_are_pruned() {
         let mut store = SpringStore::default();
-        let key: SharedString = "gone".into();
-        store.value(&key, 0.0, SPRING_HOVER, false, Instant::now());
-        store.tick();
-        store.tick();
-        store.tick();
-        assert!(store.entries.is_empty());
+        let (gone, kept): (SharedString, SharedString) = ("gone".into(), "kept".into());
+        let now = Instant::now();
+        store.tick(now);
+        store.value(&gone, 0.0, SPRING_HOVER, false, now, 7);
+        store.value(&kept, 0.0, SPRING_HOVER, false, now, 7);
+        // The view draws again with only one of them.
+        for _ in 0..2 {
+            store.tick(now);
+            store.value(&kept, 0.0, SPRING_HOVER, false, now, 7);
+        }
+        store.tick(now);
+        assert!(!store.entries.contains_key(&gone));
+        assert!(store.entries.contains_key(&kept));
+    }
+
+    #[test]
+    fn springs_of_an_undrawn_view_are_kept_and_still_animate() {
+        let mut store = SpringStore::default();
+        let key: SharedString = "tab/pos".into();
+        let other: SharedString = "other".into();
+        let t0 = Instant::now();
+        store.tick(t0);
+        store.value(&key, 0.0, SPRING_SELECT, false, t0, 3);
+        // The view is cached for many frames while another one draws.
+        for i in 1..50 {
+            store.tick(t0 + Duration::from_millis(16 * i));
+            store.value(&other, 0.0, SPRING_SELECT, false, t0, 4);
+        }
+        assert!(store.entries.contains_key(&key));
+        // Its target moves: it springs from where it was rather than starting on the new target.
+        let t = t0 + Duration::from_millis(16 * 51);
+        store.tick(t);
+        let (x, moving) = store.value(&key, 1.0, SPRING_SELECT, false, t, 3);
+        assert!(moving && x < 0.5, "animates from 0: {x}");
+        // Springs left unread for long go.
+        let later = t + SPRING_FORGET + Duration::from_secs(1);
+        store.tick(later);
+        store.tick(later);
+        assert!(!store.entries.contains_key(&key));
     }
 
     #[test]

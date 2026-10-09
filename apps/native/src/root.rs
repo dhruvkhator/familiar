@@ -320,6 +320,8 @@ impl Render for Root {
         let with_sidebar = self.shell.is_some() && !matches!(phase, Phase::Stopping);
         let body = match phase {
             Phase::Stopping => self.stopping(cx),
+            // Not cached: a cached view that redraws redraws every view inside it, so the shell's own children (the
+            // sidebar, a teammate's page) are the cached ones.
             _ if self.shell.is_some() => self.shell.clone().unwrap().into_any_element(),
             Phase::Booting(message) => self.boot(&message, cx),
             Phase::FirstRun(_) => self.first_run(window, cx),

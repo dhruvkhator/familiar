@@ -159,7 +159,7 @@ pub struct SchedulesPage {
 
 impl SchedulesPage {
     pub fn new(data: Entity<AppData>, toasts: Entity<ToastStack>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&data, |_, _, cx| cx.notify()).detach();
+        crate::data::redraw_on_updates(&data, cx);
         data.update(cx, |d, cx| d.reload_schedules(cx));
         Self { data, toasts, editor: None, confirm_delete: None, busy: HashSet::new() }
     }

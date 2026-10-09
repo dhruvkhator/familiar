@@ -15,7 +15,7 @@ use familiar_ui::components::{Button, ButtonSize, Segmented, SidebarItem, Skelet
 use familiar_ui::edge_fade::edge_faded;
 use familiar_ui::icons::{self, icon};
 use familiar_ui::mascot::{Mascot, MascotState};
-use familiar_ui::motion::{AnimationExt as _, EASE, MotionSpec};
+use familiar_ui::motion::{EASE, MotionSpec};
 use familiar_ui::theme::{RADIUS_CARD, RADIUS_CHIP, SIDEBAR_WIDTH, Theme, Tone, text};
 use familiar_ui::toast::ToastStack;
 use gpui::{
@@ -114,6 +114,8 @@ pub struct BotPage {
     computer_open: bool,
     /// You closed the computer: it doesn't open by itself again on this page.
     computer_dismissed: bool,
+    /// The live reply's caret: its run and when it first showed (the blink's phase).
+    caret: Option<(Uuid, Instant)>,
     setup: Entity<SetupCard>,
 }
 
@@ -127,7 +129,6 @@ impl BotPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        cx.observe(&data, |_, _, cx| cx.notify()).detach();
         cx.subscribe(&data, Self::on_data).detach();
         let name = data.read(cx).bot(bot).map(|b| b.name.clone()).unwrap_or_else(|| "your teammate".into());
         let composer = text_input::new_field(format!("Message {name}"), true, 6, window, cx);
@@ -180,6 +181,7 @@ impl BotPage {
             computer,
             computer_open: false,
             computer_dismissed: false,
+            caret: None,
             setup,
         };
         this.reload_threads(cx);
@@ -215,6 +217,8 @@ impl BotPage {
             }
             DataEvent::Delta(run) if self.events_run == Some(*run) => cx.notify(),
             DataEvent::Delta(_) => {}
+            // The header (status, model), the run card's approvals and their pictures.
+            DataEvent::Updated(_) => cx.notify(),
         }
     }
 
@@ -828,13 +832,28 @@ impl BotPage {
                             .ml(px(2.0))
                             .mb(px(2.0))
                             .bg(theme.accent)
-                            .with_animation(SharedString::from(format!("caret-{run}")), CARET_BLINK.repeating(), |el, t| {
-                                el.opacity(if t < 0.5 { 1.0 } else { 0.15 })
-                            }),
+                            .opacity(self.caret_opacity(run, cx)),
                     ),
             );
         }
         col.into_any_element()
+    }
+
+    /// The caret blinks on for the first half of each [`CARET_BLINK`] and dim for the second. It only changes at
+    /// those edges, so the page wakes for them instead of drawing every frame (it rests on under reduced motion).
+    fn caret_opacity(&mut self, run: Uuid, cx: &mut Context<Self>) -> f32 {
+        if familiar_ui::motion::reduced_motion(cx) {
+            return 1.0;
+        }
+        let since = match self.caret {
+            Some((r, at)) if r == run => at,
+            _ => self.caret.insert((run, Instant::now())).1,
+        };
+        let period = CARET_BLINK.total().as_millis().max(2);
+        let t = since.elapsed().as_millis() % period;
+        let (on, edge) = if t < period / 2 { (true, period / 2 - t) } else { (false, period - t) };
+        anim::wake_at(cx.entity_id(), Instant::now() + Duration::from_millis(edge as u64), cx);
+        if on { 1.0 } else { 0.15 }
     }
 
     fn run_card(&mut self, run: &Run, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {

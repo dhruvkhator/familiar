@@ -4,8 +4,11 @@
 //! across bots, schedules) plus the live text deltas of running runs. Reads go through the client's SWR cache (the
 //! cached value is applied at once, the fresh one when it lands). One SSE connection (`client.stream()`) runs on the
 //! gpui_tokio runtime; change notices are coalesced per table+scope over 150 ms (the client's [`Coalescer`]) and then
-//! refresh only the affected pieces. Views observe the entity, and subscribe to [`DataEvent`] for their own data
-//! (a thread's messages, a run's events).
+//! refresh only the affected pieces. Views subscribe to [`DataEvent`]s: [`DataEvent::Updated`] says which part of
+//! the entity changed (redraw if you show it; [`redraw_on_updates`]), [`DataEvent::Delta`] that a run's live text grew,
+//! and [`DataEvent::Changed`] carries the notices for views that keep their own data (a thread's messages, a run's
+//! events). Nothing observes the entity as a whole: live text arrives many times a second and must redraw only what
+//! shows it.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -41,13 +44,37 @@ pub struct LiveBuf {
     pub thinking: String,
 }
 
-/// Emitted after the entity applied a live update, for views that keep their own data.
+/// Emitted after the entity changed.
 #[derive(Debug, Clone)]
 pub enum DataEvent {
     /// A coalesced change notice; `None` is a resync (refetch everything you show).
     Changed(Option<Notice>),
     /// New delta text for this run.
     Delta(Uuid),
+    /// This part of the entity changed.
+    Updated(Part),
+}
+
+/// The parts of [`AppData`] that change (apart from live text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Part {
+    /// The overview: teammates and their status, the computer; also `status`.
+    Overview,
+    Pending,
+    Runs,
+    Schedules,
+    /// A desktop approval's picture arrived.
+    Previews,
+}
+
+/// Redraw the view whenever a part of `data` changed (not on live text).
+pub fn redraw_on_updates<V: 'static>(data: &gpui::Entity<AppData>, cx: &mut Context<V>) {
+    cx.subscribe(data, |_, _, ev: &DataEvent, cx| {
+        if matches!(ev, DataEvent::Updated(_)) {
+            cx.notify();
+        }
+    })
+    .detach();
 }
 
 enum LiveMsg {
@@ -115,6 +142,12 @@ impl AppData {
         this
     }
 
+    /// `part` changed: tell the views.
+    fn updated(&mut self, part: Part, cx: &mut Context<Self>) {
+        cx.emit(DataEvent::Updated(part));
+        cx.notify();
+    }
+
     // ---- reads ------------------------------------------------------------------------------------------------
 
     pub fn bots(&self) -> &[Bot] {
@@ -146,7 +179,7 @@ impl AppData {
         // The cached overview predates it: don't let the stale copy un-list it while the fresh one loads.
         self.client.invalidate("/api/overview");
         self.reload_overview(cx);
-        cx.notify();
+        self.updated(Part::Overview, cx);
     }
 
     /// A fresh row of a known teammate (an API answer): shown at once, ahead of the overview reload.
@@ -154,7 +187,7 @@ impl AppData {
         if let Some(b) = self.overview.as_mut().and_then(|o| o.bots.iter_mut().find(|b| b.id == bot.id)) {
             *b = bot;
             self.client.invalidate("/api/overview");
-            cx.notify();
+            self.updated(Part::Overview, cx);
         }
     }
 
@@ -190,8 +223,8 @@ impl AppData {
 
     // ---- loading ----------------------------------------------------------------------------------------------
 
-    /// SWR read: apply the cached value now (if any), the fresh one when it lands.
-    fn fetch<T>(&mut self, path: String, cx: &mut Context<Self>, apply: fn(&mut Self, T, &mut Context<Self>))
+    /// SWR read: apply the cached value now (if any), the fresh one when it lands (then `part` is updated).
+    fn fetch<T>(&mut self, path: String, part: Part, cx: &mut Context<Self>, apply: fn(&mut Self, T, &mut Context<Self>))
     where
         T: DeserializeOwned + Send + 'static,
     {
@@ -204,7 +237,7 @@ impl AppData {
             Ok(Ok(v)) => {
                 let _ = this.update(cx, |this, cx| {
                     apply(this, v, cx);
-                    cx.notify();
+                    this.updated(part, cx);
                 });
             }
             Ok(Err(e)) => {
@@ -212,7 +245,7 @@ impl AppData {
                 let _ = this.update(cx, |this, cx| {
                     if this.overview.is_none() {
                         this.status = Status::Failed(e.message());
-                        cx.notify();
+                        this.updated(Part::Overview, cx);
                     }
                 });
             }
@@ -227,7 +260,7 @@ impl AppData {
     }
 
     pub fn reload_overview(&mut self, cx: &mut Context<Self>) {
-        self.fetch("/api/overview".into(), cx, |this, o: Overview, cx| {
+        self.fetch("/api/overview".into(), Part::Overview, cx, |this, o: Overview, cx| {
             let first = this.overview.is_none();
             crate::perf::milestone("first_data");
             let bots_changed = this.overview.as_ref().map(|old| ids(&old.bots)) != Some(ids(&o.bots));
@@ -241,7 +274,7 @@ impl AppData {
     }
 
     pub fn reload_pending(&mut self, cx: &mut Context<Self>) {
-        self.fetch("/api/approvals?status=pending".into(), cx, |this, list: Vec<Approval>, cx| {
+        self.fetch("/api/approvals?status=pending".into(), Part::Pending, cx, |this, list: Vec<Approval>, cx| {
             this.pending = list.into_iter().filter(|a| a.status == ApprovalStatus::Pending).collect();
             this.alert_approvals(cx);
             this.load_previews(cx);
@@ -258,7 +291,7 @@ impl AppData {
             cx.spawn(async move |this, cx| {
                 if let Ok(Ok(bytes)) = task.await {
                     crate::approval::put_preview(id, bytes.to_vec());
-                    let _ = this.update(cx, |_, cx| cx.notify());
+                    let _ = this.update(cx, |this, cx| this.updated(Part::Previews, cx));
                 }
             })
             .detach();
@@ -287,7 +320,7 @@ impl AppData {
                 let _ = this.update(cx, |this, cx| {
                     this.alert_runs(&runs, cx);
                     this.set_runs(runs);
-                    cx.notify();
+                    this.updated(Part::Runs, cx);
                 });
             }
         })
@@ -339,7 +372,7 @@ impl AppData {
 
     /// Every teammate's schedules (one call), with their labels and last runs: Today's "Coming up" and Schedules.
     pub fn reload_schedules(&mut self, cx: &mut Context<Self>) {
-        self.fetch("/api/schedules".into(), cx, |this, s: Vec<Schedule>, _| {
+        self.fetch("/api/schedules".into(), Part::Schedules, cx, |this, s: Vec<Schedule>, _| {
             this.schedules = s;
             this.schedules_loaded = true;
         });
@@ -350,7 +383,7 @@ impl AppData {
     pub fn decide(&mut self, id: Uuid, d: ApprovalDecision, cx: &mut Context<Self>) -> Task<Result<(), String>> {
         // Hide it at once; a failure brings it back on the reload.
         self.pending.retain(|a| a.id != id);
-        cx.notify();
+        self.updated(Part::Pending, cx);
         let client = self.client.clone();
         let task = Tokio::spawn(cx, async move { client.decide(id, &d).await });
         cx.spawn(async move |this, cx| {

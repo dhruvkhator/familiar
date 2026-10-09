@@ -43,7 +43,7 @@ pub struct MemoryTab {
 
 impl MemoryTab {
     pub fn new(data: Entity<AppData>, toasts: Entity<ToastStack>, bot: Uuid, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        cx.observe(&data, |_, _, cx| cx.notify()).detach();
+        crate::data::redraw_on_updates(&data, cx);
         cx.subscribe(&data, |this: &mut Self, _, ev: &DataEvent, cx| match ev {
             DataEvent::Changed(None) => this.reload(cx),
             DataEvent::Changed(Some(n)) if n.t == "memories" && n.bot.as_deref().is_none_or(|b| b == this.bot.to_string()) => {

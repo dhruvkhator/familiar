@@ -36,6 +36,7 @@ mod schedules;
 mod settings;
 mod setup;
 mod shell;
+mod sidebar;
 mod templates;
 mod text_input;
 mod titlebar;

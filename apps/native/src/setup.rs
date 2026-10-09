@@ -37,7 +37,7 @@ impl EventEmitter<OpenLogin> for SetupCard {}
 
 impl SetupCard {
     pub fn new(data: Entity<AppData>, toasts: Entity<ToastStack>, bot: Uuid, cx: &mut Context<Self>) -> Self {
-        cx.observe(&data, |_, _, cx| cx.notify()).detach();
+        crate::data::redraw_on_updates(&data, cx);
         cx.subscribe(&data, |this: &mut Self, _, ev: &DataEvent, cx| match ev {
             DataEvent::Changed(None) => this.reload(cx),
             DataEvent::Changed(Some(n))
