@@ -588,7 +588,6 @@ impl Crm {
             }
             ["templates"] => json!(self.templates),
             ["templates", "bundles"] => json!([self.bundle]),
-            ["bots", _, "connectors"] => json!([]),
             _ => return None,
         })
     }

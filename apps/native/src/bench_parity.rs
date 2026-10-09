@@ -104,6 +104,8 @@ impl Parity {
             ["connectors"] => json!(self.connectors),
             ["connectors", "presets"] => json!(self.presets),
             ["channels"] => json!(self.channels),
+            // Every teammate may use GitHub and the docs server.
+            ["bots", _, "connectors"] => json!(self.connectors.iter().filter(|c| c.name == "github" || c.name == "acme-docs").collect::<Vec<_>>()),
             _ => return None,
         })
     }

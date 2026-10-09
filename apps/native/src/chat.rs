@@ -582,6 +582,12 @@ impl BotPage {
             .into_any_element()
     }
 
+    /// Scroll the open tab (Learned, Activity, Settings…) to `y` px from its top (the bench's shots).
+    pub fn scroll_tab_to(&mut self, y: f32, cx: &mut Context<Self>) {
+        self.tab_scroll.set_offset(gpui::point(px(0.0), px(-y)));
+        cx.notify();
+    }
+
     pub fn set_computer(&mut self, open: bool, cx: &mut Context<Self>) {
         if self.computer_open != open {
             self.computer_open = open;

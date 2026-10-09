@@ -1,5 +1,6 @@
 //! A teammate's Settings tab (the web's `pages/Settings.tsx`): name, look (the avatar builder), persona, engine and
-//! model, paused, and delete. The same form, in create mode, is the New teammate flow (the web's `CreateBotDialog`):
+//! model, the connectors it may use ([`crate::bot_connectors`]), what it may do without asking, shared folders, the
+//! desktop, paused, and delete. The same form, in create mode, is the New teammate flow (the web's `CreateBotDialog`):
 //! name, a randomised look, what it should do, engine and a plan-checked model, and an optional hello. Hired from a
 //! template ([`crate::templates`]), it starts with the template's questions, look, instructions and model, shows what
 //! the template sets up, and offers its first task instead of the hello.
@@ -96,6 +97,8 @@ pub struct BotSettings {
     allowed: Option<Vec<familiar_client::Rule>>,
     /// Edit mode: the folders on this PC shared with it (`None` until loaded).
     folders: Option<Vec<familiar_client::Folder>>,
+    /// Edit mode: which connectors it may use.
+    connectors: Option<Entity<crate::bot_connectors::BotConnectors>>,
     /// "Can use this PC's desktop" (saved at once when switched).
     desktop: bool,
 }
@@ -205,6 +208,7 @@ impl BotSettings {
             }
         })
         .detach();
+        let connectors = (!create).then(|| cx.new(|cx| crate::bot_connectors::BotConnectors::new(data.clone(), toasts.clone(), bot, cx)));
         let mut this = Self {
             create,
             intro: false,
@@ -229,6 +233,7 @@ impl BotSettings {
             presets: Vec::new(),
             allowed: None,
             folders: None,
+            connectors,
             desktop: b.desktop,
         };
         this.load_catalog(cx);
@@ -1317,6 +1322,7 @@ impl Render for BotSettings {
                     )
                     .child(div().flex().flex_col().gap(px(6.0)).child(label("Model")).child(model_control)),
             )
+            .when_some(self.connectors.clone(), |el, c| el.child(c))
             .when_some(if create { None } else { self.allowed_view(cx) }, |el, v| el.child(v))
             .when(!create, |el| el.child(self.folders_view(cx)))
             .when(!create && cfg!(windows), |el| el.child(self.desktop_view(cx)))

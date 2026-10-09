@@ -598,6 +598,9 @@ async fn shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Shell>
     if page.starts_with("integrations") {
         return integrations_shot(page, window, shell, cx).await;
     }
+    if page.starts_with("teammate-") {
+        return teammate_shot(page, shell, cx).await;
+    }
     match page {
         "chat" => {
             cx.update(|cx| shell.update(cx, |s, cx| s.navigate(Route::Teammate(id(ADA).to_string().into()), cx)));
@@ -739,6 +742,22 @@ async fn integrations_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &
             "integrations-telegram" | "integrations-telegram-pair" | "integrations-phone" => p.scroll_to(640.0, cx),
             _ => {}
         });
+    });
+}
+
+/// Ada's page on one tab, scrolled to what the shot is about: `teammate-connectors` (Settings → Connectors).
+async fn teammate_shot(page: &str, shell: &Entity<Shell>, cx: &mut AsyncApp) {
+    let (target, y) = match page {
+        "teammate-connectors" => ("ada/settings", 840.0),
+        _ => ("ada", 0.0),
+    };
+    cx.update(|cx| shell.update(cx, |s, cx| s.open(target, cx)));
+    until(cx, Duration::from_secs(5), |cx| shell.read(cx).page_of(id(ADA)).is_some()).await;
+    wait(cx, Duration::from_millis(900)).await;
+    cx.update(|cx| {
+        if let Some(p) = shell.read(cx).page_of(id(ADA)) {
+            p.update(cx, |p, cx| p.scroll_tab_to(y, cx));
+        }
     });
 }
 

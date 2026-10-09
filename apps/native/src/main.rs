@@ -19,6 +19,7 @@ mod approval;
 mod bench;
 mod bench_crm;
 mod bench_parity;
+mod bot_connectors;
 mod bot_settings;
 mod chat;
 mod computer;
