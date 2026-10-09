@@ -289,7 +289,7 @@ fn field_text(r: &Record, f: Field) -> String {
 fn field_shown(r: &Record, f: Field) -> Option<String> {
     let t = match (r, f) {
         (Record::Deal(d), Field::Value) => d.value_cents.map(|v| model::money(v, &d.currency)),
-        // A date without a step is left over from a step that was cleared (a date can't be cleared yet): not shown.
+        // A date without a step (left from before clearing a step also cleared its date): not shown.
         (Record::Deal(d), Field::NextStepAt) if d.next_step.as_deref().is_none_or(|s| s.trim().is_empty()) => None,
         (Record::Deal(d), Field::NextStepAt) => d.next_step_at.map(|t| {
             let (words, _) = model::due_words(t, Utc::now());
@@ -324,9 +324,9 @@ pub fn patch_for(rec: Rec, f: Field, text: &str) -> Result<Patch, String> {
                 Field::Description => p.description = some(),
                 Field::FitReason => p.fit_reason = some(),
                 Field::Tags => p.tags = Some(model::parse_tags(&t)),
-                Field::FitScore if t.is_empty() => return Err("A fit score can't be cleared yet: give it a number from 0 to 100.".into()),
+                Field::FitScore if t.is_empty() => p.fit_score = Some(None),
                 Field::FitScore => match t.parse::<i32>() {
-                    Ok(n) if (0..=100).contains(&n) => p.fit_score = Some(n),
+                    Ok(n) if (0..=100).contains(&n) => p.fit_score = Some(Some(n)),
                     _ => return Err("A fit score is a whole number from 0 to 100.".into()),
                 },
                 _ => return Err("That can't be changed here.".into()),
@@ -357,17 +357,21 @@ pub fn patch_for(rec: Rec, f: Field, text: &str) -> Result<Patch, String> {
                 Field::Name | Field::Title if t.is_empty() => return Err("A deal needs a title.".into()),
                 Field::Name | Field::Title => p.title = some(),
                 Field::Value => match model::parse_money(&t) {
-                    Some(Some(c)) => p.value_cents = Some(c),
-                    // The API reads an absent value as "unchanged": a value can't be cleared yet.
-                    Some(None) => return Err("A value can't be cleared yet: set it to 0.".into()),
+                    Some(Some(c)) => p.value_cents = Some(Some(c)),
+                    Some(None) => p.value_cents = Some(None),
                     None => return Err("Write an amount, like 12,500 or 12.5k.".into()),
                 },
                 Field::Currency if t.len() == 3 && t.chars().all(|c| c.is_ascii_alphabetic()) => p.currency = Some(t.to_uppercase()),
                 Field::Currency => return Err("A currency is a 3-letter code, like USD.".into()),
+                // Clearing the step clears its date too, so no date is left behind without a step.
+                Field::NextStep if t.is_empty() => {
+                    p.next_step = some();
+                    p.next_step_at = Some(None);
+                }
                 Field::NextStep => p.next_step = some(),
                 Field::NextStepAt => match model::parse_due(&t, Local::now().date_naive()) {
-                    Some(Some(at)) => p.next_step_at = Some(at),
-                    Some(None) => return Err("Pick a date; to drop the step, clear the next step instead.".into()),
+                    Some(Some(at)) => p.next_step_at = Some(Some(at)),
+                    Some(None) => p.next_step_at = Some(None),
                     None => return Err("Write a date like 2026-10-20, tomorrow or in 3 days.".into()),
                 },
                 _ => return Err("That can't be changed here.".into()),
@@ -1730,7 +1734,7 @@ mod tests {
     #[test]
     fn patches_validate() {
         let co = Rec::Company(Uuid::nil());
-        assert!(matches!(patch_for(co, Field::FitScore, "82"), Ok(Patch::Company(CompanyPatch { fit_score: Some(82), .. }))));
+        assert!(matches!(patch_for(co, Field::FitScore, "82"), Ok(Patch::Company(CompanyPatch { fit_score: Some(Some(82)), .. }))));
         assert!(patch_for(co, Field::FitScore, "120").is_err());
         assert!(patch_for(co, Field::FitScore, "high").is_err());
         assert!(patch_for(co, Field::Name, "  ").is_err());
@@ -1745,7 +1749,7 @@ mod tests {
         assert!(patch_for(ct, Field::Email, "sam@acme.com").is_ok());
         assert!(patch_for(ct, Field::Email, "").is_ok());
         let dl = Rec::Deal(Uuid::nil());
-        assert!(matches!(patch_for(dl, Field::Value, "12.5k"), Ok(Patch::Deal(DealPatch { value_cents: Some(1_250_000), .. }))));
+        assert!(matches!(patch_for(dl, Field::Value, "12.5k"), Ok(Patch::Deal(DealPatch { value_cents: Some(Some(1_250_000)), .. }))));
         assert!(patch_for(dl, Field::Value, "lots").is_err());
         assert!(matches!(patch_for(dl, Field::Currency, "eur"), Ok(Patch::Deal(DealPatch { currency: Some(ref c), .. })) if c == "EUR"));
         assert!(patch_for(dl, Field::Currency, "euro").is_err());
@@ -1755,12 +1759,18 @@ mod tests {
     }
 
     #[test]
-    fn numbers_and_dates_say_they_cant_be_cleared() {
+    fn numbers_and_dates_clear() {
         let co = Rec::Company(Uuid::nil());
-        assert!(patch_for(co, Field::FitScore, " ").is_err_and(|e| e.contains("can't be cleared")));
+        assert!(matches!(patch_for(co, Field::FitScore, " "), Ok(Patch::Company(CompanyPatch { fit_score: Some(None), .. }))));
         let dl = Rec::Deal(Uuid::nil());
-        assert!(patch_for(dl, Field::Value, "").is_err_and(|e| e.contains("set it to 0")));
-        assert!(patch_for(dl, Field::NextStep, "").is_ok(), "a step clears");
+        assert!(matches!(patch_for(dl, Field::Value, ""), Ok(Patch::Deal(DealPatch { value_cents: Some(None), .. }))));
+        assert!(matches!(patch_for(dl, Field::NextStepAt, ""), Ok(Patch::Deal(DealPatch { next_step_at: Some(None), .. }))));
+        // Clearing the step takes its date with it.
+        assert!(matches!(
+            patch_for(dl, Field::NextStep, ""),
+            Ok(Patch::Deal(DealPatch { next_step: Some(ref s), next_step_at: Some(None), .. })) if s.is_empty()
+        ));
+        assert!(matches!(patch_for(dl, Field::NextStep, "Call"), Ok(Patch::Deal(DealPatch { next_step_at: None, .. }))));
         // Its leftover date isn't shown once the step is gone.
         let at = Some(Utc::now());
         let gone = Record::Deal(CrmDeal { next_step: None, next_step_at: at, ..Default::default() });
