@@ -525,9 +525,30 @@ pub struct Connector {
     pub url: Option<String>,
     pub env_names: Vec<String>,
     pub header_names: Vec<String>,
+    /// The names (never the values) of its stored secrets, as the API reports them.
+    pub secret_names: SecretNames,
     pub has_secrets: bool,
     pub enabled: bool,
     pub created_at: Option<DateTime<Utc>>,
+}
+
+/// `secret_names` of a connector: which environment variables (stdio) and headers (http) are stored.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecretNames {
+    pub env: Vec<String>,
+    pub headers: Vec<String>,
+}
+
+impl Connector {
+    /// The stored secrets' names: `secret_names` (what the API sends), else the older `env_names` / `header_names`.
+    pub fn stored_secret_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.secret_names.env.iter().chain(&self.secret_names.headers).cloned().collect();
+        if names.is_empty() {
+            names = self.env_names.iter().chain(&self.header_names).cloned().collect();
+        }
+        names
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

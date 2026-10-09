@@ -33,6 +33,7 @@ use crate::crm_crew::{CrewEvent, CrewHire};
 use crate::sidebar::{self, Sidebar};
 use crate::bot_settings::{BotSettings, CreateEvent};
 use crate::chat::{BotPage, TAB_SETTINGS};
+use crate::integrations::IntegrationsPage;
 use crate::schedules::SchedulesPage;
 use crate::settings::AppSettings;
 use crate::data::{AppData, DataEvent, Status, Teammate, ago, excerpt, run_status, tail, until};
@@ -50,8 +51,22 @@ pub enum Route {
     Schedules,
     Crm,
     Teammate(SharedString),
+    Integrations,
     Settings,
     NewTeammate,
+}
+
+/// Opens a page by name from anywhere (set by the shell): a teammate's settings linking to Integrations, the crew's
+/// checklist opening a connector's install form. Takes [`Shell::open`]'s names.
+pub struct PageOpener(pub std::rc::Rc<dyn Fn(&str, &mut App)>);
+
+impl gpui::Global for PageOpener {}
+
+/// Open `target` (see [`Shell::open`]) through the shell, if there is one.
+pub fn open_page(target: &str, cx: &mut App) {
+    if let Some(open) = cx.try_global::<PageOpener>().map(|o| o.0.clone()) {
+        open(target, cx);
+    }
 }
 
 pub struct Shell {
@@ -68,6 +83,9 @@ pub struct Shell {
     pages: HashMap<Uuid, Entity<BotPage>>,
     settings: Option<Entity<AppSettings>>,
     schedules: Option<Entity<SchedulesPage>>,
+    integrations: Option<Entity<IntegrationsPage>>,
+    /// `--open integrations/<preset>` before the page exists: open that preset's install form.
+    install: Option<String>,
     crm: Option<Entity<CrmPage>>,
     /// `--open crm/<tab>` before the CRM page exists: (tab, the deals as a list).
     crm_tab: Option<(Tab, bool)>,
@@ -81,8 +99,8 @@ pub struct Shell {
     new_bot: Option<Entity<BotSettings>>,
     /// Bumped per form so each one plays its entrance.
     form_gen: usize,
-    /// Open this teammate's page on its Settings tab (from `--open <name>/settings`).
-    open_tab: Option<Uuid>,
+    /// Open this teammate's page on this tab (from `--open <name>/settings`).
+    open_tab: Option<(Uuid, usize)>,
     /// No route crossfade is running: pages may be drawn cached.
     settled: bool,
     /// The teammate under the pointer, and the wait before their chat is fetched (dropping it cancels the wait).
@@ -130,6 +148,19 @@ impl Shell {
                 shell.update(cx, |s, cx| s.navigate(Route::NeedsYou, cx));
             }
         })));
+        let weak_open = weak_shell.clone();
+        cx.set_global(PageOpener(std::rc::Rc::new(move |target: &str, cx: &mut App| {
+            let target = target.to_owned();
+            // Deferred: the caller is usually a view the shell is drawing or updating.
+            let weak = weak_open.clone();
+            cx.defer(move |cx| {
+                if let Some(shell) = weak.upgrade() {
+                    shell.update(cx, |s, cx| {
+                        s.open(&target, cx);
+                    });
+                }
+            });
+        })));
         // Relative times ("5m ago", "in 2h") move on their own: re-render every 30 s like the web's clock (the sidebar
         // and the pages too: a teammate's "Done" fades to "Idle", the computer goes offline).
         cx.spawn(async move |this, cx| {
@@ -167,6 +198,8 @@ impl Shell {
             pages: HashMap::new(),
             settings: None,
             schedules: None,
+            integrations: None,
+            install: None,
             crm: None,
             crm_tab: None,
             crew: None,
@@ -183,14 +216,29 @@ impl Shell {
     }
 
     /// Open a page by name: `today`, `needs`, `schedules`, `crm` (or `crm/contacts`, `crm/pipeline`, `crm/deals`,
-    /// `crm/activity`), `crew`, `settings`, `first`, a teammate's name or `bot:<id>`, optionally with `/settings` for
-    /// that teammate's Settings tab. Returns whether it matched.
+    /// `crm/activity`), `crew`, `integrations` (or `integrations/<preset>`: that connector's install form),
+    /// `settings`, `first`, a teammate's name or `bot:<id>`, optionally with `/settings` for that teammate's Settings
+    /// tab. Returns whether it matched.
     pub fn open(&mut self, target: &str, cx: &mut Context<Self>) -> bool {
         let want = target.trim().to_lowercase();
         let (who, tab) = match want.strip_suffix("/settings") {
-            Some(w) => (w.to_owned(), true),
-            None => (want.clone(), false),
+            Some(w) => (w.to_owned(), Some(TAB_SETTINGS)),
+            None => (want.clone(), None),
         };
+        if let Some(rest) = who.strip_prefix("integrations") {
+            let preset = rest.trim_start_matches('/');
+            if !preset.is_empty() {
+                match self.integrations.clone() {
+                    Some(p) => {
+                        let preset = preset.to_owned();
+                        p.update(cx, |p, cx| p.install_when_ready(preset, cx));
+                    }
+                    None => self.install = Some(preset.to_owned()),
+                }
+            }
+            self.navigate(Route::Integrations, cx);
+            return true;
+        }
         if let Some(tab) = who.strip_prefix("crm") {
             let want = match tab.trim_start_matches('/') {
                 "" | "companies" => (Tab::Companies, false),
@@ -232,8 +280,8 @@ impl Shell {
             }
         };
         let Some(route) = route else { return false };
-        if let (Route::Teammate(id), true) = (&route, tab) {
-            self.open_tab = id.parse().ok();
+        if let (Route::Teammate(id), Some(tab)) = (&route, tab) {
+            self.open_tab = id.parse().ok().map(|bot| (bot, tab));
         }
         self.navigate(route, cx);
         true
@@ -257,6 +305,10 @@ impl Shell {
             let shown = route == Route::Settings;
             s.update(cx, |s, cx| s.set_shown(shown, cx));
         }
+        if let Some(p) = self.integrations.clone() {
+            let shown = route == Route::Integrations;
+            p.update(cx, |p, cx| p.set_shown(shown, cx));
+        }
         let shown = route.clone();
         if self.route.set(route) {
             self.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
@@ -279,6 +331,11 @@ impl Shell {
     /// The CRM page, if it was opened.
     pub fn crm_page(&self) -> Option<Entity<CrmPage>> {
         self.crm.clone()
+    }
+
+    /// Integrations, if it was opened.
+    pub fn integrations_page(&self) -> Option<Entity<IntegrationsPage>> {
+        self.integrations.clone()
     }
 
     /// App Settings, if it was opened.
@@ -371,6 +428,26 @@ impl Shell {
                 }
             }
             Route::Teammate(id) => self.bot_page(id, window, cx),
+            Route::Integrations => {
+                let page = match self.integrations.clone() {
+                    Some(p) => p,
+                    None => {
+                        let (data, toasts) = (self.data.clone(), self.toasts.clone());
+                        let p = cx.new(|cx| IntegrationsPage::new(data, toasts, cx));
+                        if let Some(preset) = self.install.take() {
+                            p.update(cx, |p, cx| p.install_when_ready(preset, cx));
+                        }
+                        self.integrations = Some(p.clone());
+                        p
+                    }
+                };
+                // Its own scrolling (the install form is a dialog over the page); drawn cached like the CRM.
+                if self.settled {
+                    page.cached(StyleRefinement::default().size_full()).into_any_element()
+                } else {
+                    page.into_any_element()
+                }
+            }
             Route::Settings => {
                 let (data, toasts) = (self.data.clone(), self.toasts.clone());
                 let page = self.settings.get_or_insert_with(|| cx.new(|cx| AppSettings::new(data, toasts, window, cx))).clone();
@@ -956,9 +1033,9 @@ impl Shell {
         let data = self.data.clone();
         let toasts = self.toasts.clone();
         let page = self.pages.entry(bot).or_insert_with(|| cx.new(|cx| BotPage::new(data, toasts, bot, window, cx))).clone();
-        if self.open_tab == Some(bot) {
+        if let Some((_, tab)) = self.open_tab.filter(|(b, _)| *b == bot) {
             self.open_tab = None;
-            page.update(cx, |p, cx| p.set_tab(TAB_SETTINGS, window, cx));
+            page.update(cx, |p, cx| p.set_tab(tab, window, cx));
         }
         // Cached: the page redraws when it is notified (its data, its live text, its own animations), not with the
         // shell. Mid-crossfade it is drawn afresh, since a cached view keeps the opacity it was painted with.

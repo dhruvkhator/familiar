@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
 use familiar_client::{
-    ActivityKind, Avatar, Bot, BotEngine, BotSetup, BotStatus, ConnectorPreset, CrmActivity, CrmChange, CrmCompany,
+    ActivityKind, Avatar, Bot, BotEngine, BotSetup, BotStatus, CrmActivity, CrmChange, CrmCompany,
     CrmContact, CrmDeal, CrmWebhook, CrmWebhookDelivery, DealStage, Hired, PipelineDeal, PipelineStage, RunKind, Schedule,
     SetupLogin, Template, TemplateBundle, TemplateLogin, TemplateQuestion, TemplateSchedule,
 };
@@ -189,17 +189,6 @@ pub fn crew_bundle() -> TemplateBundle {
             q("follow_up_days", "Days of silence before a follow-up", "4", false),
         ],
     }
-}
-
-pub fn presets() -> Vec<ConnectorPreset> {
-    vec![ConnectorPreset {
-        id: "google-workspace".into(),
-        name: "Google Workspace".into(),
-        description: "Gmail, Calendar, Drive, Docs, Sheets.".into(),
-        transport: "stdio".into(),
-        docs_url: Some("https://github.com/taylorwilsdon/google_workspace_mcp".into()),
-        ..Default::default()
-    }]
 }
 
 /// The crew's first three teammates as bots of the fixture (their rows show who added what).
@@ -599,8 +588,6 @@ impl Crm {
             }
             ["templates"] => json!(self.templates),
             ["templates", "bundles"] => json!([self.bundle]),
-            ["connectors"] => json!([]),
-            ["connectors", "presets"] => json!(presets()),
             ["bots", _, "connectors"] => json!([]),
             _ => return None,
         })

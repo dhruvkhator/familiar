@@ -1,5 +1,5 @@
 //! The shell's sidebar: Today, Needs you, Schedules and the CRM, the teammates with their mascots and live status,
-//! Settings, and whether the computer is online. Its own view, drawn cached by the shell: working teammates' mascots animate
+//! Integrations and Settings, and whether the computer is online. Its own view, drawn cached by the shell: working teammates' mascots animate
 //! here without redrawing the page beside it, and the page's live text doesn't redraw the sidebar.
 
 use familiar_ui::anim;
@@ -214,6 +214,7 @@ impl Render for Sidebar {
                     .p(px(8.0))
                     .border_t_1()
                     .border_color(theme.line)
+                    .child(nav("nav-integrations", "Integrations", icons::PLUG, Route::Integrations, 0))
                     .child(nav("nav-settings", "Settings", icons::SETTINGS, Route::Settings, 0))
                     .child(
                         div()

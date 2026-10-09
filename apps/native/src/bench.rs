@@ -9,7 +9,9 @@
 //!
 //! `--bench-shot today|needs|schedules|chat` only opens that page on the same data and quits after `--bench-hold`
 //! seconds (default 8): for before/after screenshots. `crm…` shots open the CRM screens on a synthetic CRM
-//! ([`crate::bench_crm`]; [`crm_shot`] lists them) with three of the GTM crew among the teammates.
+//! ([`crate::bench_crm`]; [`crm_shot`] lists them) with three of the GTM crew among the teammates. The screens of the
+//! integrations, a teammate's connectors, triggers, skills and files, and the rules have their own fake data
+//! ([`crate::bench_parity`]; [`integrations_shot`] lists the Integrations shots).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -78,6 +80,7 @@ struct Fixture {
     approvals: Vec<Approval>,
     schedules: Vec<Schedule>,
     crm: crate::bench_crm::Crm,
+    parity: crate::bench_parity::Parity,
 }
 
 fn ago(now: DateTime<Utc>, minutes: i64) -> DateTime<Utc> {
@@ -276,6 +279,7 @@ impl Fixture {
             approvals,
             schedules,
             crm: crate::bench_crm::Crm::new(now, crew_ids(), empty_crm),
+            parity: crate::bench_parity::Parity::new(now),
         }
     }
 
@@ -324,7 +328,7 @@ impl Fixture {
         let path = target.split('?').next().unwrap_or("/");
         let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
         if let ["api", rest @ ..] = segs.as_slice()
-            && let Some(v) = self.crm.get(rest, &crate::bench_crm::query(target))
+            && let Some(v) = self.parity.get(rest).or_else(|| self.crm.get(rest, &crate::bench_crm::query(target)))
         {
             return Some(v);
         }
@@ -590,6 +594,9 @@ async fn shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Shell>
     if page.starts_with("crm") {
         return crm_shot(page, window, shell, cx).await;
     }
+    if page.starts_with("integrations") {
+        return integrations_shot(page, window, shell, cx).await;
+    }
     match page {
         "chat" => {
             cx.update(|cx| shell.update(cx, |s, cx| s.navigate(Route::Teammate(id(ADA).to_string().into()), cx)));
@@ -710,6 +717,25 @@ async fn crm_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Sh
             }
         }
     }
+}
+
+/// The Integrations shots: `integrations` (the installed connectors), `integrations-catalog` (scrolled to the
+/// catalog), `integrations-install` (Slack's install dialog: two secret fields), `integrations-custom` (your own
+/// server) and `integrations-edit` (an installed server of the owner's, with its stored secrets' names).
+async fn integrations_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Shell>, cx: &mut AsyncApp) {
+    let target = if page == "integrations-install" { "integrations/slack" } else { "integrations" };
+    cx.update(|cx| shell.update(cx, |s, cx| s.open(target, cx)));
+    until(cx, Duration::from_secs(5), |cx| shell.read(cx).integrations_page().is_some()).await;
+    wait(cx, Duration::from_millis(600)).await;
+    let _ = window.update(cx, |_, window, cx| {
+        let Some(p) = shell.read(cx).integrations_page() else { return };
+        p.update(cx, |p, cx| match page {
+            "integrations-custom" => p.open_dialog(None, window, cx),
+            "integrations-edit" => p.open_dialog(Some("notes"), window, cx),
+            "integrations-catalog" => p.scroll_to(640.0, cx),
+            _ => {}
+        });
+    });
 }
 
 /// Frames and renders over `d` of doing nothing.

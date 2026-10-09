@@ -82,6 +82,12 @@ fn overview_devices_and_throttle() {
 fn misc_rows() {
     let c: Connector = de(json!({"id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "name": "gh", "preset": "github", "transport": "stdio", "env_names": ["TOKEN"], "has_secrets": true, "enabled": true}));
     assert_eq!(c.env_names, ["TOKEN"]);
+    assert_eq!(c.stored_secret_names(), ["TOKEN"]);
+    // What the API sends: `secret_names` ({env, headers}), names only.
+    let c: Connector = de(json!({"id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "name": "lin", "transport": "http",
+        "secret_names": {"env": [], "headers": ["Authorization"]}, "has_secrets": true, "enabled": true}));
+    assert_eq!(c.secret_names.headers, ["Authorization"]);
+    assert_eq!(c.stored_secret_names(), ["Authorization"]);
     let p: ConnectorPreset = de(json!({"id": "github", "name": "GitHub", "description": "d", "transport": "http", "secret_fields": [{"key": "T", "label": "Token"}]}));
     assert_eq!(p.secret_fields[0].label, "Token");
     let t: Trigger = de(json!({"id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "name": "n", "kind": "chat", "enabled": true, "url": "http://x/hooks/abc"}));

@@ -6,8 +6,9 @@
 //!   (<https://creativecommons.org/licenses/by/4.0/>); attribution: "Solar Icons by 480 Design".
 //! - A few (`bell`, `home`, `info-circle`, `plus`, `close`) are zeron's own hand-drawn ports in the Solar
 //!   Linear style (MIT).
-//! - `folder` and the CRM glyphs (`case`, `user`, `buildings`, `download`, `upload`, `trash`, `undo`, `link`,
-//!   `filter`, `block`) are Familiar's own drawings in the same style (MIT).
+//! - `folder`, the CRM glyphs (`case`, `user`, `buildings`, `download`, `upload`, `trash`, `undo`, `link`,
+//!   `filter`, `block`) and `plug`, `file`, `bolt`, `book`, `send`, `lock` are Familiar's own drawings in the same
+//!   style (MIT); `shield` follows Solar's shield outline (CC BY 4.0, as above).
 //!
 //! No third-party brand marks are bundled. gpui tints SVGs with the text colour (monochrome), so icons take their
 //! colour at the call site: `icon(icons::BELL).size(px(16.)).text_color(theme.muted)`.
@@ -85,6 +86,13 @@ icon_assets![
     (LINK, "link"),
     (FILTER, "filter"),
     (BLOCK, "block"),
+    (PLUG, "plug"),
+    (SHIELD, "shield"),
+    (FILE, "file"),
+    (BOLT, "bolt"),
+    (BOOK, "book"),
+    (SEND, "send"),
+    (LOCK, "lock"),
 ];
 
 /// An icon element for an embedded asset path. Size and colour are set by the caller.
