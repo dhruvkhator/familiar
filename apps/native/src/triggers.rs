@@ -285,7 +285,8 @@ impl BotTriggers {
         let theme = Theme::of(cx).clone();
         let (copy, done, ex) = (cx.entity(), cx.entity(), cx.entity());
         let url_copy = Zeroizing::new(url.to_owned());
-        let example = example_request(url);
+        // The example carries the address too: built only while it is shown, and wiped with it.
+        let example = Zeroizing::new(if self.example { example_request(url) } else { String::new() });
         let example_copy = example.clone();
         let local = local_only(url);
         div()
@@ -394,10 +395,10 @@ impl BotTriggers {
                                         .border_color(theme.line)
                                         .font_family(theme.font_mono.clone())
                                         .text_size(px(text::CAPTION))
-                                        .child(example),
+                                        .child(example.to_string()),
                                 )
                                 .child(Button::icon_only("trig-example-copy", icons::COPY).size(ButtonSize::Small).tooltip("Copy the example").on_click(move |_, _, cx| {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(example_copy.clone()))
+                                    cx.write_to_clipboard(ClipboardItem::new_string(example_copy.to_string()))
                                 })),
                         )
                         .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(

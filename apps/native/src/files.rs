@@ -33,7 +33,9 @@ use crate::approval::strip_hidden;
 use crate::data::{AppData, DataEvent, ago, excerpt};
 
 /// Pictures larger than this aren't fetched for a thumbnail.
-const THUMB_MAX_BYTES: u64 = 10 * 1024 * 1024;
+const THUMB_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// At most this many thumbnails are fetched (the newest pictures); the rest show an icon.
+const THUMBS: usize = 30;
 /// A thumbnail's longest side, in pixels.
 const THUMB_SIDE: u32 = 480;
 /// How many runs get their request and chat looked up.
@@ -140,7 +142,9 @@ impl FilesTab {
             .list
             .iter()
             .flatten()
-            .filter(|a| is_picture(&a.mime) && !self.thumbs.contains_key(&a.id))
+            .filter(|a| is_picture(&a.mime))
+            .take(THUMBS)
+            .filter(|a| !self.thumbs.contains_key(&a.id))
             .cloned()
             .collect();
         for a in wanted {
@@ -280,7 +284,8 @@ impl FilesTab {
     fn picture(&self, a: &Artifact, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let name = strip_hidden(&a.name, false);
-        let thumb = self.thumbs.get(&a.id).cloned().unwrap_or(Thumb::Loading);
+        // Not asked for (past the newest [`THUMBS`]): an icon.
+        let thumb = self.thumbs.get(&a.id).cloned().unwrap_or(Thumb::None);
         let preview = div()
             .h(px(150.0))
             .w_full()

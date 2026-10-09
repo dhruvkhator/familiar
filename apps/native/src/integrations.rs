@@ -1175,7 +1175,7 @@ impl Render for IntegrationsPage {
             .gap(px(14.0))
             .child(Self::section_head(
                 "Connectors",
-                "MCP servers that give teammates tools. Install one here, then choose which teammates may use it on each one's Settings tab.",
+                "MCP servers that give teammates tools. Install one here and pick who may use it; change that later on each teammate's Settings tab.",
                 &theme,
             ))
             .child(
@@ -1189,7 +1189,7 @@ impl Render for IntegrationsPage {
                     .bg(theme.sunken)
                     .child(icon(icons::SHIELD).size(px(16.0)).text_color(theme.accent))
                     .child(div().flex_1().min_w_0().text_size(px(text::SMALL)).text_color(theme.ink).child(
-                        "A teammate asks you before it uses a connector's tools, until you allow them: from an approval (\"Always allow\", for tools that only read) or with a rule.",
+                        "A teammate asks you before it uses a connector's tools until you allow them: with a rule, or with “Always allow” on an approval (for tools that only read).",
                     ))
                     .child(
                         Button::new("conn-rules", "Rules")
@@ -1575,8 +1575,9 @@ pub fn secret_rows(rows: &[(String, Zeroizing<String>)], headers: bool) -> Resul
         return Ok(None);
     }
     let what = if headers { "header" } else { "variable" };
-    let mut out = BTreeMap::new();
-    for (k, v) in rows {
+    // Everything is checked before any value is copied (a refused form leaves no stray copies).
+    let mut names = HashSet::new();
+    for (k, v) in &rows {
         if k.is_empty() {
             return Err(format!("Give every value a {what} name."));
         }
@@ -1590,11 +1591,11 @@ pub fn secret_rows(rows: &[(String, Zeroizing<String>)], headers: bool) -> Resul
         if bad {
             return Err(format!("{} isn't a usable {what} name.", reveal(k, false).0));
         }
-        if out.insert(k.clone(), v.to_string()).is_some() {
+        if !names.insert(k.as_str()) {
             return Err(format!("{} is there twice.", strip_hidden(k, false)));
         }
     }
-    Ok(Some(out))
+    Ok(Some(rows.iter().map(|(k, v)| (k.clone(), v.to_string())).collect()))
 }
 
 #[cfg(test)]
