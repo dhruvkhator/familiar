@@ -640,6 +640,11 @@ async fn scenario(shell: &Entity<Shell>, data: &Entity<AppData>, fx: &Arc<Mutex<
         frames.len(),
         frames.len() as f32 / secs
     );
+    // Does a frame cost more as the reply grows? The first and the last eighth of the stream's frames.
+    let eighth = (frames.len() / 8).max(1).min(frames.len());
+    let (early, _, _) = perf::percentiles(&frames[..eighth]);
+    let (late, _, _) = perf::percentiles(&frames[frames.len() - eighth..]);
+    let _ = writeln!(out, "streaming frame p50, first eighth {early:.2} ms, last eighth {late:.2} ms");
     let _ = writeln!(
         out,
         "streaming CPU: UI thread {:.0} ms ({:.1}% of a core), process {:.0} ms ({:.1}% of a core)",
