@@ -1,9 +1,9 @@
 //! The bench's synthetic integrations (`--bench-shot integrations…`): the real connector catalog (the API's own
-//! `presets.json`) and four installed connectors (two from the catalog, two of the owner's own, one of them off). The
-//! fake API answers their reads; nothing here is ever written to a real Familiar.
+//! `presets.json`), four installed connectors (two from the catalog, two of the owner's own, one of them off) and a
+//! Telegram channel. The fake API answers their reads; nothing here is ever written to a real Familiar.
 
 use chrono::{DateTime, Duration, Utc};
-use familiar_client::{Connector, ConnectorPreset, SecretNames};
+use familiar_client::{Channel, Connector, ConnectorPreset, SecretNames};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -17,10 +17,13 @@ pub fn pid(kind: u128, n: usize) -> Uuid {
 pub struct Parity {
     pub presets: Vec<ConnectorPreset>,
     pub connectors: Vec<Connector>,
+    /// Telegram: paired (most shots), waiting to pair (`integrations-telegram-pair`) or not set up
+    /// (`integrations-telegram`).
+    pub channels: Vec<Channel>,
 }
 
 impl Parity {
-    pub fn new(now: DateTime<Utc>) -> Self {
+    pub fn new(now: DateTime<Utc>, page: &str, answers: Uuid) -> Self {
         let presets: Vec<ConnectorPreset> = serde_json::from_str(PRESETS).unwrap_or_default();
         let secrets = |env: &[&str], headers: &[&str]| SecretNames {
             env: env.iter().map(|s| (*s).to_owned()).collect(),
@@ -79,7 +82,20 @@ impl Parity {
                 ..Default::default()
             },
         ];
-        Self { presets, connectors }
+        let channel = |bound: bool| Channel {
+            id: pid(2, 1),
+            kind: "telegram".into(),
+            bound,
+            pair_code: (!bound).then(|| "K7QM2XWD".into()),
+            default_bot_id: Some(answers),
+            enabled: true,
+        };
+        let channels = match page {
+            "integrations-telegram" => Vec::new(),
+            "integrations-telegram-pair" => vec![channel(false)],
+            _ => vec![channel(true)],
+        };
+        Self { presets, connectors, channels }
     }
 
     /// The reads (`segs` is the path after `/api`).
@@ -87,6 +103,7 @@ impl Parity {
         Some(match segs {
             ["connectors"] => json!(self.connectors),
             ["connectors", "presets"] => json!(self.presets),
+            ["channels"] => json!(self.channels),
             _ => return None,
         })
     }

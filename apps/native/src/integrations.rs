@@ -1,7 +1,8 @@
 //! Integrations (the web's `pages/Integrations.tsx`): connectors, the MCP servers that give teammates tools. The
 //! installed ones (on/off, edit, delete with a confirmation), the catalog of ready-made ones (`/api/connectors/presets`)
 //! and your own server: a program on this PC (command, arguments, environment variables) or an online one (an address
-//! and headers). Installing or editing happens in a dialog over the page.
+//! and headers). Installing or editing happens in a dialog over the page. Telegram has its own card
+//! ([`crate::telegram`]).
 //!
 //! Secrets are write-only: typed into masked fields, read out only to send them (held in [`Zeroizing`] strings, and
 //! wiped from the request body once it went), never shown again (the API reports their names only) and never logged.
@@ -19,7 +20,7 @@ use familiar_ui::icons::{self, icon};
 use familiar_ui::theme::{RADIUS_CARD, RADIUS_CONTROL, RADIUS_DIALOG, Theme, Tone, text};
 use familiar_ui::toast::ToastStack;
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
+    AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
     ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div,
     prelude::FluentBuilder as _, px,
 };
@@ -31,6 +32,7 @@ use zeroize::{Zeroize as _, Zeroizing};
 use crate::approval::{reveal, strip_hidden};
 use crate::crm_model::safe_url;
 use crate::data::{AppData, DataEvent};
+use crate::telegram::TelegramCard;
 use crate::text_input;
 
 /// What the connector dialog is for.
@@ -100,6 +102,7 @@ pub struct IntegrationsPage {
     stale: bool,
     scroll: ScrollHandle,
     form_scroll: ScrollHandle,
+    telegram: Entity<TelegramCard>,
 }
 
 impl IntegrationsPage {
@@ -110,6 +113,7 @@ impl IntegrationsPage {
             _ => {}
         })
         .detach();
+        let telegram = cx.new(|cx| TelegramCard::new(data.clone(), toasts.clone(), cx));
         let mut this = Self {
             data,
             toasts,
@@ -124,6 +128,7 @@ impl IntegrationsPage {
             stale: false,
             scroll: ScrollHandle::new(),
             form_scroll: ScrollHandle::new(),
+            telegram,
         };
         let client = this.client(cx);
         crate::data::swr(&mut this, &client, "/api/connectors/presets".into(), cx, |this, p: Vec<ConnectorPreset>, _| {
@@ -155,6 +160,7 @@ impl IntegrationsPage {
         } else if std::mem::take(&mut self.stale) {
             self.reload(cx);
         }
+        self.telegram.update(cx, |t, cx| t.set_shown(shown, cx));
         cx.notify();
     }
 
@@ -1025,15 +1031,35 @@ impl Render for IntegrationsPage {
                             .on_click(move |_, window, cx| this.update(cx, |p, cx| p.open_form(FormKind::Custom, window, cx))),
                     ),
             )
-            .child(self.installed(cx))
-            .child(div().pt(px(8.0)).text_size(px(text::SMALL)).font_weight(FontWeight::MEDIUM).text_color(theme.muted).child("Catalog"))
+            .child(self.installed(cx));
+        let phone = div()
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .child(Self::section_head(
+                "On your phone",
+                "Chat with your teammates and approve what they ask from Telegram, wherever you are.",
+                &theme,
+            ))
+            .child(self.telegram.clone());
+        let catalog = div()
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .child(Self::section_head(
+                "Add a connector",
+                "Ready-made servers for common tools. Each asks for its key once; its tools then work for the teammates you pick.",
+                &theme,
+            ))
             .child(self.catalog(cx));
         let page = div()
             .flex()
             .flex_col()
-            .gap(px(32.0))
+            .gap(px(36.0))
             .child(anim::appear("integ-head", div().child(self.header(cx))))
-            .child(connectors);
+            .child(connectors)
+            .child(phone)
+            .child(catalog);
         let dialog = self.form.as_ref().map(|f| self.form_view(f, window, cx));
         div()
             .relative()

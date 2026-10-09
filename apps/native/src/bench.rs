@@ -146,8 +146,9 @@ fn long_reply() -> String {
 }
 
 impl Fixture {
-    /// `empty_crm`: the CRM holds nothing (the `crm-empty` shot).
-    fn new(empty_crm: bool) -> Self {
+    /// The data for `page` (`--bench-shot`): `crm-empty` has an empty CRM; the integrations shots pick Telegram's state.
+    fn new(page: &str) -> Self {
+        let empty_crm = page == "crm-empty";
         let now = Utc::now();
         let bot = |n: u128, name: &str, persona: &str, last: i64| Bot {
             id: id(n),
@@ -279,7 +280,7 @@ impl Fixture {
             approvals,
             schedules,
             crm: crate::bench_crm::Crm::new(now, crew_ids(), empty_crm),
-            parity: crate::bench_parity::Parity::new(now),
+            parity: crate::bench_parity::Parity::new(now, page, id(ADA)),
         }
     }
 
@@ -510,7 +511,7 @@ impl Render for BenchRoot {
 /// Open the bench window on the fake API and run the scenario (or show one page for `--bench-shot`).
 pub fn open(args: Args, rt: tokio::runtime::Handle, cx: &mut App) {
     let page = args.shot.as_deref().unwrap_or("");
-    let mut fixture = Fixture::new(page == "crm-empty");
+    let mut fixture = Fixture::new(page);
     // The CRM shots show three of the GTM crew at work (not the ones that hire it).
     if page.starts_with("crm") && !matches!(page, "crm-crew" | "crm-crew-done" | "crm-picker") {
         fixture.add_crew();
@@ -721,7 +722,9 @@ async fn crm_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Sh
 
 /// The Integrations shots: `integrations` (the installed connectors), `integrations-catalog` (scrolled to the
 /// catalog), `integrations-install` (Slack's install dialog: two secret fields), `integrations-custom` (your own
-/// server) and `integrations-edit` (an installed server of the owner's, with its stored secrets' names).
+/// server), `integrations-edit` (an installed server of the owner's, with its stored secrets' names), and Telegram:
+/// `integrations-phone` (paired), `integrations-telegram-pair` (waiting for `/start <code>`), `integrations-telegram`
+/// (the three steps).
 async fn integrations_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Shell>, cx: &mut AsyncApp) {
     let target = if page == "integrations-install" { "integrations/slack" } else { "integrations" };
     cx.update(|cx| shell.update(cx, |s, cx| s.open(target, cx)));
@@ -732,7 +735,8 @@ async fn integrations_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &
         p.update(cx, |p, cx| match page {
             "integrations-custom" => p.open_dialog(None, window, cx),
             "integrations-edit" => p.open_dialog(Some("notes"), window, cx),
-            "integrations-catalog" => p.scroll_to(640.0, cx),
+            "integrations-catalog" => p.scroll_to(1200.0, cx),
+            "integrations-telegram" | "integrations-telegram-pair" | "integrations-phone" => p.scroll_to(640.0, cx),
             _ => {}
         });
     });

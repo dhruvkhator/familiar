@@ -46,6 +46,7 @@ mod settings;
 mod setup;
 mod shell;
 mod sidebar;
+mod telegram;
 mod templates;
 mod text_input;
 mod titlebar;
