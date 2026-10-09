@@ -136,7 +136,8 @@ impl FilesTab {
         .detach();
     }
 
-    /// Fetch and decode the pictures' thumbnails not tried yet (off the UI thread).
+    /// Fetch and decode the pictures' thumbnails not tried yet, one at a time and off the UI thread (a decode is
+    /// bounded by [`thumbnail`]'s limits; one at a time keeps the total bounded too).
     fn load_thumbs(&mut self, cx: &mut Context<Self>) {
         let wanted: Vec<Artifact> = self
             .list
@@ -147,34 +148,37 @@ impl FilesTab {
             .filter(|a| !self.thumbs.contains_key(&a.id))
             .cloned()
             .collect();
+        let mut queue = Vec::new();
         for a in wanted {
             if a.bytes > THUMB_MAX_BYTES {
                 self.thumbs.insert(a.id, Thumb::None);
-                continue;
+            } else {
+                self.thumbs.insert(a.id, Thumb::Loading);
+                queue.push(a.id);
             }
-            self.thumbs.insert(a.id, Thumb::Loading);
-            let client = self.client(cx);
-            let id = a.id;
-            let task = Tokio::spawn(cx, async move { client.download_artifact(id).await });
-            cx.spawn(async move |this, cx| {
-                let bytes = match task.await {
-                    Ok(Ok(b)) if b.len() as u64 <= THUMB_MAX_BYTES => b,
-                    _ => {
-                        let _ = this.update(cx, |p, cx| {
-                            p.thumbs.insert(id, Thumb::None);
-                            cx.notify()
-                        });
-                        return;
-                    }
+        }
+        if queue.is_empty() {
+            return;
+        }
+        let client = self.client(cx);
+        cx.spawn(async move |this, cx| {
+            for id in queue {
+                let client = client.clone();
+                let task = cx.update(|cx| Tokio::spawn(cx, async move { client.download_artifact(id).await }));
+                let decoded = match task.await {
+                    Ok(Ok(b)) if b.len() as u64 <= THUMB_MAX_BYTES => cx.background_executor().spawn(async move { thumbnail(&b) }).await,
+                    _ => None,
                 };
-                let decoded = cx.background_executor().spawn(async move { thumbnail(&bytes) }).await;
-                let _ = this.update(cx, |p, cx| {
+                let alive = this.update(cx, |p, cx| {
                     p.thumbs.insert(id, decoded.map(Thumb::Ready).unwrap_or(Thumb::None));
                     cx.notify()
                 });
-            })
-            .detach();
-        }
+                if alive.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Fetch a file and write it where the owner picked (Save) or to a private temporary folder to open it.
@@ -187,7 +191,7 @@ impl FilesTab {
             return;
         }
         let target = if open {
-            let dir = std::env::temp_dir().join("familiar-files").join(a.id.to_string());
+            let dir = temp_root().join(a.id.to_string());
             Some(dir.join(&name))
         } else {
             None
@@ -610,6 +614,24 @@ pub fn can_open(safe_name: &str) -> bool {
     matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "pdf" | "txt" | "md" | "log")
 }
 
+/// Where files opened from the tab are written (one folder per file).
+fn temp_root() -> PathBuf {
+    std::env::temp_dir().join("familiar-files")
+}
+
+/// Remove the copies opened more than a day ago (at start-up, off the UI thread). Best effort.
+pub fn clean_opened_copies() {
+    let Ok(entries) = std::fs::read_dir(temp_root()) else { return };
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    for e in entries.flatten() {
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > day);
+        // Only the per-file folders Familiar made (named by the file's id), never anything else.
+        if old && e.file_name().to_str().is_some_and(|n| n.parse::<Uuid>().is_ok()) && e.path().is_dir() {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 /// Mark a written file as downloaded from the internet (an NTFS `Zone.Identifier` stream, as browsers write), so
 /// Windows and Office warn before running or editing it. Best effort.
 fn mark_downloaded(path: &Path) {
@@ -620,24 +642,46 @@ fn mark_downloaded(path: &Path) {
     }
 }
 
-/// A picture's thumbnail (BGRA for gpui), from PNG, JPEG, GIF or WebP only, within size limits; `None` otherwise.
+/// The largest picture (in pixels) a thumbnail is made from: 16 MP, 64 MB decoded.
+const THUMB_MAX_PIXELS: u64 = 16_000_000;
+/// The longest side a thumbnail is made from.
+const THUMB_MAX_SIDE: u32 = 8192;
+
+/// A picture's thumbnail (BGRA for gpui), from PNG, JPEG, GIF or WebP only; `None` otherwise. Its size is read from the
+/// header first and anything over [`THUMB_MAX_SIDE`] a side or [`THUMB_MAX_PIXELS`] is refused before decoding (not
+/// every decoder honours the allocation limit), so a crafted file can't make it allocate gigabytes.
 fn thumbnail(bytes: &[u8]) -> Option<Arc<RenderImage>> {
     use image::ImageFormat as F;
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
-    if !matches!(reader.format(), Some(F::Png | F::Jpeg | F::Gif | F::WebP)) {
+    let reader = || image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok();
+    let probe = reader()?;
+    if !matches!(probe.format(), Some(F::Png | F::Jpeg | F::Gif | F::WebP)) {
         return None;
     }
+    let (w, h) = probe.into_dimensions().ok()?;
+    if !fits(w, h) {
+        return None;
+    }
+    let mut reader = reader()?;
     let mut limits = image::Limits::default();
-    limits.max_image_width = Some(12_000);
-    limits.max_image_height = Some(12_000);
-    limits.max_alloc = Some(256 * 1024 * 1024);
+    limits.max_image_width = Some(THUMB_MAX_SIDE);
+    limits.max_image_height = Some(THUMB_MAX_SIDE);
+    limits.max_alloc = Some(128 * 1024 * 1024);
     reader.limits(limits);
     let picture = reader.decode().ok()?;
+    // What was decoded is what the header said (a decoder that disagrees is not trusted).
+    if !fits(picture.width(), picture.height()) {
+        return None;
+    }
     let mut rgba = picture.thumbnail(THUMB_SIDE, THUMB_SIDE).to_rgba8();
     for p in rgba.chunks_exact_mut(4) {
         p.swap(0, 2);
     }
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(rgba)])))
+}
+
+/// A picture of this size may be decoded for a thumbnail.
+fn fits(w: u32, h: u32) -> bool {
+    w > 0 && h > 0 && w <= THUMB_MAX_SIDE && h <= THUMB_MAX_SIDE && u64::from(w) * u64::from(h) <= THUMB_MAX_PIXELS
 }
 
 #[cfg(test)]
@@ -719,5 +763,20 @@ mod tests {
         let mut png = Vec::new();
         image::RgbaImage::new(1, 1).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
         assert!(thumbnail(&png).is_some());
+    }
+
+    #[test]
+    fn huge_pictures_are_refused_before_decoding() {
+        // A GIF header claiming 65535 x 65535 (4.3 billion pixels) and nothing else: refused from the header alone.
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x3b]);
+        assert!(thumbnail(&gif).is_none());
+        // A real picture past the side limit.
+        let mut png = Vec::new();
+        image::GrayImage::new(THUMB_MAX_SIDE + 1, 1).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        assert!(thumbnail(&png).is_none());
+        assert!(fits(4000, 4000));
+        assert!(!fits(8000, 8000), "64 MP");
+        assert!(!fits(0, 10));
     }
 }

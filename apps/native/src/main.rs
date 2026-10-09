@@ -195,6 +195,8 @@ fn main() {
             return;
         }
         perf::start_summaries(cx);
+        // Copies of teammates' files opened more than a day ago go.
+        std::thread::spawn(files::clean_opened_copies);
         // Toasts need an app identity when the app isn't packaged (the same id the window and installer use).
         cx.set_app_identity("dev.familiar.desktop", "Familiar");
         notify::init(cx);
