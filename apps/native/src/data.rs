@@ -229,6 +229,7 @@ impl AppData {
     pub fn reload_overview(&mut self, cx: &mut Context<Self>) {
         self.fetch("/api/overview".into(), cx, |this, o: Overview, cx| {
             let first = this.overview.is_none();
+            crate::perf::milestone("first_data");
             let bots_changed = this.overview.as_ref().map(|old| ids(&old.bots)) != Some(ids(&o.bots));
             this.overview = Some(o);
             this.status = Status::Ready;
@@ -401,17 +402,28 @@ impl AppData {
         }));
     }
 
+    /// New live text of `run` (the stream's deltas, or the bench's).
+    pub fn push_delta(&mut self, run: Uuid, thinking: bool, text: &str, cx: &mut Context<Self>) {
+        let buf = self.live.entry(run).or_default();
+        if thinking {
+            buf.thinking.push_str(text);
+        } else {
+            buf.text.push_str(text);
+        }
+        cx.emit(DataEvent::Delta(run));
+        cx.notify();
+    }
+
+    /// A (coalesced) change notice, as from the stream; `None` is a resync.
+    pub fn push_notice(&mut self, n: Option<Notice>, cx: &mut Context<Self>) {
+        self.on_live(LiveMsg::Changed(n), cx);
+    }
+
     fn on_live(&mut self, msg: LiveMsg, cx: &mut Context<Self>) {
         match msg {
             LiveMsg::Delta(d) => {
                 let Ok(run) = d.run.parse::<Uuid>() else { return };
-                let buf = self.live.entry(run).or_default();
-                match d.kind {
-                    DeltaKind::Thinking => buf.thinking.push_str(&d.text),
-                    _ => buf.text.push_str(&d.text),
-                }
-                cx.emit(DataEvent::Delta(run));
-                cx.notify();
+                self.push_delta(run, d.kind == DeltaKind::Thinking, &d.text, cx);
             }
             LiveMsg::Changed(n) => {
                 match n.as_ref().map(|n| n.t.as_str()) {

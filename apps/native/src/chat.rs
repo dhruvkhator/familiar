@@ -204,6 +204,7 @@ impl BotPage {
 
     pub fn select(&mut self, thread: Uuid, cx: &mut Context<Self>) {
         if self.selected != Some(thread) {
+            crate::perf::begin("thread_open");
             self.selected = Some(thread);
             self.reset_thread(cx);
             cx.notify();
@@ -759,6 +760,7 @@ impl BotPage {
             );
         }
         if !buf.text.is_empty() {
+            crate::perf::painted("delta");
             col = col.child(
                 div()
                     .flex()
@@ -961,6 +963,12 @@ impl BotPage {
             }
         }
 
+        // What a click on this teammate or thread waited for is on screen.
+        if self.messages_loaded || (self.threads_loaded && self.selected.is_none()) {
+            crate::perf::painted("switch");
+            crate::perf::painted("thread_open");
+        }
+
         // Stick to the bottom: when what's shown changed and the reader was at (or within 80 px of) the bottom.
         let live_len = self.runs.first().and_then(|r| self.data.read(cx).live.get(&r.id)).map(|b| b.text.len() + b.thinking.len()).unwrap_or(0);
         let rev = (
@@ -1039,6 +1047,7 @@ fn prose(s: &str) -> String {
 
 impl Render for BotPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf::count("BotPage");
         let header = self.header(cx);
         // The computer slides in from the right (its width springs); its content keeps a fixed width meanwhile.
         let main_w = f32::from(window.viewport_size().width) - SIDEBAR_WIDTH;

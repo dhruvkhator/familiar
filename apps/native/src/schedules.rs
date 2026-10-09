@@ -516,6 +516,7 @@ impl SchedulesPage {
 
 impl Render for SchedulesPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::perf::count("SchedulesPage");
         let theme = Theme::of(cx).clone();
         let (list, loaded) = {
             let d = self.data.read(cx);

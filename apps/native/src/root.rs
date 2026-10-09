@@ -8,7 +8,7 @@ use familiar_ui::mascot::{Mascot, MascotState, default_avatar};
 use familiar_ui::notice::{NoticeChipIcon, notice_chip};
 use familiar_ui::theme::{Theme, text};
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _, Render, SharedString,
+    AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _, Render, SharedString,
     Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_base::input::{InputEvent, InputState};
@@ -16,6 +16,7 @@ use gpui_tokio::Tokio;
 
 use crate::data::AppData;
 use crate::engine::{Engine, Phase, familiar_home};
+use crate::perf;
 use crate::shell::Shell;
 use crate::text_input;
 use crate::titlebar;
@@ -315,7 +316,6 @@ fn screen(content: impl IntoElement, theme: &Theme) -> AnyElement {
 
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        anim::frame(window);
         let phase = self.engine.read(cx).phase.clone();
         let with_sidebar = self.shell.is_some() && !matches!(phase, Phase::Stopping);
         let body = match phase {
@@ -326,16 +326,26 @@ impl Render for Root {
             Phase::Failed(message) => self.failed(&message, cx),
             Phase::Ready(_) => self.boot("Opening your workspace…", cx),
         };
-        if !titlebar::CUSTOM {
-            return body;
-        }
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(Theme::of(cx).bg)
-            .child(titlebar::render(with_sidebar, window, cx))
-            .child(div().flex_1().min_h_0().w_full().child(body))
-            .into_any_element()
+        perf::milestone_painted("first_frame");
+        window_frame(body, with_sidebar, window, cx)
     }
+}
+
+/// A window root's frame around `body`: the per-frame motion bookkeeping, the title bar (Windows) and the perf probe.
+pub fn window_frame(body: AnyElement, with_sidebar: bool, window: &mut Window, cx: &mut App) -> AnyElement {
+    perf::frame_begin();
+    perf::count("Root");
+    anim::frame(window);
+    if !titlebar::CUSTOM {
+        return div().size_full().child(body).child(perf::frame_probe()).into_any_element();
+    }
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .bg(Theme::of(cx).bg)
+        .child(titlebar::render(with_sidebar, window, cx))
+        .child(div().flex_1().min_h_0().w_full().child(body))
+        .child(perf::frame_probe())
+        .into_any_element()
 }

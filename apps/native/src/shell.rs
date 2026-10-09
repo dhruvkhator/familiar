@@ -157,6 +157,9 @@ impl Shell {
     }
 
     pub fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        if matches!(route, Route::Teammate(_)) && &route != self.route.current() {
+            crate::perf::begin("switch");
+        }
         if route != Route::NewTeammate {
             self.new_bot = None;
             self.picker = None;
@@ -170,6 +173,14 @@ impl Shell {
             cx.notify();
         }
     }
+
+    /// A teammate's page, if it was opened.
+    pub fn page_of(&self, bot: Uuid) -> Option<Entity<BotPage>> {
+        self.pages.get(&bot).cloned()
+    }
+
+    /// The pointer rests on a teammate (the sidebar, Today's strip): nothing yet.
+    pub fn hover_teammate(&mut self, _bot: Uuid, _cx: &mut Context<Self>) {}
 
     fn loading(&self, cx: &App) -> bool {
         let d = self.data.read(cx);
@@ -974,6 +985,10 @@ fn local_hour() -> u32 {
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         anim::frame(window);
+        crate::perf::count("Shell");
+        if !self.loading(cx) {
+            crate::perf::milestone_painted("shell_usable");
+        }
         let theme = Theme::of(cx).clone();
         let sidebar = self.sidebar(cx).into_any_element();
         let page = self.render_route(window, cx);

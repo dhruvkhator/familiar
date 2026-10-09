@@ -96,8 +96,12 @@ impl Engine {
             // Follow the boot (tokio's watch needs no runtime to await).
             loop {
                 let b = boot.borrow_and_update().clone();
+                crate::perf::note(&format!("boot: {}", b.message));
                 match b.phase {
-                    BootPhase::Ready => break,
+                    BootPhase::Ready => {
+                        crate::perf::milestone("engine_ready");
+                        break;
+                    }
                     BootPhase::Error if b.message == ANOTHER_HOST => {
                         let _ = this.update(cx, |e, cx| {
                             e.host = None;
@@ -124,6 +128,7 @@ impl Engine {
             let signing = Tokio::spawn(cx, hosted_sign_in(host, client.clone()));
             let phase = match signing.await {
                 Ok(Ok(Some(token))) => {
+                    crate::perf::milestone("signed_in");
                     client.set_token(Some(token));
                     Phase::Ready(client)
                 }

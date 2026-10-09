@@ -7,13 +7,16 @@
 //!
 //! Flags (both windows): `--theme light|dark|system`, `--reduce-motion`; gallery only: `--section <name>`; shell only:
 //! `--open needs|schedules|new|<teammate name>|first` (opens that page once the data is in), `--hidden` (start in the tray),
-//! `--quit` (ask the running copy to quit; in host mode its engine drains first).
+//! `--quit` (ask the running copy to quit; in host mode its engine drains first). `--bench` runs the lab benchmark on
+//! synthetic data (see `bench.rs`; `--bench-out <file>`, `--bench-shot <page>`, `--bench-hold <secs>`).
+//! `FAMILIAR_PERF=1` writes the perf log (see `perf.rs`).
 
 // Release builds are GUI-subsystem binaries (no console window); debug builds keep the console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod activity;
 mod approval;
+mod bench;
 mod bot_settings;
 mod chat;
 mod computer;
@@ -26,6 +29,7 @@ mod gallery;
 mod markdown;
 mod memory;
 mod notify;
+mod perf;
 mod prefs;
 mod root;
 mod schedules;
@@ -53,10 +57,26 @@ struct Args {
     hidden: bool,
     /// Ask the running copy to quit (gracefully) and exit.
     quit: bool,
+    bench: bool,
+    bench_out: Option<String>,
+    bench_shot: Option<String>,
+    bench_hold: u64,
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { gallery: false, theme: None, reduce_motion: false, section: None, open: None, hidden: false, quit: false };
+    let mut args = Args {
+        gallery: false,
+        theme: None,
+        reduce_motion: false,
+        section: None,
+        open: None,
+        hidden: false,
+        quit: false,
+        bench: false,
+        bench_out: None,
+        bench_shot: None,
+        bench_hold: 8,
+    };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -73,6 +93,10 @@ fn parse_args() -> Args {
             }
             "--section" => args.section = it.next(),
             "--open" => args.open = it.next(),
+            "--bench" => args.bench = true,
+            "--bench-out" => args.bench_out = it.next(),
+            "--bench-shot" => args.bench_shot = it.next(),
+            "--bench-hold" => args.bench_hold = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
             "--version" => {
                 println!("familiar-native {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
@@ -100,9 +124,10 @@ fn window_options(cx: &App, title: &str, width: f32, height: f32, custom_titleba
 
 fn main() {
     let args = parse_args();
-    // One copy per user: a second launch shows the running window and exits.
+    perf::init(args.bench);
+    // One copy per user: a second launch shows the running window and exits. The gallery and the bench run beside it.
     let nudge = if args.quit { desktop::Nudge::Quit } else { desktop::Nudge::Show };
-    let nudges = match (!args.gallery).then(|| desktop::single_instance(nudge)) {
+    let nudges = match (!args.gallery && !args.bench).then(|| desktop::single_instance(nudge)) {
         Some(desktop::Instance::Second) => return,
         // `--quit` with nothing running: nothing to do.
         Some(desktop::Instance::First(_)) if args.quit => return,
@@ -110,7 +135,9 @@ fn main() {
         None => None,
     };
     // Debug builds log to the console; release builds have none and log to ~/.familiar/logs/native.log.
-    if cfg!(debug_assertions) {
+    if args.bench {
+        // The bench leaves the app's log alone.
+    } else if cfg!(debug_assertions) {
         let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
         tracing_subscriber::fmt().with_env_filter(filter).init();
     } else {
@@ -125,7 +152,7 @@ fn main() {
         .expect("start the tokio runtime");
     let handle = runtime.handle().clone();
     gpui_platform::application().with_assets(familiar_ui::icons::Assets).run(move |cx: &mut App| {
-        gpui_tokio::init_from_handle(cx, handle);
+        gpui_tokio::init_from_handle(cx, handle.clone());
         gpui_base::init(cx);
         let saved = prefs::load();
         familiar_ui::init(args.theme.unwrap_or(saved.theme), cx);
@@ -141,6 +168,12 @@ fn main() {
             cx.activate(true);
             return;
         }
+        if args.bench {
+            let bench = bench::Args { out: args.bench_out.clone(), shot: args.bench_shot.clone(), hold: args.bench_hold };
+            bench::open(bench, handle.clone(), cx);
+            return;
+        }
+        perf::start_summaries(cx);
         // Toasts need an app identity when the app isn't packaged (the same id the window and installer use).
         cx.set_app_identity("dev.familiar.desktop", "Familiar");
         notify::init(cx);
