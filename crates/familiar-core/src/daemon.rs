@@ -27,12 +27,15 @@ pub struct Notice {
     pub id: Uuid,
     #[serde(default)]
     pub owner: Option<Uuid>,
+    /// INSERT, UPDATE or DELETE.
+    #[serde(default)]
+    pub op: Option<String>,
 }
 
 impl Notice {
     /// "Something may have been missed" (listener reconnected): everyone re-checks.
     fn all() -> Self {
-        Notice { t: "*".into(), id: Uuid::nil(), owner: None }
+        Notice { t: "*".into(), id: Uuid::nil(), owner: None, op: None }
     }
 }
 
@@ -144,6 +147,9 @@ async fn serve(cfg: Config, shutdown: CancellationToken, signals: broadcast::Sen
 
     let wake = Arc::new(Notify::new());
     let active: ActiveMap = Arc::default();
+    // CRM webhook deliveries: their own loop, so a slow receiver never holds up runs.
+    let hooks = Arc::new(Notify::new());
+    tokio::spawn(crate::crm::webhooks::run(ctx.db.clone(), ctx.secrets.clone(), hooks.clone(), shutdown.clone()));
 
     let device = Config::device_id();
     let device_name = ctx.cfg.device_name.clone().unwrap_or_else(|| {
@@ -189,7 +195,7 @@ async fn serve(cfg: Config, shutdown: CancellationToken, signals: broadcast::Sen
 
     let mut listener = PgListener::connect_with(&pool).await?;
     listener.listen_all(["familiar", "familiar_input"]).await?;
-    tokio::spawn(listen(ctx.clone(), listener, wake.clone(), active.clone(), shutdown.clone()));
+    tokio::spawn(listen(ctx.clone(), listener, wake.clone(), hooks, active.clone(), shutdown.clone()));
 
     info!(owner = %ctx.db.owner, max_parallel = ctx.cfg.max_parallel, "Familiar daemon running");
     loop {
@@ -217,7 +223,14 @@ async fn serve(cfg: Config, shutdown: CancellationToken, signals: broadcast::Sen
     Ok(())
 }
 
-async fn listen(ctx: Ctx, mut listener: PgListener, wake: Arc<Notify>, active: ActiveMap, shutdown: CancellationToken) {
+async fn listen(
+    ctx: Ctx,
+    mut listener: PgListener,
+    wake: Arc<Notify>,
+    hooks: Arc<Notify>,
+    active: ActiveMap,
+    shutdown: CancellationToken,
+) {
     loop {
         let next = tokio::select! { n = listener.try_recv() => n, _ = shutdown.cancelled() => return };
         match next {
@@ -265,6 +278,9 @@ async fn listen(ctx: Ctx, mut listener: PgListener, wake: Arc<Notify>, active: A
                 if matches!(notice.t.as_str(), "runs" | "messages" | "schedules" | "approvals") {
                     wake.notify_one();
                 }
+                if notice.t == "crm_webhook_deliveries" && notice.op.as_deref() == Some("INSERT") {
+                    hooks.notify_one();
+                }
                 let _ = ctx.notices.send(notice);
             }
             Ok(None) => {
@@ -272,6 +288,7 @@ async fn listen(ctx: Ctx, mut listener: PgListener, wake: Arc<Notify>, active: A
                 info!("listener reconnected");
                 let _ = ctx.notices.send(Notice::all());
                 wake.notify_one();
+                hooks.notify_one();
             }
             Err(e) => {
                 warn!("listener error: {e:#}");

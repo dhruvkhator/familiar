@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::crm::{self, Actor, teammate};
 use crate::daemon::{Ctx, Signal};
 use crate::db::{Bot, Run};
 use crate::runner::{self, Ask, Decision, Events, Offer};
@@ -190,6 +191,22 @@ impl Tools {
             .and_then(|t| self.registry.get(t))
             .ok_or_else(|| ErrorData::invalid_request("unknown or finished run", None))
     }
+
+    /// The run's scope and its CRM identity, for a tool that changes the CRM (research-only runs only read it).
+    fn crm_writer(&self, parts: &http::request::Parts) -> Result<Result<Actor, String>, ErrorData> {
+        let s = self.scope(parts)?;
+        if s.run.research() {
+            return Ok(Err("research-only runs can read the CRM (crm_search, crm_get) but not change it".into()));
+        }
+        Ok(Ok(Actor::Bot { bot: s.bot.id, run: Some(s.run.id) }))
+    }
+}
+
+fn answer(r: Result<String, String>) -> Result<CallToolResult, ErrorData> {
+    match r {
+        Ok(text) => ok(text),
+        Err(e) => fail(e),
+    }
 }
 
 #[tool_router(server_handler)]
@@ -279,6 +296,14 @@ impl Tools {
             Ok(v) => v,
             Err(e) => return fail(e),
         };
+        // Never to someone who asked not to be contacted (checked again before an approved draft is passed on).
+        if let Some(to) = input["to"].as_str() {
+            match crm::teammate::do_not_contact(&self.ctx.db, to).await {
+                Ok(Some(name)) => return fail(crm::teammate::dnc_refusal(to, &name)),
+                Ok(None) => {}
+                Err(e) => return fail(format!("could not check the do-not-contact list, so not proposed: {e}")),
+            }
+        }
         // Images and files of the draft go into the conversation, so the owner can open them before deciding.
         for m in input["media"].as_array().into_iter().flatten().filter_map(Value::as_str) {
             if let Some(path) = inside(&s.workspace, m) {
@@ -408,6 +433,109 @@ impl Tools {
                 _ = tokio::time::sleep_until(deadline) => return ok(format!("Still running after 15 min (run {run}).")),
                 _ = s.cancel.cancelled() => return fail("cancelled"),
             }
+        }
+    }
+
+    #[tool(
+        description = "Search your owner's CRM: companies, contacts and deals (with ids, stages, fit scores, tags and \
+            do-not-contact flags). Use it before adding anything, so you update a record instead of duplicating it.",
+        annotations(read_only_hint = true)
+    )]
+    async fn crm_search(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<teammate::SearchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.scope(&parts)?;
+        answer(teammate::search(&self.ctx.db, p).await)
+    }
+
+    #[tool(
+        description = "Read one CRM record in full: a company with its contacts, deals and recent activity; a contact \
+            with its deals and activity; or a deal with its activity.",
+        annotations(read_only_hint = true)
+    )]
+    async fn crm_get(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<teammate::GetArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.scope(&parts)?;
+        answer(teammate::get(&self.ctx.db, p).await)
+    }
+
+    #[tool(
+        description = "The sales pipeline: for each deal stage, how many deals, their total value and the newest ten.",
+        annotations(read_only_hint = true)
+    )]
+    async fn crm_pipeline(&self, Extension(parts): Extension<http::request::Parts>) -> Result<CallToolResult, ErrorData> {
+        self.scope(&parts)?;
+        answer(teammate::pipeline(&self.ctx.db).await)
+    }
+
+    #[tool(description = "Add a company to the CRM or update one (same domain = same company). A new company needs \
+        source_urls. Fields your owner set themselves keep their values; tags and source_urls are added to.")]
+    async fn crm_upsert_company(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<teammate::CompanyArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self.crm_writer(&parts)? {
+            Ok(actor) => answer(teammate::upsert_company(&self.ctx.db, &actor, p).await),
+            Err(e) => fail(e),
+        }
+    }
+
+    #[tool(description = "Add a person to the CRM or update one (same email = same person). A new contact needs \
+        source_urls. Only public business contact details; never a guessed email. Set do_not_contact when they ask \
+        not to be contacted (you can never clear it).")]
+    async fn crm_upsert_contact(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<teammate::ContactArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self.crm_writer(&parts)? {
+            Ok(actor) => answer(teammate::upsert_contact(&self.ctx.db, &actor, p).await),
+            Err(e) => fail(e),
+        }
+    }
+
+    #[tool(description = "Add a deal (an opportunity with a company) or update one. Use crm_move_deal to change the \
+        stage of an existing deal.")]
+    async fn crm_upsert_deal(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<teammate::DealArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self.crm_writer(&parts)? {
+            Ok(actor) => answer(teammate::upsert_deal(&self.ctx.db, &actor, p).await),
+            Err(e) => fail(e),
+        }
+    }
+
+    #[tool(description = "Move a deal to another stage (new, researching, contacted, replied, meeting, proposal, won, \
+        lost), with a one-line note on why. The move is logged on the deal's timeline.")]
+    async fn crm_move_deal(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<teammate::MoveArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self.crm_writer(&parts)? {
+            Ok(actor) => answer(teammate::move_deal(&self.ctx.db, &actor, p).await),
+            Err(e) => fail(e),
+        }
+    }
+
+    #[tool(description = "Add an entry to a company's, contact's or deal's timeline: research, a note, an email or DM \
+        you sent (name the approved draft) or received, a call or a meeting.")]
+    async fn crm_log_activity(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(p): Parameters<teammate::ActivityArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self.crm_writer(&parts)? {
+            Ok(actor) => answer(teammate::log_activity(&self.ctx.db, &actor, p).await),
+            Err(e) => fail(e),
         }
     }
 

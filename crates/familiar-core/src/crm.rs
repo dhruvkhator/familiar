@@ -4,6 +4,9 @@
 //!
 //! Every write runs in one transaction with its `crm_changes` record (the row before and after, who did it) and a call
 //! to [`enqueue_webhooks`]. Companies, contacts and deals are soft-deleted so a delete can be undone ([`undo`]).
+//!
+//! A teammate's writes ([`Actor::Bot`]) follow the trust rules of [`teammate`]: the owner's own edits win, a new company
+//! or contact needs `source_urls`, and one run makes at most [`MAX_WRITES_PER_RUN`] changes.
 
 use crate::db::Db;
 use chrono::{DateTime, Utc};
@@ -13,6 +16,11 @@ use sqlx::{PgConnection, types::Json};
 use uuid::Uuid;
 
 pub mod csv;
+pub mod teammate;
+pub mod webhooks;
+
+/// The most CRM changes one teammate run may make (a runaway loop stops here; a new run can carry on).
+pub const MAX_WRITES_PER_RUN: i64 = 200;
 
 // ---- errors ---------------------------------------------------------------
 
@@ -162,6 +170,15 @@ pub enum Outcome {
     Created,
     Updated,
     Unchanged,
+}
+
+/// A save of a company, contact or deal: the row as it is now, what happened, and (for a teammate) the fields it asked
+/// to change that were kept because the owner set them ([`teammate`]'s owner-edits-win rule).
+#[derive(Debug, Clone)]
+pub struct Saved {
+    pub row: Value,
+    pub outcome: Outcome,
+    pub kept: Vec<String>,
 }
 
 // ---- normalisers ----------------------------------------------------------
@@ -535,10 +552,10 @@ fn clean_activity(i: &ActivityInput) -> Result<M> {
 // ---- webhooks and the change log ------------------------------------------
 
 /// Queue a webhook delivery for every enabled webhook of `owner` that listens to `event`, inside the transaction of
-/// the change itself. `payload` is `{event, data, previous, actor: {kind, bot_id}}`. Phase 1: a no-op; the webhook
-/// feature fills it in (and completes the payload) without touching the callers.
-pub async fn enqueue_webhooks(_tx: &mut PgConnection, _owner: Uuid, _event: &str, _payload: &Value) -> Result<()> {
-    Ok(())
+/// the change itself (so a rolled-back write sends nothing). `payload` is `{event, data, previous, actor: {kind,
+/// bot_id}}`; [`webhooks::enqueue`] completes it with the delivery `id`, `at` and the teammate's `bot_slug`.
+pub async fn enqueue_webhooks(tx: &mut PgConnection, owner: Uuid, event: &str, payload: &Value) -> Result<()> {
+    webhooks::enqueue(tx, owner, event, payload).await
 }
 
 async fn emit(
@@ -674,19 +691,40 @@ async fn update_row(tx: &mut PgConnection, kind: Kind, owner: Uuid, id: Uuid, m:
     Ok(row.map(|r| r.0))
 }
 
-/// Create (`id` None) or change one company, contact or deal and log it. `m` holds only validated columns.
-async fn save(
-    tx: &mut PgConnection,
-    owner: Uuid,
-    actor: &Actor,
-    kind: Kind,
-    id: Option<Uuid>,
-    mut m: M,
-) -> Result<(Value, Outcome)> {
+/// A teammate run's write budget ([`MAX_WRITES_PER_RUN`]). The run's row is locked, so parallel tool calls of one run
+/// count one after the other.
+async fn budget(tx: &mut PgConnection, actor: &Actor) -> Result<()> {
+    let Actor::Bot { run: Some(run), .. } = actor else { return Ok(()) };
+    sqlx::query("select 1 from runs where id = $1 for no key update").bind(run).execute(&mut *tx).await?;
+    let made: i64 = sqlx::query_scalar("select count(*) from crm_changes where run_id = $1")
+        .bind(run)
+        .fetch_one(&mut *tx)
+        .await?;
+    if made >= MAX_WRITES_PER_RUN {
+        return invalid(format!(
+            "This run already made {MAX_WRITES_PER_RUN} CRM changes, the most one run may make. Stop changing the CRM \
+             now: finish with a summary of what you did and what is left (a later run can carry on)."
+        ));
+    }
+    Ok(())
+}
+
+/// Create (`id` None) or change one company, contact or deal and log it. `m` holds only validated columns. A teammate's
+/// change goes through [`teammate::owner_edits_win`] first.
+async fn save(tx: &mut PgConnection, owner: Uuid, actor: &Actor, kind: Kind, id: Option<Uuid>, mut m: M) -> Result<Saved> {
+    budget(tx, actor).await?;
     check_refs(tx, owner, &m).await?;
     let name = kind.name();
     let Some(id) = id else {
         if let Some(bot) = actor.bot() {
+            // A teammate says where the facts came from, so the owner can check them.
+            let sourced = m.get("source_urls").and_then(Value::as_array).is_some_and(|s| !s.is_empty());
+            if matches!(kind, Kind::Company | Kind::Contact) && !sourced {
+                return invalid(format!(
+                    "a new {name} needs source_urls: the public pages its facts come from (a company's own website \
+                     counts for an inbound lead)"
+                ));
+            }
             m.insert("created_by_bot".into(), json!(bot));
         }
         if m.get("do_not_contact") == Some(&json!(true)) {
@@ -698,9 +736,17 @@ async fn save(
         if row["do_not_contact"] == json!(true) {
             emit(tx, owner, actor, "contact.do_not_contact", &row, None).await?;
         }
-        return Ok((row, Outcome::Created));
+        return Ok(Saved { row, outcome: Outcome::Created, kept: vec![] });
     };
     let before = fetch_locked(tx, kind, owner, id, true).await?.ok_or(CrmError::NotFound)?;
+    let kept = if actor.bot().is_some() {
+        let fields: Vec<String> = m.keys().cloned().collect();
+        let held = teammate::owner_held(tx, owner, kind, id, &fields).await?;
+        teammate::owner_edits_win(kind, &before, &mut m, &held)
+    } else {
+        vec![]
+    };
+    let unchanged = |row: Value, kept: Vec<String>| Ok(Saved { row, outcome: Outcome::Unchanged, kept });
     let mut now_dnc = false;
     let mut stage_moved = false;
     if kind == Kind::Contact
@@ -726,10 +772,10 @@ async fn save(
         stage_moved = true;
     }
     if m.is_empty() {
-        return Ok((before, Outcome::Unchanged));
+        return unchanged(before, kept);
     }
     let Some(after) = update_row(tx, kind, owner, id, &m, false).await? else {
-        return Ok((before, Outcome::Unchanged));
+        return unchanged(before, kept);
     };
     record(tx, owner, actor, kind, id, "update", Some(&before), Some(&after)).await?;
     emit(tx, owner, actor, &format!("{name}.updated"), &after, Some(&before)).await?;
@@ -739,7 +785,7 @@ async fn save(
     if stage_moved {
         emit(tx, owner, actor, "deal.stage_changed", &after, Some(&before)).await?;
     }
-    Ok((after, Outcome::Updated))
+    Ok(Saved { row: after, outcome: Outcome::Updated, kept })
 }
 
 async fn find_one(tx: &mut PgConnection, sql: &str, owner: Uuid, a: &str) -> Result<Option<Uuid>> {
@@ -767,6 +813,14 @@ pub async fn find_company_in(tx: &mut PgConnection, owner: Uuid, domain: Option<
 /// Create the company, or update the one it matches (same domain; or, without a domain, the same name). Several writes
 /// in one transaction (a CSV import) use this form; see [`upsert_company`].
 pub async fn upsert_company_in(tx: &mut PgConnection, owner: Uuid, actor: &Actor, i: &CompanyInput) -> Result<(Value, Outcome)> {
+    write_company_in(tx, owner, actor, None, i).await.map(|s| (s.row, s.outcome))
+}
+
+/// Change the company `id`, or (None) create one / update the one it matches, as [`upsert_company_in`] does.
+pub async fn write_company_in(tx: &mut PgConnection, owner: Uuid, actor: &Actor, id: Option<Uuid>, i: &CompanyInput) -> Result<Saved> {
+    if id.is_some() {
+        return save(tx, owner, actor, Kind::Company, id, clean_company(i, false)?).await;
+    }
     let m = clean_company(i, true)?;
     let domain = m.get("domain").and_then(Value::as_str);
     let name = m.get("name").and_then(Value::as_str);
@@ -835,7 +889,15 @@ pub async fn find_contact_in(
 
 /// Create the contact, or update the one it matches (email, else LinkedIn link, else name + company).
 pub async fn upsert_contact_in(tx: &mut PgConnection, owner: Uuid, actor: &Actor, i: &ContactInput) -> Result<(Value, Outcome)> {
+    write_contact_in(tx, owner, actor, None, i).await.map(|s| (s.row, s.outcome))
+}
+
+/// Change the contact `id`, or (None) create one / update the one it matches, as [`upsert_contact_in`] does.
+pub async fn write_contact_in(tx: &mut PgConnection, owner: Uuid, actor: &Actor, id: Option<Uuid>, i: &ContactInput) -> Result<Saved> {
     let m = clean_contact(i)?;
+    if id.is_some() {
+        return save(tx, owner, actor, Kind::Contact, id, m).await;
+    }
     let get = |k: &str| m.get(k).and_then(Value::as_str);
     let found = find_contact_in(tx, owner, get("email"), get("linkedin_url"), get("name"), i.company_id).await?;
     if found.is_none() && !m.contains_key("name") {
@@ -865,7 +927,15 @@ pub async fn soft_delete_contact(db: &Db, actor: &Actor, id: Uuid) -> Result<Val
 
 /// Create the deal, or update the one at the same company with the same title (any case).
 pub async fn upsert_deal_in(tx: &mut PgConnection, owner: Uuid, actor: &Actor, i: &DealInput) -> Result<(Value, Outcome)> {
+    write_deal_in(tx, owner, actor, None, i).await.map(|s| (s.row, s.outcome))
+}
+
+/// Change the deal `id`, or (None) create one / update the one it matches, as [`upsert_deal_in`] does.
+pub async fn write_deal_in(tx: &mut PgConnection, owner: Uuid, actor: &Actor, id: Option<Uuid>, i: &DealInput) -> Result<Saved> {
     let m = clean_deal(i)?;
+    if id.is_some() {
+        return save(tx, owner, actor, Kind::Deal, id, m).await;
+    }
     let found: Option<Uuid> = match (i.company_id, m.get("title").and_then(Value::as_str)) {
         (Some(c), Some(t)) => {
             sqlx::query_scalar(
@@ -905,11 +975,19 @@ pub async fn soft_delete_deal(db: &Db, actor: &Actor, id: Uuid) -> Result<Value>
 /// Move a deal to a stage: sets `stage_changed_at` and logs a `stage_change` activity (with `note` as its body).
 /// Already in that stage: nothing happens.
 pub async fn move_deal(db: &Db, actor: &Actor, deal: Uuid, stage: &str, note: Option<&str>) -> Result<Value> {
-    let m = clean_deal(&DealInput { stage: Some(stage.to_string()), ..Default::default() })?;
     let mut tx = db.pool.begin().await?;
-    let before = fetch_locked(&mut tx, Kind::Deal, db.owner, deal, true).await?.ok_or(CrmError::NotFound)?;
-    let (row, outcome) = save(&mut tx, db.owner, actor, Kind::Deal, Some(deal), m).await?;
-    if outcome == Outcome::Updated {
+    let saved = move_deal_in(&mut tx, db.owner, actor, deal, stage, note).await?;
+    tx.commit().await?;
+    Ok(saved.row)
+}
+
+/// [`move_deal`] inside a transaction.
+pub async fn move_deal_in(tx: &mut PgConnection, owner: Uuid, actor: &Actor, deal: Uuid, stage: &str, note: Option<&str>) -> Result<Saved> {
+    let m = clean_deal(&DealInput { stage: Some(stage.to_string()), ..Default::default() })?;
+    let before = fetch_locked(tx, Kind::Deal, owner, deal, true).await?.ok_or(CrmError::NotFound)?;
+    let saved = save(tx, owner, actor, Kind::Deal, Some(deal), m).await?;
+    let row = &saved.row;
+    if saved.outcome == Outcome::Updated {
         let uuid = |k: &str| row[k].as_str().and_then(|s| s.parse::<Uuid>().ok());
         let a = ActivityInput {
             company_id: uuid("company_id"),
@@ -920,19 +998,18 @@ pub async fn move_deal(db: &Db, actor: &Actor, deal: Uuid, stage: &str, note: Op
             body: note.map(str::to_string),
             ..Default::default()
         };
-        log_activity_in(&mut tx, db.owner, actor, &a).await?;
+        log_activity_in(tx, owner, actor, &a).await?;
     }
-    tx.commit().await?;
-    Ok(row)
+    Ok(saved)
 }
 
 // ---- generic patch / delete -----------------------------------------------
 
 async fn patch(db: &Db, actor: &Actor, kind: Kind, id: Uuid, m: M) -> Result<Value> {
     let mut tx = db.pool.begin().await?;
-    let (row, _) = save(&mut tx, db.owner, actor, kind, Some(id), m).await?;
+    let saved = save(&mut tx, db.owner, actor, kind, Some(id), m).await?;
     tx.commit().await?;
-    Ok(row)
+    Ok(saved.row)
 }
 
 async fn soft_delete(db: &Db, actor: &Actor, kind: Kind, id: Uuid) -> Result<Value> {
@@ -954,6 +1031,7 @@ pub async fn log_activity_in(tx: &mut PgConnection, owner: Uuid, actor: &Actor, 
     if !(m.contains_key("company_id") || m.contains_key("contact_id") || m.contains_key("deal_id")) {
         return invalid("an activity needs a company_id, contact_id or deal_id");
     }
+    budget(tx, actor).await?;
     check_refs(tx, owner, &m).await?;
     if let Some(deal) = i.deal_id {
         let d: Option<(Uuid, Option<Uuid>)> =
@@ -1055,7 +1133,8 @@ const CONTACT_SEL: &str = "select (to_jsonb(x) - 'owner_id') || jsonb_build_obje
      from crm_contacts x left join crm_companies co on co.id = x.company_id";
 // a deal of a deleted company is hidden with it
 const DEAL_SEL: &str = "select (to_jsonb(x) - 'owner_id') || jsonb_build_object('company_name', co.name,
-         'company_domain', co.domain, 'contact_name', ct.name, 'contact_email', ct.email)
+         'company_domain', co.domain, 'contact_name', ct.name, 'contact_email', ct.email,
+         'contact_do_not_contact', coalesce(ct.do_not_contact, false))
      from crm_deals x join crm_companies co on co.id = x.company_id and co.deleted_at is null
      left join crm_contacts ct on ct.id = x.contact_id";
 
@@ -1088,10 +1167,14 @@ pub struct Filters {
     pub q: Option<String>,
     /// Companies and contacts.
     pub tag: Option<String>,
+    /// Companies and contacts: every one of these tags too (any case).
+    pub tags: Vec<String>,
     /// Deals.
     pub stage: Option<String>,
     /// Contacts and deals.
     pub company_id: Option<Uuid>,
+    /// Deals.
+    pub contact_id: Option<Uuid>,
     /// Contacts: only those (not) marked do-not-contact.
     pub dnc: Option<bool>,
     /// `updated` (default), `name` or `fit` (companies; else as `updated`).
@@ -1117,18 +1200,23 @@ async fn list(db: &Db, kind: Kind, f: &Filters, limit: i64, offset: i64) -> Resu
     };
     let q = like(&f.q);
     let base = "x.owner_id = $1 and x.deleted_at is null";
+    // every wanted tag is on the record (any case)
+    let tags: Vec<String> =
+        f.tag.iter().chain(&f.tags).map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect();
+    let has_tags = "not exists (select 1 from unnest($3::text[]) w
+                                where not exists (select 1 from unnest(x.tags) g where lower(g) = lower(w)))";
     let rows: Vec<Json<Value>> = match kind {
         Kind::Company => {
             sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
                 "{sel} where {base}
                    and ($2::text is null or x.name ilike $2 or x.domain ilike $2 or x.industry ilike $2
                         or x.location ilike $2 or x.description ilike $2)
-                   and ($3::text is null or exists (select 1 from unnest(x.tags) g where lower(g) = lower($3)))
+                   and {has_tags}
                  order by {order} limit $4 offset $5"
             )))
             .bind(db.owner)
             .bind(q)
-            .bind(f.tag.as_deref().map(str::trim).filter(|t| !t.is_empty()))
+            .bind(&tags)
             .bind(limit)
             .bind(offset)
             .fetch_all(&db.pool)
@@ -1139,14 +1227,14 @@ async fn list(db: &Db, kind: Kind, f: &Filters, limit: i64, offset: i64) -> Resu
                 "{sel} where {base}
                    and ($2::text is null or x.name ilike $2 or x.email ilike $2 or x.title ilike $2
                         or x.notes ilike $2 or co.name ilike $2)
-                   and ($3::text is null or exists (select 1 from unnest(x.tags) g where lower(g) = lower($3)))
+                   and {has_tags}
                    and ($4::uuid is null or x.company_id = $4)
                    and ($5::bool is null or x.do_not_contact = $5)
                  order by {order} limit $6 offset $7"
             )))
             .bind(db.owner)
             .bind(q)
-            .bind(f.tag.as_deref().map(str::trim).filter(|t| !t.is_empty()))
+            .bind(&tags)
             .bind(f.company_id)
             .bind(f.dnc)
             .bind(limit)
@@ -1165,6 +1253,7 @@ async fn list(db: &Db, kind: Kind, f: &Filters, limit: i64, offset: i64) -> Resu
                    and ($2::text is null or x.title ilike $2 or x.next_step ilike $2 or co.name ilike $2)
                    and ($3::text is null or x.stage = $3)
                    and ($4::uuid is null or x.company_id = $4)
+                   and ($7::uuid is null or x.contact_id = $7)
                  order by {order} limit $5 offset $6"
             )))
             .bind(db.owner)
@@ -1173,6 +1262,7 @@ async fn list(db: &Db, kind: Kind, f: &Filters, limit: i64, offset: i64) -> Resu
             .bind(f.company_id)
             .bind(limit)
             .bind(offset)
+            .bind(f.contact_id)
             .fetch_all(&db.pool)
             .await?
         }

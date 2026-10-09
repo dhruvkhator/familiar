@@ -70,7 +70,7 @@ pub struct ListQuery {
 }
 
 pub async fn list(State(st): State<S>, a: Auth, P(k): P<String>, Q(q): Q<ListQuery>) -> R<Json<Vec<Value>>> {
-    let f = Filters { q: q.q, tag: q.tag, stage: q.stage, company_id: q.company_id, dnc: q.dnc, sort: q.sort };
+    let f = Filters { q: q.q, tag: q.tag, stage: q.stage, company_id: q.company_id, dnc: q.dnc, sort: q.sort, ..Default::default() };
     Ok(Json(crm::search(&db(&st, &a), kind(&k)?, &f, q.limit, q.offset).await?))
 }
 
