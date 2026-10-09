@@ -1,10 +1,11 @@
 //! Teammate templates in the New teammate flow: the picker (category chips over a grid of ready-made teammates, plus
-//! "Blank teammate") and the "What it sets up" summary the form shows for a picked template. The form itself is
-//! [`crate::bot_settings::BotSettings`]; creating goes through `POST /api/templates/{id}/create`.
+//! "Blank teammate"; crews hired together, such as the GTM crew, are featured on top) and the "What it sets up"
+//! summary the form shows for a picked template. The form itself is [`crate::bot_settings::BotSettings`]; creating
+//! goes through `POST /api/templates/{id}/create` (a crew: [`crate::crm_crew`]).
 
 use std::collections::HashMap;
 
-use familiar_client::{ConnectorPreset, Template};
+use familiar_client::{ConnectorPreset, Template, TemplateBundle};
 use familiar_ui::anim;
 use familiar_ui::components::{HoverCard, Skeleton, card, chip};
 use familiar_ui::icons::{self, icon};
@@ -12,7 +13,7 @@ use familiar_ui::mascot::{Avatar, Mascot, MascotState, resolve_avatar};
 use familiar_ui::theme::{RADIUS_CARD, RADIUS_CONTROL, Theme, Tone, text};
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::data::{AppData, swr};
@@ -23,19 +24,25 @@ const CATEGORIES: [&str; 6] = ["Growth & marketing", "Sales", "Social", "Researc
 /// The picker's answer: a template, or `None` for a blank teammate.
 pub struct Picked(pub Option<Template>);
 
+/// The picker's other answer: a crew of teammates hired together (the GTM crew).
+pub struct PickedBundle(pub TemplateBundle);
+
 pub struct TemplatePicker {
     templates: Option<Vec<Template>>,
+    bundles: Vec<TemplateBundle>,
     /// Index into the chips: 0 is "All".
     category: usize,
 }
 
 impl EventEmitter<Picked> for TemplatePicker {}
+impl EventEmitter<PickedBundle> for TemplatePicker {}
 
 impl TemplatePicker {
     pub fn new(data: Entity<AppData>, cx: &mut Context<Self>) -> Self {
-        let mut this = Self { templates: None, category: 0 };
+        let mut this = Self { templates: None, bundles: Vec::new(), category: 0 };
         let client = data.read(cx).client.clone();
         swr(&mut this, &client, "/api/templates".into(), cx, |this, list: Vec<Template>, _| this.templates = Some(list));
+        swr(&mut this, &client, "/api/templates/bundles".into(), cx, |this, list: Vec<TemplateBundle>, _| this.bundles = list);
         this
     }
 
@@ -111,6 +118,88 @@ impl TemplatePicker {
                                             .text_ellipsis()
                                             .child(t.summary.clone()),
                                     ),
+                            ),
+                    ),
+            ),
+        )
+        .into_any_element()
+    }
+
+    /// A crew hired together, featured above the grid: its faces, name, pitch and "Hire the crew".
+    fn bundle_card(&self, b: &TemplateBundle, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let this = cx.entity();
+        let pick = b.clone();
+        let mut faces = div().flex().items_center();
+        for (i, id) in b.templates.iter().enumerate() {
+            let avatar = self
+                .templates
+                .as_ref()
+                .and_then(|l| l.iter().find(|t| &t.id == id))
+                .map(template_avatar)
+                .unwrap_or_else(|| resolve_avatar(id, None));
+            faces = faces.child(
+                div()
+                    .when(i > 0, |el| el.ml(px(-10.0)))
+                    .size(px(46.0))
+                    .rounded_full()
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.line)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Mascot::new(format!("tpl-crew-{id}"), avatar, MascotState::Idle, 38.0)),
+            );
+        }
+        anim::appear(
+            SharedString::from(format!("tpl-bundle-in-{}", b.id)),
+            div().child(
+                HoverCard::new(SharedString::from(format!("tpl-bundle-{}", b.id)))
+                    .padding(16.0)
+                    .on_click(move |_, _, cx| this.update(cx, |_, cx| cx.emit(PickedBundle(pick.clone()))))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(16.0))
+                            .child(faces)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap(px(3.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(8.0))
+                                            .child(div().font_weight(FontWeight::SEMIBOLD).text_color(theme.ink).child(b.name.clone()))
+                                            .child(chip(Tone::Accent, format!("{} teammates", b.templates.len()), cx))
+                                            .child(chip(Tone::Muted, "Keeps a CRM", cx)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(text::SMALL))
+                                            .text_color(theme.muted)
+                                            .line_clamp(2)
+                                            .text_ellipsis()
+                                            .child(b.summary.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_none()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .text_size(px(text::SMALL))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme.accent)
+                                    .child("Hire the crew")
+                                    .child(icon(icons::ARROW_RIGHT).size(px(14.0)).text_color(theme.accent)),
                             ),
                     ),
             ),
@@ -196,6 +285,13 @@ impl Render for TemplatePicker {
                 }
             }
         }
+        // Crews show on All and on their category.
+        let want = self.chips().get(self.category).copied().unwrap_or("All");
+        let featured: Vec<AnyElement> = if want == "All" || want == "Sales" {
+            self.bundles.clone().iter().map(|b| self.bundle_card(b, cx)).collect()
+        } else {
+            Vec::new()
+        };
         div()
             .flex()
             .flex_col()
@@ -211,6 +307,7 @@ impl Render for TemplatePicker {
                     )),
             )
             .child(chips)
+            .children(featured)
             // Keyed by category so a filter change re-plays the reveal.
             .child(div().id(SharedString::from(format!("tpl-grid-{}", self.category))).child(grid))
     }
@@ -327,13 +424,16 @@ pub fn describe_cron(cron: &str) -> String {
     const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
     const PLURAL: [&str; 7] = ["Sundays", "Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays", "Saturdays"];
     let f: Vec<&str> = cron.split_whitespace().collect();
-    let (Ok(min), Ok(hour)) = (f.first().unwrap_or(&"").parse::<u32>(), f.get(1).unwrap_or(&"").parse::<u32>()) else {
+    // One hour, or a short list of them ("9,15": twice a day).
+    let hours: Option<Vec<u32>> = f.get(1).and_then(|h| h.split(',').map(|x| x.parse::<u32>().ok().filter(|h| *h <= 23)).collect());
+    let (Ok(min), Some(hours)) = (f.first().unwrap_or(&"").parse::<u32>(), hours) else {
         return cron.to_owned();
     };
-    if f.len() != 5 || f[2] != "*" || f[3] != "*" || min > 59 || hour > 23 {
+    if f.len() != 5 || f[2] != "*" || f[3] != "*" || min > 59 || hours.is_empty() || hours.len() > 4 {
         return cron.to_owned();
     }
-    let at = format!("{hour}:{min:02}");
+    let times: Vec<String> = hours.iter().map(|h| format!("{h}:{min:02}")).collect();
+    let at = join_and(&times.iter().map(String::as_str).collect::<Vec<_>>());
     let day = |s: &str| s.parse::<usize>().ok().map(|d| d % 7);
     let when = match f[4] {
         "*" => "Every day".to_owned(),
@@ -363,6 +463,8 @@ mod tests {
         assert_eq!(describe_cron("30 8 * * *"), "Every day at 8:30");
         assert_eq!(describe_cron("*/5 * * * *"), "*/5 * * * *");
         assert_eq!(describe_cron("0 9 1 * *"), "0 9 1 * *");
+        assert_eq!(describe_cron("0 9,15 * * 1-5"), "Weekdays at 9:00 and 15:00");
+        assert_eq!(describe_cron("0 9,x * * 1-5"), "0 9,x * * 1-5");
     }
 
     #[test]

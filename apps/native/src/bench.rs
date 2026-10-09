@@ -8,7 +8,8 @@
 //! paint). The report goes to `--bench-out <file>` (else stdout); the window quits when done.
 //!
 //! `--bench-shot today|needs|schedules|chat` only opens that page on the same data and quits after `--bench-hold`
-//! seconds (default 8): for before/after screenshots.
+//! seconds (default 8): for before/after screenshots. `crm…` shots open the CRM screens on a synthetic CRM
+//! ([`crate::bench_crm`]; [`crm_shot`] lists them) with three of the GTM crew among the teammates.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -49,6 +50,14 @@ const PIP: u128 = 0x4;
 const ADA_SHORT: u128 = 0x101;
 const ADA_LONG: u128 = 0x102;
 const LIVE_RUN: u128 = 0x900;
+// The GTM crew in the CRM shots.
+const LEAD: u128 = 0x11;
+const DRAFTER: u128 = 0x12;
+const TRACKER: u128 = 0x13;
+
+fn crew_ids() -> crate::bench_crm::CrewIds {
+    crate::bench_crm::CrewIds { lead: id(LEAD), drafter: id(DRAFTER), tracker: id(TRACKER) }
+}
 
 pub struct Args {
     pub out: Option<String>,
@@ -68,6 +77,7 @@ struct Fixture {
     runs: Vec<Run>,
     approvals: Vec<Approval>,
     schedules: Vec<Schedule>,
+    crm: crate::bench_crm::Crm,
 }
 
 fn ago(now: DateTime<Utc>, minutes: i64) -> DateTime<Utc> {
@@ -133,7 +143,8 @@ fn long_reply() -> String {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    /// `empty_crm`: the CRM holds nothing (the `crm-empty` shot).
+    fn new(empty_crm: bool) -> Self {
         let now = Utc::now();
         let bot = |n: u128, name: &str, persona: &str, last: i64| Bot {
             id: id(n),
@@ -256,7 +267,16 @@ impl Fixture {
             schedule(0x502, MILO, "Milo", "Weekly metrics", "0 9 * * 1", RunKind::Scheduled, 3 * 24 * 60),
             schedule(0x503, PIP, "Pip", "Inbox sweep", "*/30 * * * *", RunKind::Proactive, 20),
         ];
-        Self { now, bots, threads, messages, runs, approvals, schedules }
+        Self {
+            now,
+            bots,
+            threads,
+            messages,
+            runs,
+            approvals,
+            schedules,
+            crm: crate::bench_crm::Crm::new(now, crew_ids(), empty_crm),
+        }
     }
 
     fn overview(&self) -> Overview {
@@ -273,9 +293,41 @@ impl Fixture {
         }
     }
 
+    /// The CRM shots' extras: three of the GTM crew at work, and a first email of theirs waiting in Needs you.
+    fn add_crew(&mut self) {
+        self.bots.extend(crate::bench_crm::crew_bots(self.now, &crew_ids()));
+        let deal = self.crm.deals.first().cloned().unwrap_or_default();
+        self.approvals.push(Approval {
+            id: self.crm.waiting_draft,
+            run_id: id(0x305),
+            bot_id: id(DRAFTER),
+            tool_name: "propose_draft".into(),
+            input: Some(json!({
+                "kind": "email",
+                "channel": "email",
+                "to": deal.contact_email.clone().unwrap_or_default(),
+                "subject": format!("Incident reviews at {}", deal.company_name.clone().unwrap_or_default()),
+                "body": "Hi Sam, saw the postmortem your team published last week. We help platform teams cut the time from page to fix. Worth a 20-minute call next week?\n\nIf this isn't relevant, reply \"stop\" and I won't write again.",
+                "note": format!("CRM deal {} / contact {}", deal.id, deal.contact_id.unwrap_or_default()),
+            })),
+            reason: Some("First email for a new deal".into()),
+            status: ApprovalStatus::Pending,
+            created_at: self.now - chrono::Duration::minutes(1),
+            bot_name: Some("Outbound drafter".into()),
+            editable: vec!["subject".into(), "body".into()],
+            ..Default::default()
+        });
+    }
+
     /// The fake API: the JSON for a GET, or `None` (404).
-    fn get(&self, path: &str) -> Option<Value> {
+    fn get(&self, target: &str) -> Option<Value> {
+        let path = target.split('?').next().unwrap_or("/");
         let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+        if let ["api", rest @ ..] = segs.as_slice()
+            && let Some(v) = self.crm.get(rest, &crate::bench_crm::query(target))
+        {
+            return Some(v);
+        }
         let uuid = |s: &str| s.parse::<Uuid>().ok();
         let v = match segs.as_slice() {
             ["api", "overview"] => json!(self.overview()),
@@ -301,6 +353,19 @@ impl Fixture {
             }
             _ => return None,
         };
+        Some(v)
+    }
+
+    /// The fake API's writes (the CRM's; hiring the crew also adds its teammates and schedules).
+    fn write(&mut self, method: &str, target: &str, body: &str) -> Option<Value> {
+        let path = target.split('?').next().unwrap_or("/");
+        let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+        let ["api", rest @ ..] = segs.as_slice() else { return None };
+        let (v, hired) = self.crm.write(method, rest, body)?;
+        if let Some((bots, schedules)) = hired {
+            self.bots.extend(bots);
+            self.schedules.extend(schedules);
+        }
         Some(v)
     }
 
@@ -382,7 +447,24 @@ async fn answer_one(mut sock: tokio::net::TcpStream, fx: Arc<Mutex<Fixture>>) ->
         }
         head.extend_from_slice(&buf[..n]);
     }
+    // The body: what came with the head, then the rest of `Content-Length`.
+    let split = head.windows(4).position(|w| w == b"\r\n\r\n").map_or(head.len(), |p| p + 4);
+    let mut body = head.split_off(split);
     let head = String::from_utf8_lossy(&head);
+    let length = head
+        .lines()
+        .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("content-length")))
+        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(8 * 1024 * 1024);
+    while body.len() < length {
+        let n = sock.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&buf[..n]);
+    }
+    let body = String::from_utf8_lossy(&body).into_owned();
     let mut words = head.split_whitespace();
     let (method, target) = (words.next().unwrap_or(""), words.next().unwrap_or("/"));
     let path = target.split('?').next().unwrap_or("/");
@@ -395,7 +477,7 @@ async fn answer_one(mut sock: tokio::net::TcpStream, fx: Arc<Mutex<Fixture>>) ->
         }
     }
     tokio::time::sleep(LATENCY).await;
-    let found = if method == "GET" { fx.lock().unwrap().get(path) } else { None };
+    let found = if method == "GET" { fx.lock().unwrap().get(target) } else { fx.lock().unwrap().write(method, target, &body) };
     let (status, body) = match found {
         Some(v) => ("200 OK", v.to_string()),
         None => ("404 Not Found", json!({ "error": "not found" }).to_string()),
@@ -423,7 +505,13 @@ impl Render for BenchRoot {
 
 /// Open the bench window on the fake API and run the scenario (or show one page for `--bench-shot`).
 pub fn open(args: Args, rt: tokio::runtime::Handle, cx: &mut App) {
-    let fx = Arc::new(Mutex::new(Fixture::new()));
+    let page = args.shot.as_deref().unwrap_or("");
+    let mut fixture = Fixture::new(page == "crm-empty");
+    // The CRM shots show three of the GTM crew at work (not the ones that hire it).
+    if page.starts_with("crm") && !matches!(page, "crm-crew" | "crm-crew-done" | "crm-picker") {
+        fixture.add_crew();
+    }
+    let fx = Arc::new(Mutex::new(fixture));
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind the bench's local API");
     listener.set_nonblocking(true).expect("non-blocking listener");
     let base = format!("http://{}", listener.local_addr().expect("local address"));
@@ -448,7 +536,7 @@ pub fn open(args: Args, rt: tokio::runtime::Handle, cx: &mut App) {
     cx.spawn(async move |cx| {
         let report = match args.shot.as_deref() {
             Some(page) => {
-                shot(page, &shell, &data, cx).await;
+                shot(page, window, &shell, &data, cx).await;
                 cx.background_executor().timer(Duration::from_secs(args.hold)).await;
                 None
             }
@@ -497,8 +585,11 @@ async fn interval(cx: &mut AsyncApp, name: &'static str) -> Option<f64> {
     got
 }
 
-async fn shot(page: &str, shell: &Entity<Shell>, data: &Entity<AppData>, cx: &mut AsyncApp) {
+async fn shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Shell>, data: &Entity<AppData>, cx: &mut AsyncApp) {
     until(cx, Duration::from_secs(10), |cx| data.read(cx).overview.is_some()).await;
+    if page.starts_with("crm") {
+        return crm_shot(page, window, shell, cx).await;
+    }
     match page {
         "chat" => {
             cx.update(|cx| shell.update(cx, |s, cx| s.navigate(Route::Teammate(id(ADA).to_string().into()), cx)));
@@ -516,6 +607,107 @@ async fn shot(page: &str, shell: &Entity<Shell>, data: &Entity<AppData>, cx: &mu
                 _ => Route::Today,
             };
             cx.update(|cx| shell.update(cx, |s, cx| s.navigate(route, cx)));
+        }
+    }
+}
+
+/// The CRM shots: `crm` (companies), `crm-contacts`, `crm-pipeline`, `crm-deals`, `crm-activity`, `crm-company`,
+/// `crm-contact` (do-not-contact), `crm-deal`, `crm-move` (the board's stage menu), `crm-import` (the dry-run
+/// preview), `crm-empty`, `crm-picker` (New teammate with the crew), `crm-crew`, `crm-crew-done`, `crm-webhooks`,
+/// `crm-webhook-add` (with an address it refuses) and `crm-webhook-secret`.
+async fn crm_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Shell>, cx: &mut AsyncApp) {
+    use crate::crm::Tab;
+    use crate::crm_record::Rec;
+    let open = |cx: &mut AsyncApp, target: &str| {
+        let target = target.to_owned();
+        cx.update(|cx| shell.update(cx, |s, cx| s.open(&target, cx)));
+    };
+    let crm_ready = |cx: &mut App| shell.read(cx).crm_page().is_some();
+    // Run `f` on the CRM page with its window once the page exists and its lists are in.
+    async fn on_crm(
+        window: WindowHandle<BenchRoot>,
+        shell: &Entity<Shell>,
+        cx: &mut AsyncApp,
+        f: impl FnOnce(&mut crate::crm::CrmPage, &mut Window, &mut Context<crate::crm::CrmPage>),
+    ) {
+        wait(cx, Duration::from_millis(700)).await;
+        let _ = window.update(cx, |_, window, cx| {
+            if let Some(p) = shell.read(cx).crm_page() {
+                p.update(cx, |p, cx| f(p, window, cx));
+            }
+        });
+    }
+    match page {
+        "crm-picker" => open(cx, "new"),
+        "crm-crew" | "crm-crew-done" => {
+            open(cx, "crew");
+            if page == "crm-crew-done" {
+                until(cx, Duration::from_secs(5), |cx| shell.read(cx).crew_form().is_some()).await;
+                wait(cx, Duration::from_millis(600)).await;
+                cx.update(|cx| {
+                    if let Some(c) = shell.read(cx).crew_form() {
+                        c.update(cx, |c, cx| c.hire(cx));
+                    }
+                });
+            }
+        }
+        "crm-webhooks" | "crm-webhook-add" | "crm-webhook-secret" => {
+            open(cx, "settings");
+            wait(cx, Duration::from_millis(500)).await;
+            let fill = match page {
+                "crm-webhook-add" => Some(("https://192.168.1.20/hooks/crm", false)),
+                "crm-webhook-secret" => Some(("https://hooks.zapier.com/hooks/catch/1234567/n3wh00k/", true)),
+                _ => None,
+            };
+            if let Some((url, submit)) = fill {
+                let _ = window.update(cx, |_, window, cx| {
+                    if let Some(s) = shell.read(cx).settings_page() {
+                        let hooks = s.read(cx).webhooks();
+                        hooks.update(cx, |h, cx| h.fill_add(url, submit, window, cx));
+                    }
+                });
+            }
+            wait(cx, Duration::from_millis(500)).await;
+            cx.update(|cx| shell.update(cx, |s, cx| {
+                s.scroll_page_to(5000.0);
+                cx.notify()
+            }));
+        }
+        _ => {
+            let (target, then): (&str, Option<&str>) = match page {
+                "crm-contacts" => ("crm/contacts", None),
+                "crm-pipeline" | "crm-move" => ("crm/pipeline", Some(page)),
+                "crm-deals" => ("crm/deals", None),
+                "crm-activity" => ("crm/activity", None),
+                "crm-contact" => ("crm/contacts", Some(page)),
+                "crm-company" | "crm-deal" | "crm-import" => ("crm", Some(page)),
+                _ => ("crm", None),
+            };
+            open(cx, target);
+            until(cx, Duration::from_secs(5), crm_ready).await;
+            // The newest company, a do-not-contact contact, the first deal (the fixture's ids are fixed).
+            use crate::bench_crm::cid;
+            let (company, dnc_contact, deal) = (cid(1, 0), cid(2, 5), cid(3, 0));
+            match then {
+                Some("crm-company") => on_crm(window, shell, cx, |p, w, cx| p.open(Rec::Company(company), false, w, cx)).await,
+                Some("crm-contact") => on_crm(window, shell, cx, |p, w, cx| p.open(Rec::Contact(dnc_contact), false, w, cx)).await,
+                Some("crm-deal") => on_crm(window, shell, cx, |p, w, cx| p.open(Rec::Deal(deal), false, w, cx)).await,
+                Some("crm-import") => {
+                    on_crm(window, shell, cx, |p, _, cx| p.preview_import("leads-october.csv".into(), crate::bench_crm::sample_csv(), "companies", cx)).await
+                }
+                Some("crm-move") => {
+                    on_crm(window, shell, cx, |p, w, cx| {
+                        p.set_tab(Tab::Pipeline, cx);
+                        // The first card of Replied.
+                        let replied = crate::crm_model::stage_index(familiar_client::DealStage::Replied).unwrap_or(3);
+                        if let Some(d) = p.board_card(replied, 0) {
+                            p.open_move_menu(d, w, cx);
+                        }
+                    })
+                    .await
+                }
+                _ => {}
+            }
         }
     }
 }

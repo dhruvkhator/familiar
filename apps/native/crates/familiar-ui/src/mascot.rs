@@ -418,11 +418,18 @@ pub struct Mascot {
     avatar: Avatar,
     state: MascotState,
     size: f32,
+    still: bool,
 }
 
 impl Mascot {
     pub fn new(key: impl Into<SharedString>, avatar: Avatar, state: MascotState, size: f32) -> Self {
-        Self { key: key.into(), avatar, state, size }
+        Self { key: key.into(), avatar, state, size, still: false }
+    }
+
+    /// No idle blink: for long lists (a table row's byline), where a blink would redraw the whole view.
+    pub fn still(mut self) -> Self {
+        self.still = true;
+        self
     }
 }
 
@@ -440,7 +447,7 @@ impl RenderOnce for Mascot {
         let offset = snap(-s * PAD / 100.0);
 
         // Idle blink, per-teammate phase so a row of mascots never blinks in unison.
-        let blink = if reduced || self.state == MascotState::Paused {
+        let blink = if reduced || self.still || self.state == MascotState::Paused {
             false
         } else {
             let phase_offset = (hash(&self.key) % 1000) as f32 / 1000.0;

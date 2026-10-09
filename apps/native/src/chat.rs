@@ -591,7 +591,7 @@ impl BotPage {
     }
 
     /// The Set up checklist's "Log in to …": show the computer on that page, with you in control.
-    fn open_login(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn open_login(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
         self.computer_dismissed = false;
         self.set_computer(true, cx);
         self.computer.update(cx, |c, cx| c.take_over_at(url, window, cx));

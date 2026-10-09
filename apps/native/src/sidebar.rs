@@ -1,5 +1,5 @@
-//! The shell's sidebar: Today, Needs you and Schedules, the teammates with their mascots and live status, Settings,
-//! and whether the computer is online. Its own view, drawn cached by the shell: working teammates' mascots animate
+//! The shell's sidebar: Today, Needs you, Schedules and the CRM, the teammates with their mascots and live status,
+//! Settings, and whether the computer is online. Its own view, drawn cached by the shell: working teammates' mascots animate
 //! here without redrawing the page beside it, and the page's live text doesn't redraw the sidebar.
 
 use familiar_ui::anim;
@@ -179,7 +179,8 @@ impl Render for Sidebar {
                                 .gap(px(2.0))
                                 .child(nav("nav-today", "Today", icons::HOME, Route::Today, 0))
                                 .child(nav("nav-needs", "Needs you", icons::BELL, Route::NeedsYou, pending))
-                                .child(nav("nav-schedules", "Schedules", icons::CALENDAR, Route::Schedules, 0)),
+                                .child(nav("nav-schedules", "Schedules", icons::CALENDAR, Route::Schedules, 0))
+                                .child(nav("nav-crm", "CRM", icons::CASE, Route::Crm, 0)),
                         )
                         .child(
                             div()

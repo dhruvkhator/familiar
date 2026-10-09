@@ -1,5 +1,6 @@
 //! App Settings (the web's `pages/AppSettings.tsx`): the Claude Code / Codex sign-ins on this computer, the owner
-//! account, this computer (who runs the engine, data folder, start at login, appearance, motion) and about.
+//! account, this computer (who runs the engine, data folder, start at login, appearance, motion), the CRM's webhooks
+//! ([`crate::crm_webhooks`]) and about.
 
 use std::time::{Duration, Instant};
 
@@ -12,7 +13,7 @@ use familiar_ui::motion::{self, ReduceMotion};
 use familiar_ui::theme::{RADIUS_CONTROL, Theme, Tone, text};
 use familiar_ui::toast::ToastStack;
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
+    AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _, Render, SharedString, Styled as _,
     Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_base::input::{InputEvent, InputState};
@@ -72,6 +73,8 @@ pub struct AppSettings {
     saving: bool,
     error: Option<String>,
     autostart: bool,
+    /// "Send CRM updates to another app".
+    webhooks: Entity<crate::crm_webhooks::CrmWebhooks>,
 }
 
 impl AppSettings {
@@ -96,9 +99,11 @@ impl AppSettings {
             }
         })
         .detach();
+        let webhooks = cx.new(|cx| crate::crm_webhooks::CrmWebhooks::new(data.clone(), toasts.clone(), cx));
         let mut this = Self {
             data,
             toasts,
+            webhooks,
             claude: None,
             codex: None,
             checking: false,
@@ -116,6 +121,10 @@ impl AppSettings {
         this.check(cx);
         this.load_me(window, cx);
         this
+    }
+
+    pub fn webhooks(&self) -> Entity<crate::crm_webhooks::CrmWebhooks> {
+        self.webhooks.clone()
     }
 
     pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
@@ -584,7 +593,7 @@ impl Render for AppSettings {
                     .flex_col()
                     .gap(px(4.0))
                     .child(div().text_size(px(text::DISPLAY)).font_weight(FontWeight::SEMIBOLD).child("Settings"))
-                    .child(div().text_size(px(text::LEAD)).text_color(theme.muted).child("Accounts, this computer, and about.")),
+                    .child(div().text_size(px(text::LEAD)).text_color(theme.muted).child("Accounts, this computer, CRM webhooks, and about.")),
             )
             .child(section(
                 "AI accounts",
@@ -594,6 +603,12 @@ impl Render for AppSettings {
             ))
             .child(section("Your account", Some("You sign in with this from the web or your phone."), account, &theme))
             .child(section("This computer", None, computer, &theme))
+            .child(section(
+                "Send CRM updates to another app",
+                Some("Zapier, HubSpot (through Zapier), Attio or your own app: every change you pick is sent there as it happens, signed so it can tell it came from Familiar."),
+                self.webhooks.clone(),
+                &theme,
+            ))
             .child(section(
                 "About",
                 None,

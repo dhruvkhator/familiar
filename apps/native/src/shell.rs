@@ -28,13 +28,15 @@ use gpui_tokio::Tokio;
 use uuid::Uuid;
 
 use crate::approval::ApprovalCards;
+use crate::crm::{CrmEvent, CrmPage, Tab};
+use crate::crm_crew::{CrewEvent, CrewHire};
 use crate::sidebar::{self, Sidebar};
 use crate::bot_settings::{BotSettings, CreateEvent};
 use crate::chat::{BotPage, TAB_SETTINGS};
 use crate::schedules::SchedulesPage;
 use crate::settings::AppSettings;
 use crate::data::{AppData, DataEvent, Status, Teammate, ago, excerpt, run_status, tail, until};
-use crate::templates::{Picked, TemplatePicker};
+use crate::templates::{Picked, PickedBundle, TemplatePicker};
 
 /// Resting on a teammate this long (sidebar row, Today's cards) fetches their chat before the click.
 const PREFETCH_AFTER: Duration = Duration::from_millis(120);
@@ -46,6 +48,7 @@ pub enum Route {
     Today,
     NeedsYou,
     Schedules,
+    Crm,
     Teammate(SharedString),
     Settings,
     NewTeammate,
@@ -65,6 +68,14 @@ pub struct Shell {
     pages: HashMap<Uuid, Entity<BotPage>>,
     settings: Option<Entity<AppSettings>>,
     schedules: Option<Entity<SchedulesPage>>,
+    crm: Option<Entity<CrmPage>>,
+    /// `--open crm/<tab>` before the CRM page exists: (tab, the deals as a list).
+    crm_tab: Option<(Tab, bool)>,
+    /// "Hire the GTM crew" while it is open (in the New teammate route); `crew_from_crm`: Back returns to the CRM.
+    crew: Option<Entity<CrewHire>>,
+    crew_from_crm: bool,
+    /// Open the crew form when the New teammate route next draws (it needs the window).
+    want_crew: bool,
     /// The New teammate flow while it is open (fresh each time): the template picker, then the form.
     picker: Option<Entity<TemplatePicker>>,
     new_bot: Option<Entity<BotSettings>>,
@@ -150,6 +161,11 @@ impl Shell {
             pages: HashMap::new(),
             settings: None,
             schedules: None,
+            crm: None,
+            crm_tab: None,
+            crew: None,
+            crew_from_crm: false,
+            want_crew: false,
             picker: None,
             new_bot: None,
             form_gen: 0,
@@ -160,14 +176,38 @@ impl Shell {
         }
     }
 
-    /// Open a page by name: `today`, `needs`, `schedules`, `settings`, `first`, a teammate's name or `bot:<id>`, optionally with
-    /// `/settings` for that teammate's Settings tab. Returns whether it matched.
+    /// Open a page by name: `today`, `needs`, `schedules`, `crm` (or `crm/contacts`, `crm/pipeline`, `crm/deals`,
+    /// `crm/activity`), `crew`, `settings`, `first`, a teammate's name or `bot:<id>`, optionally with `/settings` for
+    /// that teammate's Settings tab. Returns whether it matched.
     pub fn open(&mut self, target: &str, cx: &mut Context<Self>) -> bool {
         let want = target.trim().to_lowercase();
         let (who, tab) = match want.strip_suffix("/settings") {
             Some(w) => (w.to_owned(), true),
             None => (want.clone(), false),
         };
+        if let Some(tab) = who.strip_prefix("crm") {
+            let want = match tab.trim_start_matches('/') {
+                "" | "companies" => (Tab::Companies, false),
+                "contacts" => (Tab::Contacts, false),
+                "pipeline" | "board" => (Tab::Pipeline, false),
+                "deals" => (Tab::Pipeline, true),
+                "activity" => (Tab::Activity, false),
+                _ => return false,
+            };
+            match self.crm.clone() {
+                Some(p) => p.update(cx, |p, cx| {
+                    p.set_tab(want.0, cx);
+                    p.set_deal_list(want.1, cx);
+                }),
+                None => self.crm_tab = Some(want),
+            }
+            self.navigate(Route::Crm, cx);
+            return true;
+        }
+        if who == "crew" {
+            self.hire_crew(true, cx);
+            return true;
+        }
         let route = match who.as_str() {
             "today" => Some(Route::Today),
             "needs" => Some(Route::NeedsYou),
@@ -200,6 +240,12 @@ impl Shell {
         if route != Route::NewTeammate {
             self.new_bot = None;
             self.picker = None;
+            self.crew = None;
+            self.want_crew = false;
+        }
+        if let Some(p) = self.crm.clone() {
+            let shown = route == Route::Crm;
+            p.update(cx, |p, cx| p.set_shown(shown, cx));
         }
         if let Some(s) = self.settings.clone() {
             let shown = route == Route::Settings;
@@ -211,6 +257,37 @@ impl Shell {
             self.sidebar.update(cx, |s, cx| s.set_route(shown, cx));
             cx.notify();
         }
+    }
+
+    /// "Hire the GTM crew" (`from_crm`: Back returns to the CRM rather than the template picker).
+    pub fn hire_crew(&mut self, from_crm: bool, cx: &mut Context<Self>) {
+        self.navigate(Route::NewTeammate, cx);
+        self.new_bot = None;
+        self.crew = None;
+        self.crew_from_crm = from_crm;
+        self.want_crew = true;
+        self.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        cx.notify();
+    }
+
+    /// The CRM page, if it was opened.
+    pub fn crm_page(&self) -> Option<Entity<CrmPage>> {
+        self.crm.clone()
+    }
+
+    /// App Settings, if it was opened.
+    pub fn settings_page(&self) -> Option<Entity<AppSettings>> {
+        self.settings.clone()
+    }
+
+    /// Scroll an overview page (Settings, Today…) to `y` px from its top.
+    pub fn scroll_page_to(&self, y: f32) {
+        self.scroll.set_offset(gpui::point(px(0.0), px(-y)));
+    }
+
+    /// The crew form, while it is open.
+    pub fn crew_form(&self) -> Option<Entity<CrewHire>> {
+        self.crew.clone()
     }
 
     /// A teammate's page, if it was opened.
@@ -263,6 +340,30 @@ impl Shell {
                 let page = self.schedules.get_or_insert_with(|| cx.new(|cx| SchedulesPage::new(data, toasts, cx))).clone();
                 self.scrolled(page.into_any_element())
             }
+            Route::Crm => {
+                let page = match self.crm.clone() {
+                    Some(p) => p,
+                    None => {
+                        let (data, toasts) = (self.data.clone(), self.toasts.clone());
+                        let p = cx.new(|cx| CrmPage::new(data, toasts, window, cx));
+                        cx.subscribe_in(&p, window, Self::on_crm).detach();
+                        if let Some((tab, list)) = self.crm_tab.take() {
+                            p.update(cx, |p, cx| {
+                                p.set_tab(tab, cx);
+                                p.set_deal_list(list, cx);
+                            });
+                        }
+                        self.crm = Some(p.clone());
+                        p
+                    }
+                };
+                // Full width with its own scrolling (tables, the board); drawn cached like a teammate's page.
+                if self.settled {
+                    page.cached(StyleRefinement::default().size_full()).into_any_element()
+                } else {
+                    page.into_any_element()
+                }
+            }
             Route::Teammate(id) => self.bot_page(id, window, cx),
             Route::Settings => {
                 let (data, toasts) = (self.data.clone(), self.toasts.clone());
@@ -270,6 +371,17 @@ impl Shell {
                 self.scrolled(page.into_any_element())
             }
             Route::NewTeammate => {
+                if std::mem::take(&mut self.want_crew) {
+                    let (data, toasts) = (self.data.clone(), self.toasts.clone());
+                    let crew = cx.new(|cx| CrewHire::new(data, toasts, None, window, cx));
+                    cx.subscribe_in(&crew, window, Self::on_crew).detach();
+                    self.crew = Some(crew);
+                    self.form_gen += 1;
+                }
+                if let Some(crew) = self.crew.clone() {
+                    let id = SharedString::from(format!("crew-form-{}", self.form_gen));
+                    return self.scrolled(anim::appear(id, div().child(crew)).into_any_element());
+                }
                 if let Some(form) = self.new_bot.clone() {
                     let id = SharedString::from(format!("new-teammate-form-{}", self.form_gen));
                     return self.scrolled(anim::appear(id, div().child(form)).into_any_element());
@@ -280,6 +392,7 @@ impl Shell {
                         let data = self.data.clone();
                         let p = cx.new(|cx| TemplatePicker::new(data, cx));
                         cx.subscribe_in(&p, window, Self::on_pick).detach();
+                        cx.subscribe_in(&p, window, Self::on_pick_bundle).detach();
                         self.picker = Some(p.clone());
                         p
                     }
@@ -298,6 +411,53 @@ impl Shell {
         self.form_gen += 1;
         self.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
         cx.notify();
+    }
+
+    /// The GTM crew was picked: its own form (hires every teammate of the bundle at once).
+    fn on_pick_bundle(&mut self, _: &Entity<TemplatePicker>, ev: &PickedBundle, window: &mut Window, cx: &mut Context<Self>) {
+        let (data, toasts, bundle) = (self.data.clone(), self.toasts.clone(), ev.0.clone());
+        let crew = cx.new(|cx| CrewHire::new(data, toasts, Some(bundle), window, cx));
+        cx.subscribe_in(&crew, window, Self::on_crew).detach();
+        self.crew = Some(crew);
+        self.crew_from_crm = false;
+        self.form_gen += 1;
+        self.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+        cx.notify();
+    }
+
+    fn on_crew(&mut self, _: &Entity<CrewHire>, ev: &CrewEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev {
+            CrewEvent::Cancelled => self.navigate(if self.crew_from_crm { Route::Crm } else { Route::Today }, cx),
+            CrewEvent::Back if self.crew_from_crm => self.navigate(Route::Crm, cx),
+            CrewEvent::Back => {
+                self.crew = None;
+                self.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+                cx.notify();
+            }
+            CrewEvent::Hired(bots) => {
+                for b in bots {
+                    self.data.update(cx, |d, cx| d.add_bot(b.clone(), cx));
+                }
+                self.data.update(cx, |d, cx| d.reload_schedules(cx));
+                self.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+            }
+            CrewEvent::Open(bot) => self.navigate(Route::Teammate(bot.to_string().into()), cx),
+            CrewEvent::Login { bot, url } => {
+                let (data, toasts, id) = (self.data.clone(), self.toasts.clone(), *bot);
+                let page = self.pages.entry(id).or_insert_with(|| cx.new(|cx| BotPage::new(data, toasts, id, window, cx))).clone();
+                self.navigate(Route::Teammate(id.to_string().into()), cx);
+                page.update(cx, |p, cx| p.open_login(url.clone(), window, cx));
+            }
+            CrewEvent::Schedules => self.navigate(Route::Schedules, cx),
+            CrewEvent::Crm => self.navigate(Route::Crm, cx),
+        }
+    }
+
+    fn on_crm(&mut self, _: &Entity<CrmPage>, ev: &CrmEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        match ev {
+            CrmEvent::HireCrew => self.hire_crew(true, cx),
+            CrmEvent::OpenNeeds => self.navigate(Route::NeedsYou, cx),
+        }
     }
 
     /// The New teammate form finished: show the teammate, and (if asked) send its first message.
