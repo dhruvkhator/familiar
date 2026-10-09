@@ -230,7 +230,10 @@ impl Shell {
             (_, Some(w)) => (w.to_owned(), Some(TAB_FILES)),
             _ => (want.clone(), None),
         };
-        if let Some(rest) = who.strip_prefix("integrations") {
+        // Exact page names (`integrations`, `integrations/<preset>`), so a teammate named "integrations bot" or
+        // "crm helper" still opens as a teammate.
+        let page = |name: &str| (who == name || who.starts_with(&format!("{name}/"))).then(|| who[name.len()..].to_owned());
+        if let Some(rest) = page("integrations") {
             let preset = rest.trim_start_matches('/');
             if !preset.is_empty() {
                 match self.integrations.clone() {
@@ -244,7 +247,7 @@ impl Shell {
             self.navigate(Route::Integrations, cx);
             return true;
         }
-        if let Some(tab) = who.strip_prefix("crm") {
+        if let Some(tab) = page("crm") {
             let want = match tab.trim_start_matches('/') {
                 "" | "companies" => (Tab::Companies, false),
                 "contacts" => (Tab::Contacts, false),

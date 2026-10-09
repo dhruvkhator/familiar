@@ -55,6 +55,8 @@ struct Form {
     http: bool,
     command: Entity<InputState>,
     args: Entity<InputState>,
+    /// The arguments hold a password (shown as dots until "Show").
+    args_hidden: bool,
     url: Entity<InputState>,
     /// A catalog entry's secret fields, each with its masked box.
     fields: Vec<(SecretField, Entity<InputState>)>,
@@ -313,6 +315,7 @@ impl IntegrationsPage {
         let args = self.line("-y @modelcontextprotocol/server-memory", false, window, cx);
         let url = self.line("https://example.com/mcp", false, window, cx);
         let mut http = false;
+        let mut args_hidden = false;
         let mut fields = Vec::new();
         let mut rows = Vec::new();
         let set = |input: &Entity<InputState>, v: String, window: &mut Window, cx: &mut Context<Self>| {
@@ -335,7 +338,13 @@ impl IntegrationsPage {
                 set(&name, c.name.clone(), window, cx);
                 http = c.transport == "http";
                 set(&command, c.command.clone().unwrap_or_default(), window, cx);
-                set(&args, join_args(c.args.as_deref().unwrap_or_default()), window, cx);
+                let joined = join_args(c.args.as_deref().unwrap_or_default());
+                // A password in the arguments (the Postgres entry's connection string) stays hidden until asked for.
+                args_hidden = masked(&joined) != joined;
+                if args_hidden {
+                    args.update(cx, |s, cx| s.set_masked(true, window, cx));
+                }
+                set(&args, joined, window, cx);
                 set(&url, c.url.clone().unwrap_or_default(), window, cx);
             }
             FormKind::Custom => {}
@@ -365,7 +374,7 @@ impl IntegrationsPage {
         // The first thing to fill in has the cursor.
         let first = fields.first().map(|(_, i)| i.clone()).unwrap_or_else(|| name.clone());
         first.update(cx, |s, cx| s.focus(window, cx));
-        self.form = Some(Form { kind, name, http, command, args, url, fields, rows, error: None, saving: false });
+        self.form = Some(Form { kind, name, http, command, args, args_hidden, url, fields, rows, error: None, saving: false });
         self.form_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
         cx.notify();
     }
@@ -961,7 +970,32 @@ impl IntegrationsPage {
                         .flex()
                         .flex_col()
                         .gap(px(6.0))
-                        .child(label("Arguments"))
+                        .child({
+                            let row = div().flex().items_center().justify_between().child(label("Arguments"));
+                            // Shown only when the arguments carry a password (see `open_form`).
+                            let has_secret = { let v = f.args.read(cx).value().to_string(); masked(&v) != v };
+                            if has_secret || f.args_hidden {
+                                let this = cx.entity();
+                                let hidden = f.args_hidden;
+                                row.child(
+                                    Button::new("conn-args-show", if hidden { "Show" } else { "Hide" })
+                                        .ghost()
+                                        .size(ButtonSize::Small)
+                                        .on_click(move |_, window, cx| {
+                                            this.update(cx, |p, cx| {
+                                                if let Some(f) = p.form.as_mut() {
+                                                    f.args_hidden = !f.args_hidden;
+                                                    let hide = f.args_hidden;
+                                                    f.args.update(cx, |s, cx| s.set_masked(hide, window, cx));
+                                                }
+                                                cx.notify();
+                                            })
+                                        }),
+                                )
+                            } else {
+                                row
+                            }
+                        })
                         .child(mono(text_input::field("conn-args", &f.args, 38.0, window, cx), &theme))
                         .child(caption(args_hint, false)),
                 );
@@ -1496,16 +1530,28 @@ pub fn name_problem(name: &str) -> Option<&'static str> {
     None
 }
 
-/// Why an online server's address won't do, or `None`: `http(s)` only.
+/// Why an online server's address won't do, or `None`: `https`, or plain `http` only to this PC (its headers, often a
+/// token, would otherwise travel unencrypted).
 pub fn url_problem(url: &str) -> Option<&'static str> {
     if url.is_empty() {
         return Some("Paste the server's address.");
     }
     match reqwest::Url::parse(url) {
-        Ok(u) if matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty()) => None,
+        Ok(u) if u.host_str().is_none_or(|h| h.is_empty()) => Some("That address has no server name."),
+        Ok(u) if u.scheme() == "https" => None,
+        Ok(u) if u.scheme() == "http" && local_host(&u) => None,
+        Ok(u) if u.scheme() == "http" => Some("Use https://: over http:// your headers would travel unencrypted."),
         Ok(_) => Some("Use an https:// address."),
         Err(_) => Some("That isn't a web address. It starts with https://"),
     }
+}
+
+/// The address names this PC: `localhost` (or `*.localhost`) or a loopback address.
+fn local_host(u: &reqwest::Url) -> bool {
+    let Some(h) = u.host_str() else { return false };
+    // The parser has already normalised IP forms (`127.1` → `127.0.0.1`); IPv6 comes back in brackets.
+    let h = h.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase();
+    h == "localhost" || h.ends_with(".localhost") || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Arguments as typed, read the way Windows programs read their command line: split on spaces except inside double
@@ -1689,6 +1735,13 @@ mod tests {
     fn addresses() {
         assert_eq!(url_problem("https://mcp.linear.app/mcp"), None);
         assert_eq!(url_problem("http://localhost:3000/mcp"), None);
+        assert_eq!(url_problem("http://127.0.0.1:3000/mcp"), None);
+        assert_eq!(url_problem("http://[::1]:3000/mcp"), None);
+        assert_eq!(url_problem("http://tools.localhost/mcp"), None);
+        // plain http anywhere else would send the headers (tokens) unencrypted
+        assert!(url_problem("http://mcp.example.com/mcp").is_some_and(|w| w.contains("unencrypted")));
+        assert!(url_problem("http://192.168.1.5/mcp").is_some_and(|w| w.contains("unencrypted")));
+        assert!(url_problem("http://localhost.example.com/mcp").is_some());
         assert!(url_problem("file:///c:/x").is_some());
         assert!(url_problem("javascript:alert(1)").is_some());
         assert!(url_problem("mcp.linear.app").is_some());

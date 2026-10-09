@@ -576,7 +576,7 @@ pub struct Channel {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Trigger {
     pub id: Uuid,
@@ -587,8 +587,24 @@ pub struct Trigger {
     pub enabled: bool,
     pub last_fired_at: Option<DateTime<Utc>>,
     pub created_at: Option<DateTime<Utc>>,
-    /// Webhook URL (only on create / rotate).
+    /// Webhook URL (only on create / rotate). It carries the trigger's token: never printed by `Debug`.
     pub url: Option<String>,
+}
+
+impl std::fmt::Debug for Trigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Trigger")
+            .field("id", &self.id)
+            .field("bot_id", &self.bot_id)
+            .field("name", &self.name)
+            .field("prompt", &self.prompt)
+            .field("kind", &self.kind)
+            .field("enabled", &self.enabled)
+            .field("last_fired_at", &self.last_fired_at)
+            .field("created_at", &self.created_at)
+            .field("url", &self.url.as_ref().map(|_| "<set>"))
+            .finish()
+    }
 }
 
 // ---- CRM (`/api/crm/...`) ------------------------------------------------
