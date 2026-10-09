@@ -32,6 +32,7 @@ use crate::approval::ApprovalCards;
 use crate::bot_settings::BotSettings;
 use crate::computer::{Browsing, ComputerPanel};
 use crate::events::EventRows;
+use crate::files::FilesTab;
 use crate::memory::MemoryTab;
 use crate::setup::{OpenLogin, SetupCard};
 use crate::data::{self, AppData, DataEvent, ago, excerpt, run_status, swr};
@@ -104,11 +105,12 @@ pub struct BotPage {
     /// What the transcript showed last frame; a change while at the bottom scrolls to the new bottom.
     content_rev: (usize, usize, usize, usize, bool),
     force_bottom: bool,
-    /// 0: chat, 1: what it learned, 2: activity, 3: settings.
+    /// 0: chat, 1: what it learned, 2: activity, 3: files, 4: settings.
     tab: usize,
     settings: Option<Entity<BotSettings>>,
     memory: Option<Entity<MemoryTab>>,
     activity: Option<Entity<ActivityTab>>,
+    files: Option<Entity<FilesTab>>,
     tab_scroll: ScrollHandle,
     computer: Entity<ComputerPanel>,
     computer_open: bool,
@@ -119,7 +121,8 @@ pub struct BotPage {
     setup: Entity<SetupCard>,
 }
 
-pub const TAB_SETTINGS: usize = 3;
+pub const TAB_FILES: usize = 3;
+pub const TAB_SETTINGS: usize = 4;
 
 impl BotPage {
     pub fn new(
@@ -177,6 +180,7 @@ impl BotPage {
             settings: None,
             memory: None,
             activity: None,
+            files: None,
             tab_scroll: ScrollHandle::new(),
             computer,
             computer_open: false,
@@ -549,11 +553,12 @@ impl BotPage {
                                 ("Chat".into(), Some(icons::CHAT_ROUND_LINE)),
                                 ("Learned".into(), Some(icons::STAR)),
                                 ("Activity".into(), Some(icons::LIST)),
+                                ("Files".into(), Some(icons::FILE)),
                                 ("Settings".into(), Some(icons::SETTINGS)),
                             ],
                             self.tab,
                         )
-                        .segment_width(96.0)
+                        .segment_width(88.0)
                         .on_select(move |i, window, cx| this.update(cx, |p, cx| p.set_tab(i, window, cx))),
                     )
                     .child({
@@ -641,6 +646,15 @@ impl BotPage {
                 })
                 .detach();
                 self.activity = Some(activity);
+            }
+            TAB_FILES if self.files.is_none() => {
+                let files = cx.new(|cx| FilesTab::new(data, toasts, bot, cx));
+                cx.subscribe_in(&files, window, |this: &mut Self, _, ev: &OpenThread, window, cx| {
+                    this.select(ev.0, cx);
+                    this.set_tab(0, window, cx);
+                })
+                .detach();
+                self.files = Some(files);
             }
             _ => {}
         }
@@ -1248,6 +1262,7 @@ impl Render for BotPage {
         let tab: Option<AnyElement> = match self.tab {
             1 => self.memory.clone().map(|e| e.into_any_element()),
             2 => self.activity.clone().map(|e| e.into_any_element()),
+            TAB_FILES => self.files.clone().map(|e| e.into_any_element()),
             TAB_SETTINGS => self.settings.clone().map(|e| e.into_any_element()),
             _ => None,
         };

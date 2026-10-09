@@ -32,7 +32,7 @@ use crate::crm::{CrmEvent, CrmPage, Tab};
 use crate::crm_crew::{CrewEvent, CrewHire};
 use crate::sidebar::{self, Sidebar};
 use crate::bot_settings::{BotSettings, CreateEvent};
-use crate::chat::{BotPage, TAB_SETTINGS};
+use crate::chat::{BotPage, TAB_FILES, TAB_SETTINGS};
 use crate::integrations::IntegrationsPage;
 use crate::schedules::SchedulesPage;
 use crate::settings::AppSettings;
@@ -217,13 +217,14 @@ impl Shell {
 
     /// Open a page by name: `today`, `needs`, `schedules`, `crm` (or `crm/contacts`, `crm/pipeline`, `crm/deals`,
     /// `crm/activity`), `crew`, `integrations` (or `integrations/<preset>`: that connector's install form),
-    /// `settings`, `first`, a teammate's name or `bot:<id>`, optionally with `/settings` for that teammate's Settings
-    /// tab. Returns whether it matched.
+    /// `settings`, `first`, a teammate's name or `bot:<id>`, optionally with `/settings` or `/files` for that tab of
+    /// its page. Returns whether it matched.
     pub fn open(&mut self, target: &str, cx: &mut Context<Self>) -> bool {
         let want = target.trim().to_lowercase();
-        let (who, tab) = match want.strip_suffix("/settings") {
-            Some(w) => (w.to_owned(), Some(TAB_SETTINGS)),
-            None => (want.clone(), None),
+        let (who, tab) = match (want.strip_suffix("/settings"), want.strip_suffix("/files")) {
+            (Some(w), _) => (w.to_owned(), Some(TAB_SETTINGS)),
+            (_, Some(w)) => (w.to_owned(), Some(TAB_FILES)),
+            _ => (want.clone(), None),
         };
         if let Some(rest) = who.strip_prefix("integrations") {
             let preset = rest.trim_start_matches('/');

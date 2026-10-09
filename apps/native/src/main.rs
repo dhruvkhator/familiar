@@ -32,6 +32,7 @@ mod data;
 mod desktop;
 mod engine;
 mod events;
+mod files;
 mod folders;
 mod gallery;
 mod integrations;

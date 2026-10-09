@@ -280,7 +280,7 @@ impl Fixture {
             approvals,
             schedules,
             crm: crate::bench_crm::Crm::new(now, crew_ids(), empty_crm),
-            parity: crate::bench_parity::Parity::new(now, page, id(ADA)),
+            parity: crate::bench_parity::Parity::new(now, page, id(ADA), (id(0x301), id(0x303))),
         }
     }
 
@@ -356,6 +356,7 @@ impl Fixture {
                 let t = uuid(t)?;
                 json!(self.runs.iter().filter(|r| r.thread_id == t).collect::<Vec<_>>())
             }
+            ["api", "runs", r] => json!(self.runs.iter().find(|x| Some(x.id) == uuid(r))?),
             _ => return None,
         };
         Some(v)
@@ -485,6 +486,18 @@ async fn answer_one(mut sock: tokio::net::TcpStream, fx: Arc<Mutex<Fixture>>) ->
         }
     }
     tokio::time::sleep(LATENCY).await;
+    // A file's bytes (the Files tab), as they are.
+    if let Some(id) = path.strip_prefix("/api/artifacts/").and_then(|r| r.strip_suffix("/download")) {
+        let file = id.parse::<Uuid>().ok().and_then(|id| fx.lock().unwrap().parity.download(id));
+        let (status, mime, bytes) = match file {
+            Some((mime, bytes)) => ("200 OK", mime, bytes),
+            None => ("404 Not Found", "text/plain".to_owned(), b"not found".to_vec()),
+        };
+        let head = format!("HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
+        sock.write_all(head.as_bytes()).await?;
+        sock.write_all(&bytes).await?;
+        return sock.shutdown().await;
+    }
     let found = if method == "GET" { fx.lock().unwrap().get(target) } else { fx.lock().unwrap().write(method, target, &body) };
     let (status, body) = match found {
         Some(v) => ("200 OK", v.to_string()),
@@ -750,12 +763,13 @@ async fn integrations_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &
 
 /// Ada's page on one tab, scrolled to what the shot is about: `teammate-connectors` (Settings → Connectors),
 /// `teammate-triggers` (Settings → Webhooks that wake it), `teammate-trigger-url` (a new webhook's address, shown once),
-/// `teammate-skills` (Learned → Skills it wrote, the first one open).
+/// `teammate-skills` (Learned → Skills it wrote, the first one open), `teammate-files` (the Files tab).
 async fn teammate_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Shell>, cx: &mut AsyncApp) {
     let (target, y) = match page {
         "teammate-connectors" => ("ada/settings", 840.0),
         "teammate-triggers" | "teammate-trigger-url" => ("ada/settings", 1180.0),
         "teammate-skills" => ("ada", 360.0),
+        "teammate-files" => ("ada/files", 0.0),
         _ => ("ada", 0.0),
     };
     cx.update(|cx| shell.update(cx, |s, cx| s.open(target, cx)));

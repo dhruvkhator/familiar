@@ -1,10 +1,10 @@
 //! The bench's synthetic integrations (`--bench-shot integrations…`): the real connector catalog (the API's own
 //! `presets.json`), four installed connectors (two from the catalog, two of the owner's own, one of them off) and a
-//! Telegram channel; a teammate's webhooks. The fake API answers their reads (and making a webhook); nothing here is
-//! ever written to a real Familiar.
+//! Telegram channel; a teammate's webhooks, skills, memories and files (stand-in screenshots drawn here). The fake API
+//! answers their reads (and making a webhook); nothing here is ever written to a real Familiar.
 
 use chrono::{DateTime, Duration, Utc};
-use familiar_client::{Channel, Connector, ConnectorPreset, Memory, SecretNames, Skill, Trigger};
+use familiar_client::{Artifact, Channel, Connector, ConnectorPreset, Memory, SecretNames, Skill, Trigger};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -26,11 +26,15 @@ pub struct Parity {
     /// A teammate's skills and memories (the Learned tab).
     pub skills: Vec<Skill>,
     pub memories: Vec<Memory>,
+    /// A teammate's files, with their bytes (the Files tab).
+    pub artifacts: Vec<(Artifact, Vec<u8>)>,
     now: DateTime<Utc>,
 }
 
 impl Parity {
-    pub fn new(now: DateTime<Utc>, page: &str, answers: Uuid) -> Self {
+    /// `answers`: the teammate the channel and the per-teammate data belong to; `runs`: two of its runs (the files'
+    /// sources: a short one and a long one).
+    pub fn new(now: DateTime<Utc>, page: &str, answers: Uuid, runs: (Uuid, Uuid)) -> Self {
         let presets: Vec<ConnectorPreset> = serde_json::from_str(PRESETS).unwrap_or_default();
         let secrets = |env: &[&str], headers: &[&str]| SecretNames {
             env: env.iter().map(|s| (*s).to_owned()).collect(),
@@ -155,7 +159,23 @@ impl Parity {
             memory(1, "Launches happen on Thursdays; the checklist lives in docs/launch.md.", "bot", "active", 6),
             memory(2, "Sam prefers short answers with the open items first.", "user", "active", 12),
         ];
-        Self { presets, connectors, channels, triggers, skills, memories, now }
+        // Ada's files: three screenshots and three documents, from two of her runs.
+        let (short_run, long_run) = runs;
+        let file = |n: usize, run: Uuid, name: &str, mime: &str, bytes: Vec<u8>, minutes: i64| {
+            (
+                Artifact { id: pid(6, n), run_id: run, bot_id: answers, name: name.into(), mime: mime.into(), bytes: bytes.len() as u64, created_at: now - Duration::minutes(minutes) },
+                bytes,
+            )
+        };
+        let artifacts = vec![
+            file(1, short_run, "checkout-annual-toggle.png", "image/png", screenshot(0x7285d5, 3), 31),
+            file(2, short_run, "pricing-page-mobile.png", "image/png", screenshot(0x4fb98a, 5), 32),
+            file(3, short_run, "launch-status.md", "text/markdown", b"# Launch status\n\n- Pricing page: fixed\n- Checkout test: failing on the annual toggle\n".to_vec(), 33),
+            file(4, long_run, "weekly-active-teams.png", "image/png", screenshot(0xeda84b, 7), 121),
+            file(5, long_run, "launch-plan.pdf", "application/pdf", b"%PDF-1.4\n% a stand-in for the bench\n".repeat(900), 122),
+            file(6, long_run, "weekly_active_teams.sql", "application/sql", b"select week, count(distinct team_id) from events group by week;\n".to_vec(), 123),
+        ];
+        Self { presets, connectors, channels, triggers, skills, memories, artifacts, now }
     }
 
     /// The reads (`segs` is the path after `/api`).
@@ -169,8 +189,14 @@ impl Parity {
             ["bots", _, "triggers"] => json!(self.triggers),
             ["bots", _, "skills"] => json!(self.skills),
             ["bots", _, "memories"] => json!(self.memories),
+            ["bots", _, "artifacts"] => json!(self.artifacts.iter().map(|(a, _)| a).collect::<Vec<_>>()),
             _ => return None,
         })
+    }
+
+    /// A file's type and bytes.
+    pub fn download(&self, id: Uuid) -> Option<(String, Vec<u8>)> {
+        self.artifacts.iter().find(|(a, _)| a.id == id).map(|(a, b)| (a.mime.clone(), b.clone()))
     }
 
     /// The writes the screenshots use: making a webhook answers with its address (shown once).
@@ -194,4 +220,29 @@ impl Parity {
             _ => return None,
         })
     }
+}
+
+/// A stand-in screenshot (PNG): a page with a coloured header, a sidebar and `rows` content bars.
+fn screenshot(accent: u32, rows: u32) -> Vec<u8> {
+    let (w, h) = (960u32, 600u32);
+    let rgb = |c: u32| image::Rgba([(c >> 16) as u8, (c >> 8) as u8, c as u8, 255]);
+    let mut pic = image::RgbaImage::from_pixel(w, h, rgb(0xf7f6f3));
+    let mut fill = |x0: u32, y0: u32, x1: u32, y1: u32, c: image::Rgba<u8>| {
+        for y in y0..y1.min(h) {
+            for x in x0..x1.min(w) {
+                pic.put_pixel(x, y, c);
+            }
+        }
+    };
+    fill(0, 0, w, 64, rgb(accent));
+    fill(0, 64, 200, h, rgb(0xebe9e4));
+    for i in 0..rows {
+        let y = 100 + i * 70;
+        fill(240, y, 240 + 520 - (i * 37) % 200, y + 18, rgb(0xd4d1ca));
+        fill(240, y + 28, 240 + 340 - (i * 53) % 160, y + 40, rgb(0xe3e0da));
+    }
+    fill(780, 100, 920, 140, rgb(accent));
+    let mut out = Vec::new();
+    let _ = pic.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png);
+    out
 }
