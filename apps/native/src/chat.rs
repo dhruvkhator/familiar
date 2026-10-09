@@ -595,6 +595,11 @@ impl BotPage {
         self.settings.clone()
     }
 
+    /// The Learned tab, once it was opened.
+    pub fn learned_tab(&self) -> Option<Entity<MemoryTab>> {
+        self.memory.clone()
+    }
+
     /// Scroll the open tab (Learned, Activity, Settings…) to `y` px from its top (the bench's shots).
     pub fn scroll_tab_to(&mut self, y: f32, cx: &mut Context<Self>) {
         self.tab_scroll.set_offset(gpui::point(px(0.0), px(-y)));

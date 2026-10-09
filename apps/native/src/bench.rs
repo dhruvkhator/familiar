@@ -749,16 +749,33 @@ async fn integrations_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &
 }
 
 /// Ada's page on one tab, scrolled to what the shot is about: `teammate-connectors` (Settings → Connectors),
-/// `teammate-triggers` (Settings → Webhooks that wake it), `teammate-trigger-url` (a new webhook's address, shown once).
+/// `teammate-triggers` (Settings → Webhooks that wake it), `teammate-trigger-url` (a new webhook's address, shown once),
+/// `teammate-skills` (Learned → Skills it wrote, the first one open).
 async fn teammate_shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Shell>, cx: &mut AsyncApp) {
     let (target, y) = match page {
         "teammate-connectors" => ("ada/settings", 840.0),
         "teammate-triggers" | "teammate-trigger-url" => ("ada/settings", 1180.0),
+        "teammate-skills" => ("ada", 360.0),
         _ => ("ada", 0.0),
     };
     cx.update(|cx| shell.update(cx, |s, cx| s.open(target, cx)));
     until(cx, Duration::from_secs(5), |cx| shell.read(cx).page_of(id(ADA)).is_some()).await;
     wait(cx, Duration::from_millis(900)).await;
+    if page == "teammate-skills" {
+        let _ = window.update(cx, |_, window, cx| {
+            if let Some(p) = shell.read(cx).page_of(id(ADA)) {
+                p.update(cx, |p, cx| p.set_tab(1, window, cx));
+            }
+        });
+        wait(cx, Duration::from_millis(900)).await;
+        cx.update(|cx| {
+            let skills = shell.read(cx).page_of(id(ADA)).and_then(|p| p.read(cx).learned_tab()).map(|m| m.read(cx).skills());
+            if let Some(s) = skills {
+                s.update(cx, |s, cx| s.open_first(cx));
+            }
+        });
+        wait(cx, Duration::from_millis(500)).await;
+    }
     if page == "teammate-trigger-url" {
         let _ = window.update(cx, |_, window, cx| {
             let triggers = shell.read(cx).page_of(id(ADA)).and_then(|p| p.read(cx).settings_tab()).and_then(|s| s.read(cx).triggers_view());

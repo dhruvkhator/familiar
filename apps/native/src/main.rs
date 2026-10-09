@@ -46,6 +46,7 @@ mod schedules;
 mod settings;
 mod setup;
 mod shell;
+mod skills;
 mod sidebar;
 mod telegram;
 mod templates;

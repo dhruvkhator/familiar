@@ -1,6 +1,6 @@
 //! A teammate's "What I learned" tab (the web's `pages/Memory.tsx`): memories it proposed (accept, edit inline, or
 //! reject), what it remembers (with forget), teaching it something, and "Dream now" (review recent chats) with when
-//! it last did. Rows that leave fold away; new ones rise in.
+//! it last did, and the skills it wrote ([`crate::skills`]). Rows that leave fold away; new ones rise in.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -13,7 +13,7 @@ use familiar_ui::mascot::{Mascot, MascotState};
 use familiar_ui::theme::{RADIUS_CARD, Theme, Tone, text};
 use familiar_ui::toast::ToastStack;
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window,
+    AnyElement, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _, Render, SharedString, Styled as _, Window,
     div, prelude::FluentBuilder as _, px,
 };
 use gpui_base::input::{InputEvent, TextareaState};
@@ -39,6 +39,8 @@ pub struct MemoryTab {
     editing: Option<(Uuid, Entity<TextareaState>)>,
     teach: Entity<TextareaState>,
     dreaming: bool,
+    /// "Skills it wrote".
+    skills: Entity<crate::skills::SkillsSection>,
 }
 
 impl MemoryTab {
@@ -60,7 +62,7 @@ impl MemoryTab {
         })
         .detach();
         let mut this =
-            Self { data, toasts, bot, list: Vec::new(), loaded: false, leaving: HashMap::new(), editing: None, teach, dreaming: false };
+            Self { data: data.clone(), toasts, bot, list: Vec::new(), loaded: false, leaving: HashMap::new(), editing: None, teach, dreaming: false, skills: cx.new(|cx| crate::skills::SkillsSection::new(data, bot, cx)) };
         this.reload(cx);
         this
     }
@@ -443,5 +445,13 @@ impl Render for MemoryTab {
                 .child(teach)
                 .child(remembered),
         )
+        .child(self.skills.clone())
+    }
+}
+
+impl MemoryTab {
+    /// "Skills it wrote" (the bench's shot opens one).
+    pub fn skills(&self) -> Entity<crate::skills::SkillsSection> {
+        self.skills.clone()
     }
 }
