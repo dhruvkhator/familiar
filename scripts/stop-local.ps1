@@ -5,7 +5,7 @@
 param([switch]$All)
 $root = Split-Path $PSScriptRoot -Parent
 # The desktop app is asked to quit, never killed: a kill would leave its built-in database running without it.
-foreach ($exe in "$root\apps\native\target\release\familiar-native.exe", "$root\apps\native\target\debug\familiar-native.exe") {
+foreach ($exe in "local", "release", "debug" | ForEach-Object { "$root\apps\native\target\$_\familiar-native.exe" }) {
     if ((Test-Path $exe) -and (Get-Process -Name familiar-native -ErrorAction SilentlyContinue)) { & $exe --quit; break }
 }
 foreach ($name in "familiar-desktop", "familiard", "familiar-server", "zed-desktop", "zedd", "zed-server") {  # old names too, for upgrades

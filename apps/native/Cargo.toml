@@ -72,3 +72,13 @@ opt-level = 2
 [profile.release]
 lto = "thin"
 strip = "symbols"
+
+# Rebuilding the app on this PC (`scripts/rebuild-local.ps1`): optimised like release but without link-time
+# optimisation and with incremental builds, so a small change rebuilds in a minute or two instead of re-optimising the
+# whole program. The installer (CI) still builds `release`.
+[profile.local]
+inherits = "release"
+lto = false
+incremental = true
+codegen-units = 256
+strip = "none"

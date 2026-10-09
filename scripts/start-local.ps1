@@ -40,8 +40,9 @@ if ($Headless) {
     Start-Bg "server" "$root\target\debug\familiar-server.exe"
     Start-Bg "daemon" "$root\target\debug\familiard.exe"
 } else {
-    $exe = "$root\apps\native\target\release\familiar-native.exe"
-    if (-not (Test-Path $exe)) { $exe = "$root\apps\native\target\debug\familiar-native.exe" }
+    # The newest build: `local` (scripts\rebuild-local.ps1), `release` or `debug`.
+    $exe = "local", "release", "debug" | ForEach-Object { Get-Item "$root\apps\native\target\$_\familiar-native.exe" -ErrorAction SilentlyContinue } |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
     if (-not (Test-Path $exe)) { throw "Build the app first: cd apps/native; cargo build --release" }
     Start-Process $exe -WorkingDirectory $root | Out-Null
     Write-Host "  desktop app (window + tray icon; API on http://127.0.0.1:47080)"
