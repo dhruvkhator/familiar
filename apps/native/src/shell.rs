@@ -141,6 +141,12 @@ impl Shell {
                     for page in s.pages.values() {
                         page.update(cx, |_, cx| cx.notify());
                     }
+                    // The CRM's "updated 5m ago" and due dates, while it is on screen.
+                    if *s.route.current() == Route::Crm
+                        && let Some(p) = s.crm.as_ref()
+                    {
+                        p.update(cx, |_, cx| cx.notify());
+                    }
                 });
                 if ticked.is_err() {
                     break;
