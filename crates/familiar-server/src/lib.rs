@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use routes::{
-    approvals, artifacts, bots, channels, connectors, crm, desktop, folders, live, memories, models, overview, rules,
+    approvals, artifacts, bots, channels, connectors, crm, crm_webhooks, desktop, folders, live, memories, models, overview, rules,
     runs, schedules, skills, stream, templates, threads, triggers,
 };
 
@@ -125,6 +125,8 @@ fn router(state: S, web_origins: &[String]) -> Router {
         )
         .route("/api/bots/{id}/setup", patch(templates::setup))
         .route("/api/templates", get(templates::list))
+        .route("/api/templates/bundles", get(templates::bundles))
+        .route("/api/templates/bundles/{id}/create", post(templates::create_bundle))
         .route("/api/templates/{id}/create", post(templates::create))
         .route("/api/bots/{id}/dream", post(live::dream))
         .route("/api/bots/{id}/live", get(live::info))
@@ -141,6 +143,13 @@ fn router(state: S, web_origins: &[String]) -> Router {
         .route("/api/crm/changes", get(crm::changes))
         .route("/api/crm/changes/{id}/undo", post(crm::undo))
         .route("/api/crm/export.csv", get(crm::export))
+        .route("/api/crm/webhooks", get(crm_webhooks::list).post(crm_webhooks::create))
+        .route(
+            "/api/crm/webhooks/{id}",
+            get(crm_webhooks::get).patch(crm_webhooks::update).delete(crm_webhooks::remove),
+        )
+        .route("/api/crm/webhooks/{id}/test", post(crm_webhooks::test))
+        .route("/api/crm/webhooks/{id}/deliveries", get(crm_webhooks::deliveries))
         .route("/api/crm/import", post(crm::import).layer(DefaultBodyLimit::max(CRM_IMPORT_BODY)))
         .route("/api/crm/{kind}", get(crm::list).post(crm::create).layer(DefaultBodyLimit::max(CRM_BODY)))
         .route(

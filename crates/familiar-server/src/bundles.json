@@ -1,0 +1,52 @@
+[
+  {
+    "id": "gtm-crew",
+    "name": "GTM crew",
+    "summary": "A small sales team that keeps its work in your CRM: one finds leads, one writes first emails, one tracks replies and follow-ups, one reports the pipeline weekly, and one triages your inbox. Nothing goes out without your OK, and every schedule starts off.",
+    "templates": [
+      "lead-researcher",
+      "outbound-drafter",
+      "reply-follow-up-tracker",
+      "weekly-metrics-reporter",
+      "inbox-assistant"
+    ],
+    "questions": [
+      {
+        "key": "product",
+        "label": "What do you sell?",
+        "placeholder": "an incident-response tool for platform teams",
+        "multiline": true
+      },
+      {
+        "key": "icp",
+        "label": "Your ideal customer",
+        "placeholder": "B2B SaaS, 20 to 200 people, Series A or later, US or EU, with a platform or SRE team",
+        "multiline": true
+      },
+      {
+        "key": "offer",
+        "label": "What's the ask?",
+        "placeholder": "a 20-minute call, or a free two-week pilot",
+        "multiline": false
+      },
+      {
+        "key": "sender",
+        "label": "Who is it from?",
+        "placeholder": "Sam, co-founder",
+        "multiline": false
+      },
+      {
+        "key": "voice",
+        "label": "How should it sound?",
+        "placeholder": "direct and friendly, no flattery, under 120 words",
+        "multiline": true
+      },
+      {
+        "key": "follow_up_days",
+        "label": "Days of silence before a follow-up",
+        "placeholder": "4",
+        "multiline": false
+      }
+    ]
+  }
+]

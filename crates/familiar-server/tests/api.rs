@@ -1718,11 +1718,11 @@ async fn crm_teammate_writes_and_do_not_contact() {
     let db = Db { pool: app.pool.clone(), owner: a.id };
     let who = Actor::Bot { bot: bot.parse().unwrap(), run: Some(uid(&run)) };
 
-    let (co, created) = crm::upsert_company(&db, &who, &CompanyInput { name: Some("Acme".into()), domain: Some("https://acme.com".into()), ..Default::default() }).await.unwrap();
+    let (co, created) = crm::upsert_company(&db, &who, &CompanyInput { name: Some("Acme".into()), domain: Some("https://acme.com".into()), source_urls: Some(vec!["https://acme.com/about".into()]), ..Default::default() }).await.unwrap();
     assert!(created);
     assert_eq!(co["created_by_bot"].as_str(), Some(bot.as_str()));
     let cid = uid(&co);
-    let (p, _) = crm::upsert_contact(&db, &who, &ContactInput { name: Some("Sam".into()), email: Some("sam@acme.com".into()), company_id: Some(cid), ..Default::default() }).await.unwrap();
+    let (p, _) = crm::upsert_contact(&db, &who, &ContactInput { name: Some("Sam".into()), email: Some("sam@acme.com".into()), company_id: Some(cid), source_urls: Some(vec!["https://acme.com/team".into()]), ..Default::default() }).await.unwrap();
     let pid = uid(&p);
     // the change log says who (and in which run)
     let ch = crm::changes(&db, &ChangeFilters { bot_id: Some(bot.parse().unwrap()), ..Default::default() }, None).await.unwrap();
@@ -1891,4 +1891,446 @@ async fn crm_second_user_sees_nothing() {
     assert_eq!(app.get(ta, &format!("/api/crm/deals/{d}")).await.1["stage"], "new");
     assert_eq!(len(&app.get(ta, &format!("/api/crm/activities?company_id={c}")).await.1), 1);
     assert_eq!(id(&app.get(ta, &format!("/api/crm/activities?deal_id={d}")).await.1[0]), act);
+}
+
+// ------------------------------------------------------------------ CRM: teammates' trust rules
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crm_teammate_owner_edits_win_and_limits() {
+    use familiar_core::{
+        crm::{self, Actor, CompanyInput, ContactInput, DealInput, Outcome},
+        db::Db,
+    };
+    let app = app!();
+    let a = app.owner().await;
+    let t = &a.tok;
+    let bot = app.bot(t, "Scout").await;
+    let (_, run) = app.chat(t, &bot, "go").await;
+    let db = Db { pool: app.pool.clone(), owner: a.id };
+    let who = Actor::Bot { bot: bot.parse().unwrap(), run: Some(uid(&run)) };
+    let src = |u: &str| Some(vec![u.to_string()]);
+
+    // a teammate's new company or contact needs sources
+    let err = crm::upsert_company(&db, &who, &CompanyInput { name: Some("Nosource".into()), ..Default::default() }).await.unwrap_err();
+    assert!(matches!(&err, crm::CrmError::Invalid(m) if m.contains("source_urls")), "{err:?}");
+
+    // the owner adds a company with a name and a description
+    let co = app.ok_post(t, "/api/crm/companies", json!({"name": "Acme", "domain": "acme.com", "description": "Owner's words", "tags": ["vip"]}), 201).await;
+    let cid = uid(&co);
+    let write = |i: CompanyInput| {
+        let (db, who) = (db.clone(), who.clone());
+        async move {
+            let mut tx = db.pool.begin().await.unwrap();
+            let s = crm::write_company_in(&mut tx, db.owner, &who, None, &i).await.unwrap();
+            tx.commit().await.unwrap();
+            s
+        }
+    };
+    // a teammate: the owner's name and description stay; empty fields are filled; fit is the teammate's; tags add up
+    let s = write(CompanyInput {
+        domain: Some("acme.com".into()),
+        name: Some("ACME Corp".into()),
+        description: Some("Bot's words".into()),
+        industry: Some("SaaS".into()),
+        fit_score: Some(85),
+        fit_reason: Some("Raised a round".into()),
+        tags: Some(vec!["fintech".into()]),
+        source_urls: src("https://news.example/acme"),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!((s.outcome, s.kept.clone()), (Outcome::Updated, vec!["description".to_string(), "name".to_string()]));
+    let row = app.get(t, &format!("/api/crm/companies/{cid}")).await.1;
+    assert_eq!((row["name"].as_str(), row["description"].as_str(), row["industry"].as_str()), (Some("Acme"), Some("Owner's words"), Some("SaaS")));
+    assert_eq!(
+        (row["fit_score"].as_i64(), row["tags"].clone(), row["source_urls"].clone()),
+        (Some(85), json!(["vip", "fintech"]), json!(["https://news.example/acme"]))
+    );
+    // the teammate may change what a teammate set...
+    let s = write(CompanyInput { domain: Some("acme.com".into()), industry: Some("Fintech".into()), ..Default::default() }).await;
+    assert!(s.kept.is_empty() && s.outcome == Outcome::Updated);
+    // ...until the owner sets it: then the owner's value wins
+    app.patch(t, &format!("/api/crm/companies/{cid}"), json!({"industry": "Payments"})).await;
+    let s = write(CompanyInput { domain: Some("acme.com".into()), industry: Some("Banking".into()), ..Default::default() }).await;
+    assert_eq!((s.outcome, s.kept), (Outcome::Unchanged, vec!["industry".to_string()]));
+    // an owner undo of a teammate change counts as the owner's choice
+    let s = write(CompanyInput { domain: Some("acme.com".into()), location: Some("Berlin".into()), ..Default::default() }).await;
+    assert_eq!(s.outcome, Outcome::Updated);
+    let ch = app.get(t, &format!("/api/crm/changes?entity=company&entity_id={cid}&limit=1")).await.1;
+    app.ok_post(t, &format!("/api/crm/changes/{}/undo", id(&ch[0])), json!({}), 200).await;
+    let s = write(CompanyInput { domain: Some("acme.com".into()), location: Some("Paris".into()), ..Default::default() }).await;
+    assert_eq!(s.kept, vec!["location".to_string()]);
+
+    // a deal the owner closed stays closed; the teammate can still keep next_step
+    let deal = app.ok_post(t, "/api/crm/deals", json!({"company_id": cid, "title": "Pilot", "stage": "won"}), 201).await;
+    let did = uid(&deal);
+    let mut tx = db.pool.begin().await.unwrap();
+    let s = crm::move_deal_in(&mut tx, a.id, &who, did, "contacted", Some("follow up")).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!((s.outcome, s.kept), (Outcome::Unchanged, vec!["stage".to_string()]));
+    crm::patch_deal(&db, &who, did, &DealInput { next_step: Some("send the invoice".into()), ..Default::default() }).await.unwrap();
+    let d = app.get(t, &format!("/api/crm/deals/{did}")).await.1;
+    assert_eq!(
+        (d["stage"].as_str(), d["next_step"].as_str(), d["contact_do_not_contact"].clone()),
+        (Some("won"), Some("send the invoice"), json!(false))
+    );
+
+    // do-not-contact: found by email, X handle or LinkedIn, even after the contact is deleted
+    let (p, _) = crm::upsert_contact(
+        &db,
+        &who,
+        &ContactInput {
+            name: Some("Sam".into()),
+            email: Some("sam@acme.com".into()),
+            x_handle: Some("samacme".into()),
+            company_id: Some(cid),
+            linkedin_url: Some("https://www.linkedin.com/in/sam-acme/".into()),
+            source_urls: src("https://acme.com/team"),
+            do_not_contact: Some(true),
+            dnc_reason: Some("replied STOP".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    for to in ["Sam <SAM@acme.com>", "@SamAcme", "https://linkedin.com/in/sam-acme"] {
+        assert_eq!(crm::teammate::do_not_contact(&db, to).await.unwrap().as_deref(), Some("Sam"), "{to}");
+    }
+    assert_eq!(crm::teammate::do_not_contact(&db, "kim@acme.com").await.unwrap(), None);
+    app.del(t, &format!("/api/crm/contacts/{}", id(&p))).await;
+    assert_eq!(crm::teammate::do_not_contact(&db, "sam@acme.com").await.unwrap().as_deref(), Some("Sam"));
+    let stranger = Db { pool: app.pool.clone(), owner: Uuid::new_v4() };
+    assert_eq!(crm::teammate::do_not_contact(&stranger, "sam@acme.com").await.unwrap(), None, "owner-scoped");
+
+    // a runaway run stops at the write budget, with a clear message; another run carries on
+    sqlx::query(
+        "insert into crm_changes (owner_id, entity, entity_id, op, actor_kind, bot_id, run_id)
+         select $1, 'company', $2, 'update', 'bot', $3, $4 from generate_series(1, $5)",
+    )
+    .bind(a.id)
+    .bind(cid)
+    .bind(Uuid::parse_str(&bot).unwrap())
+    .bind(uid(&run))
+    .bind(crm::MAX_WRITES_PER_RUN as i32)
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    let err = crm::upsert_company(&db, &who, &CompanyInput { domain: Some("acme.com".into()), size: Some("50".into()), ..Default::default() })
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, crm::CrmError::Invalid(m) if m.contains("200 CRM changes")), "{err:?}");
+    let act = crm::ActivityInput { company_id: Some(cid), kind: Some("note".into()), summary: Some("x".into()), ..Default::default() };
+    assert!(crm::log_activity(&db, &who, &act).await.is_err());
+    crm::log_activity(&db, &Actor::User, &act).await.unwrap();
+    let (_, run2) = app.chat(t, &bot, "again").await;
+    let next = Actor::Bot { bot: bot.parse().unwrap(), run: Some(uid(&run2)) };
+    crm::log_activity(&db, &next, &act).await.unwrap();
+}
+
+// ------------------------------------------------------------------ CRM webhooks
+
+type Got = tokio::sync::mpsc::UnboundedReceiver<(String, axum::http::HeaderMap, Vec<u8>)>;
+
+/// A webhook receiver on this computer: answers 200, except 500 on /fail and a redirect on /moved; hands every request on.
+async fn receiver() -> (String, Got) {
+    use axum::{
+        body::Bytes,
+        http::{HeaderMap, StatusCode, Uri, header},
+        response::IntoResponse,
+    };
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let app = axum::Router::new().fallback(move |uri: Uri, h: HeaderMap, body: Bytes| {
+        let tx = tx.clone();
+        async move {
+            let path = uri.path().to_string();
+            let _ = tx.send((path.clone(), h, body.to_vec()));
+            match path.as_str() {
+                "/fail" => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                "/moved" => (StatusCode::FOUND, [(header::LOCATION, "http://127.0.0.1:1/elsewhere")]).into_response(),
+                _ => StatusCode::OK.into_response(),
+            }
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", l.local_addr().unwrap().port());
+    tokio::spawn(async move {
+        let _ = axum::serve(l, app).await;
+    });
+    (base, rx)
+}
+
+/// What a receiver does to check a delivery: `t=<unix>,v1=<hex HMAC-SHA256("<t>.<body>")>` with the secret.
+fn verify(secret: &str, h: &axum::http::HeaderMap, body: &[u8]) -> bool {
+    let sig = h["familiar-signature"].to_str().unwrap();
+    let (t, v1) = sig.split_once(",v1=").unwrap();
+    let t: i64 = t.strip_prefix("t=").unwrap().parse().unwrap();
+    (chrono::Utc::now().timestamp() - t).abs() < 300 && familiar_core::crm::webhooks::sign(secret, t, body) == v1
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crm_webhooks_owner_only_and_secret_once() {
+    // without a secret key nothing can be signed: 503
+    {
+        let app = app!();
+        let a = app.owner().await;
+        let (s, _) = app.post(&a.tok, "/api/crm/webhooks", json!({"url": "http://127.0.0.1:9/x", "events": ["deal.created"]})).await;
+        assert_eq!(s, 503);
+    }
+    let app = app!(true);
+    let a = app.owner().await;
+    let t = &a.tok;
+    let hook = json!({"url": "http://127.0.0.1:9/x", "events": ["deal.created"]});
+    assert_eq!(app.call(Method::GET, "/api/crm/webhooks", None, None).await.0, 401);
+    assert_eq!(app.call(Method::POST, "/api/crm/webhooks", None, Some(hook.clone())).await.0, 401);
+    for (url, events) in [
+        ("http://8.8.8.8/hook", json!(["deal.created"])),
+        ("https://10.0.0.5/hook", json!(["deal.created"])),
+        ("https://169.254.169.254/latest/meta-data", json!(["deal.created"])),
+        ("https://[fe80::1]/", json!(["deal.created"])),
+        ("https://[::ffff:192.168.1.1]/", json!(["deal.created"])),
+        ("https://no-such-host.invalid/", json!(["deal.created"])),
+        ("https://user:pw@8.8.8.8/", json!(["deal.created"])),
+        ("ftp://8.8.8.8/", json!(["deal.created"])),
+        ("http://127.0.0.1:9/x", json!([])),
+        ("http://127.0.0.1:9/x", json!(["deal.deleted"])),
+    ] {
+        let (s, v) = app.post(t, "/api/crm/webhooks", json!({"url": url, "events": events})).await;
+        assert_eq!(s, 400, "{url} {events}: {v}");
+    }
+    let w = app
+        .ok_post(t, "/api/crm/webhooks", json!({"url": "http://127.0.0.1:9/x", "events": ["deal.created", "deal.created", "contact.do_not_contact"]}), 201)
+        .await;
+    let wid = id(&w);
+    let secret = w["secret"].as_str().unwrap().to_string();
+    assert!(secret.starts_with("whsec_") && secret.len() == 70);
+    assert_eq!(
+        (w["events"].clone(), w["enabled"].clone(), w["last_delivery"].clone()),
+        (json!(["deal.created", "contact.do_not_contact"]), json!(true), Value::Null)
+    );
+    assert!(w.get("secret_enc").is_none() && w.get("owner_id").is_none());
+    // a public https address is fine too (no DNS for an address)
+    assert_eq!(app.post(t, "/api/crm/webhooks", json!({"url": "https://93.184.215.14/hook", "events": ["deal.created"]})).await.0, 201);
+    // the secret is shown once: never in a list, a read or an update, and it is stored sealed
+    let (_, list) = app.get(t, "/api/crm/webhooks").await;
+    assert_eq!(len(&list), 2);
+    let (_, one) = app.get(t, &format!("/api/crm/webhooks/{wid}")).await;
+    let (s, up) = app.patch(t, &format!("/api/crm/webhooks/{wid}"), json!({"events": ["deal.stage_changed"], "url": "http://localhost:9/y"})).await;
+    assert_eq!(s, 200, "{up}");
+    for v in [&list[0], &list[1], &one, &up] {
+        assert!(v.get("secret").is_none() && v.get("secret_enc").is_none(), "{v}");
+    }
+    assert_eq!((up["events"].clone(), up["url"].as_str()), (json!(["deal.stage_changed"]), Some("http://localhost:9/y")));
+    assert_eq!(app.patch(t, &format!("/api/crm/webhooks/{wid}"), json!({"url": "https://192.168.0.10/"})).await.0, 400);
+    let sealed: String = sqlx::query_scalar("select secret_enc from crm_webhooks where id = $1").bind(uid(&w)).fetch_one(&app.pool).await.unwrap();
+    assert!(sealed.starts_with("v1:") && !sealed.contains(&secret[6..]));
+
+    // owner only: another account sees and touches nothing
+    let b = app.second().await;
+    assert_eq!(len(&app.get(&b.tok, "/api/crm/webhooks").await.1), 0);
+    for (m, p) in [
+        (Method::GET, format!("/api/crm/webhooks/{wid}")),
+        (Method::PATCH, format!("/api/crm/webhooks/{wid}")),
+        (Method::DELETE, format!("/api/crm/webhooks/{wid}")),
+        (Method::POST, format!("/api/crm/webhooks/{wid}/test")),
+        (Method::GET, format!("/api/crm/webhooks/{wid}/deliveries")),
+    ] {
+        assert_eq!(app.call(m.clone(), &p, Some(&b.tok), Some(json!({"enabled": false}))).await.0, 404, "{m} {p}");
+    }
+    // a change in the other account's CRM never reaches this account's webhooks
+    app.ok_post(&b.tok, "/api/crm/companies", json!({"name": "Other"}), 201).await;
+    app.ok_post(&b.tok, "/api/crm/deals", json!({"company_id": id(&app.get(&b.tok, "/api/crm/companies").await.1[0]), "title": "D"}), 201).await;
+    let n: i64 = sqlx::query_scalar("select count(*) from crm_webhook_deliveries").fetch_one(&app.pool).await.unwrap();
+    assert_eq!(n, 0);
+
+    assert_eq!(app.del(t, &format!("/api/crm/webhooks/{wid}")).await.0, 204);
+    assert_eq!(app.get(t, &format!("/api/crm/webhooks/{wid}")).await.0, 404);
+    // at most 20 per owner
+    for i in 0..19 {
+        let (s, v) = app.post(t, "/api/crm/webhooks", json!({"url": format!("http://127.0.0.1:9/{i}"), "events": ["deal.created"]})).await;
+        assert_eq!(s, 201, "{v}");
+    }
+    assert_eq!(app.post(t, "/api/crm/webhooks", hook).await.0, 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crm_webhook_test_delivery_is_signed() {
+    let app = app!(true);
+    let a = app.owner().await;
+    let t = &a.tok;
+    let (base, mut got) = receiver().await;
+    let w = app.ok_post(t, "/api/crm/webhooks", json!({"url": format!("{base}/hook"), "events": ["company.created"]}), 201).await;
+    let secret = w["secret"].as_str().unwrap();
+    let d = app.ok_post(t, &format!("/api/crm/webhooks/{}/test", id(&w)), json!({}), 200).await;
+    assert_eq!(
+        (d["status"].as_str(), d["event"].as_str(), d["attempts"].as_i64(), d["last_error"].clone()),
+        (Some("delivered"), Some("ping"), Some(1), Value::Null)
+    );
+    let (path, h, body) = got.recv().await.unwrap();
+    assert_eq!(path, "/hook");
+    assert_eq!(h["familiar-event"], "ping");
+    assert_eq!(h["familiar-delivery"].to_str().unwrap(), id(&d));
+    assert_eq!(h["content-type"], "application/json");
+    assert!(verify(secret, &h, &body), "the signature checks out");
+    assert!(!verify("whsec_wrong", &h, &body));
+    let mut tampered = body.clone();
+    tampered.push(b' ');
+    assert!(!verify(secret, &h, &tampered));
+    let p: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!((p["id"].as_str(), p["event"].as_str()), (Some(id(&d).as_str()), Some("ping")));
+
+    // a failing receiver and a redirect: failed, with the reason; the redirect isn't followed
+    for (path, why) in [("fail", "HTTP 500"), ("moved", "redirects aren't followed")] {
+        let w2 = app.ok_post(t, "/api/crm/webhooks", json!({"url": format!("{base}/{path}"), "events": ["company.created"]}), 201).await;
+        let d = app.ok_post(t, &format!("/api/crm/webhooks/{}/test", id(&w2)), json!({}), 200).await;
+        assert_eq!(d["status"], "failed", "{d}");
+        assert!(d["last_error"].as_str().unwrap().contains(why), "{d}");
+        assert_eq!(got.recv().await.unwrap().0, format!("/{path}"));
+        let (_, all) = app.get(t, &format!("/api/crm/webhooks/{}/deliveries", id(&w2))).await;
+        assert_eq!((len(&all), all[0]["payload"]["event"].as_str()), (1, Some("ping")));
+    }
+    let (_, listed) = app.get(t, &format!("/api/crm/webhooks/{}", id(&w))).await;
+    assert_eq!(listed["last_delivery"]["status"], "delivered");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(got.try_recv().is_err(), "the redirect was not followed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crm_webhook_deliveries_retry_then_fail() {
+    use familiar_core::{
+        crm::{self, Actor, CompanyInput, webhooks},
+        db::Db,
+    };
+    let app = app!(true);
+    let a = app.owner().await;
+    let t = &a.tok;
+    let db = Db { pool: app.pool.clone(), owner: a.id };
+    let sb = familiar_crypto::SecretBox::from_base64(KEY).unwrap();
+    let (base, mut got) = receiver().await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = format!("http://127.0.0.1:{}/hook", closed.local_addr().unwrap().port());
+    drop(closed);
+    let down = app.ok_post(t, "/api/crm/webhooks", json!({"url": dead, "events": ["company.created"]}), 201).await;
+    let up = app.ok_post(t, "/api/crm/webhooks", json!({"url": format!("{base}/hook"), "events": ["company.created", "company.updated"]}), 201).await;
+    let deals_only = app.ok_post(t, "/api/crm/webhooks", json!({"url": format!("{base}/deals"), "events": ["deal.created"]}), 201).await;
+    let off = app.ok_post(t, "/api/crm/webhooks", json!({"url": format!("{base}/off"), "events": ["company.created"], "enabled": false}), 201).await;
+    let count = |w: &Value| {
+        let (pool, w) = (app.pool.clone(), uid(w));
+        async move {
+            sqlx::query_scalar::<_, i64>("select count(*) from crm_webhook_deliveries where webhook_id = $1").bind(w).fetch_one(&pool).await.unwrap()
+        }
+    };
+
+    // a teammate adds a company: one delivery per matching, enabled webhook, in the same transaction
+    let bot = app.bot(t, "Scout").await;
+    let who = Actor::Bot { bot: bot.parse().unwrap(), run: None };
+    let input = CompanyInput { name: Some("Acme".into()), domain: Some("acme.com".into()), source_urls: Some(vec!["https://acme.com".into()]), ..Default::default() };
+    let (co, _) = crm::upsert_company(&db, &who, &input).await.unwrap();
+    assert_eq!((count(&down).await, count(&up).await, count(&deals_only).await, count(&off).await), (1, 1, 0, 0));
+    // a write that fails leaves no delivery behind
+    assert!(crm::upsert_company(&db, &who, &CompanyInput { name: Some("No".into()), ..Default::default() }).await.is_err());
+    assert_eq!(count(&up).await, 1);
+
+    assert_eq!(webhooks::deliver_due(&db, &sb).await.unwrap(), 2);
+    let (path, h, body) = got.recv().await.unwrap();
+    assert_eq!((path.as_str(), h["familiar-event"].to_str().unwrap()), ("/hook", "company.created"));
+    assert!(verify(up["secret"].as_str().unwrap(), &h, &body));
+    let p: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!((p["event"].as_str(), p["data"]["id"].clone(), p["data"]["name"].as_str()), (Some("company.created"), co["id"].clone(), Some("Acme")));
+    assert_eq!(
+        (p["actor"]["kind"].as_str(), p["actor"]["bot_slug"].as_str(), p["actor"]["bot_id"].as_str()),
+        (Some("bot"), Some("scout"), Some(bot.as_str()))
+    );
+    assert_eq!(p["id"].as_str(), Some(h["familiar-delivery"].to_str().unwrap()));
+    assert!(p["at"].is_string() && p.get("previous").is_none() && p["data"].get("owner_id").is_none(), "{p}");
+    let (_, ups) = app.get(t, &format!("/api/crm/webhooks/{}/deliveries", id(&up))).await;
+    assert_eq!((ups[0]["status"].as_str(), ups[0]["attempts"].as_i64()), (Some("delivered"), Some(1)));
+
+    // the dead receiver: retried after 1 m, 5 m, 30 m, 2 h and 6 h, then failed
+    let state = || {
+        let (pool, w) = (app.pool.clone(), uid(&down));
+        async move {
+            sqlx::query_as::<_, (String, i32, f64, Option<String>)>(
+                "select status, attempts, extract(epoch from next_attempt_at - now())::float8, last_error
+                 from crm_webhook_deliveries where webhook_id = $1",
+            )
+            .bind(w)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    for (attempt, wait) in [(1, 60.0), (2, 300.0), (3, 1800.0), (4, 7200.0), (5, 21600.0)] {
+        let (status, attempts, left, err) = state().await;
+        assert_eq!((status.as_str(), attempts), ("pending", attempt), "after attempt {attempt}");
+        assert!((left - wait).abs() < 30.0, "attempt {attempt}: next in {left} s, want {wait}");
+        assert!(err.as_deref().is_some_and(|e| e.contains("connect")), "{err:?}");
+        // not due yet: nothing is sent
+        assert_eq!(webhooks::deliver_due(&db, &sb).await.unwrap(), 0);
+        sqlx::query("update crm_webhook_deliveries set next_attempt_at = now() where webhook_id = $1")
+            .bind(uid(&down))
+            .execute(&app.pool)
+            .await
+            .unwrap();
+        assert_eq!(webhooks::deliver_due(&db, &sb).await.unwrap(), 1);
+    }
+    let (status, attempts, _, _) = state().await;
+    assert_eq!((status.as_str(), attempts), ("failed", 6));
+    sqlx::query("update crm_webhook_deliveries set next_attempt_at = now() - interval '1 day'").execute(&app.pool).await.unwrap();
+    assert_eq!(webhooks::deliver_due(&db, &sb).await.unwrap(), 0, "failed stays failed");
+
+    // turning a webhook off fails what still waits for it
+    app.patch(t, &format!("/api/crm/companies/{}", id(&co)), json!({"industry": "SaaS"})).await;
+    assert_eq!(count(&up).await, 2);
+    let (_, w) = app.patch(t, &format!("/api/crm/webhooks/{}", id(&up)), json!({"enabled": false})).await;
+    assert_eq!(w["last_delivery"]["status"], "failed");
+    assert_eq!(w["last_delivery"]["last_error"], "the webhook was turned off");
+    assert_eq!(webhooks::deliver_due(&db, &sb).await.unwrap(), 0);
+}
+
+// ------------------------------------------------------------------ the GTM crew
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gtm_crew_bundle() {
+    let app = app!();
+    let a = app.owner().await;
+    let t = &a.tok;
+    assert_eq!(app.call(Method::GET, "/api/templates/bundles", None, None).await.0, 401);
+    let (s, bundles) = app.get(t, "/api/templates/bundles").await;
+    assert_eq!(s, 200);
+    let gtm = bundles.as_array().unwrap().iter().find(|b| b["id"] == "gtm-crew").unwrap().clone();
+    let members: Vec<&str> = gtm["templates"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+    assert_eq!(members, ["lead-researcher", "outbound-drafter", "reply-follow-up-tracker", "weekly-metrics-reporter", "inbox-assistant"]);
+    assert_eq!(app.post(t, "/api/templates/bundles/nope/create", json!({})).await.0, 404);
+    // all or nothing: a bad answer hires nobody
+    assert_eq!(app.post(t, "/api/templates/bundles/gtm-crew/create", json!({"answers": {"product": "x".repeat(4001)}})).await.0, 400);
+    assert_eq!(len(&app.get(t, "/api/bots").await.1), 0);
+
+    let answers = json!({"product": "Familiar", "icp": "two-person startups", "offer": "a 20-minute call", "sender": "Sam",
+                         "voice": "plain", "follow_up_days": "4"});
+    let v = app.ok_post(t, "/api/templates/bundles/gtm-crew/create", json!({"answers": answers}), 201).await;
+    let hired = v["hired"].as_array().unwrap();
+    assert_eq!(hired.len(), 5);
+    assert_eq!(len(&app.get(t, "/api/bots").await.1), 5);
+    for (h, template) in hired.iter().zip(&members) {
+        let bot = &h["bot"];
+        assert_eq!(bot["setup"]["template"].as_str(), Some(*template));
+        let persona = bot["persona"].as_str().unwrap();
+        assert!(!persona.contains("{{"), "{template}: {persona}");
+        let (_, scheds) = app.get(t, &format!("/api/bots/{}/schedules", id(bot))).await;
+        assert!(len(&scheds) >= 1 && scheds.as_array().unwrap().iter().all(|s| s["enabled"] == false), "{template}: every schedule off");
+    }
+    let tracker = &hired[2]["bot"];
+    let persona = tracker["persona"].as_str().unwrap();
+    assert!(persona.contains("outreach for Familiar") && persona.contains("for 4 days") && persona.contains("as Sam"), "{persona}");
+    assert!(hired[2]["first_task"].as_str().unwrap().contains("after 4 days"));
+    let (_, threads) = app.get(t, &format!("/api/bots/{}/threads", id(tracker))).await;
+    assert!(threads.as_array().unwrap().iter().any(|t| t["title"] == "Check replies"));
+    // a question the bundle doesn't ask stays "not set yet", for the teammate to ask
+    assert!(hired[3]["bot"]["persona"].as_str().unwrap().contains("(not set yet)"));
+    // hiring the crew again gets fresh slugs
+    let again = app.ok_post(t, "/api/templates/bundles/gtm-crew/create", json!({"answers": answers}), 201).await;
+    let slug = again["hired"][0]["bot"]["slug"].as_str().unwrap();
+    assert!(slug.starts_with("lead-researcher-"), "{slug}");
+    let b = app.second().await;
+    assert_eq!(len(&app.get(&b.tok, "/api/bots").await.1), 0);
 }
