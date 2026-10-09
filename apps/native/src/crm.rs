@@ -846,6 +846,9 @@ impl CrmPage {
     // ---- menus --------------------------------------------------------------------------------------------------
 
     fn open_menu(&mut self, id: MenuId, window: &mut Window, cx: &mut Context<Self>) {
+        if menu::closed_just_now(&format!("crm-menu-{id:?}")) {
+            return;
+        }
         if self.menu.as_ref().is_some_and(|m| m.id == id) {
             self.menu = None;
         } else {

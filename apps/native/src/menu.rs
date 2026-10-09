@@ -42,6 +42,16 @@ impl MenuItem {
 /// The width of an icon-only small button (a `right` menu's trigger).
 const ICON_TRIGGER: f32 = 28.0;
 
+thread_local! {
+    /// The menu a click outside just closed, and when: that click may be on its own trigger, which must not reopen it.
+    static CLOSED: std::cell::RefCell<Option<(SharedString, std::time::Instant)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Menu `id` was closed by the press of the click now landing (on its trigger): leave it closed.
+pub fn closed_just_now(id: &str) -> bool {
+    CLOSED.with(|c| c.borrow().as_ref().is_some_and(|(m, at)| m.as_ref() == id && at.elapsed() < std::time::Duration::from_millis(400)))
+}
+
 type Pick = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 type Close = Rc<dyn Fn(&mut Window, &mut App)>;
 
@@ -111,6 +121,7 @@ pub fn popover(
     }
     let (key_pick, key_close, key_cursor) = (pick.clone(), close.clone(), on_cursor.clone());
     let out_close = close.clone();
+    let out_id = id.clone();
     let panel = div()
         .id(SharedString::from(format!("{id}-panel")))
         .track_focus(focus)
@@ -135,7 +146,10 @@ pub fn popover(
             }
             cx.stop_propagation();
         })
-        .on_mouse_down_out(move |_, window, cx| out_close(window, cx))
+        .on_mouse_down_out(move |_, window, cx| {
+            CLOSED.with(|c| *c.borrow_mut() = Some((out_id.clone(), std::time::Instant::now())));
+            out_close(window, cx)
+        })
         .child(list);
     deferred(
         anchored()

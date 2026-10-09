@@ -1207,6 +1207,9 @@ impl RecordPanel {
                     .child(
                         menu::trigger("crm-panel-stage-btn", model::stage_label(d.stage), false, cx).on_click(move |_, window, cx| {
                             this.update(cx, |p, cx| {
+                                if menu::closed_just_now("crm-panel-stage") {
+                                    return;
+                                }
                                 p.stage_menu = if p.stage_menu.is_some() { None } else { Some(at) };
                                 p.menu_focus.focus(window, cx);
                                 cx.notify()
