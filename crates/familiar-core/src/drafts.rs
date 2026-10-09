@@ -36,9 +36,17 @@ pub fn queued_message(id: Uuid) -> String {
 }
 
 /// The follow-up message for a decided draft: `status` approved | revise | denied, `note` the owner's note, `proposed`
-/// the draft as the teammate proposed it, `edited` the owner's version when they changed it. None for any other status
-/// (expired drafts get no follow-up).
-pub fn decision_message(id: Uuid, status: &str, note: Option<&str>, proposed: &Value, edited: Option<&Value>) -> Option<String> {
+/// the draft as the teammate proposed it, `edited` the owner's version when they changed it, `dnc` the do-not-contact
+/// contact it turned out to reach (the CRM is checked again after approval; named by id only). None for any other
+/// status (expired drafts get no follow-up).
+pub fn decision_message(
+    id: Uuid,
+    status: &str,
+    note: Option<&str>,
+    proposed: &Value,
+    edited: Option<&Value>,
+    dnc: Option<Uuid>,
+) -> Option<String> {
     let id = short_id(id);
     let note = note.map(str::trim).filter(|n| !n.is_empty());
     let quoted = note.map(|n| format!(" Their note: \"{n}\"")).unwrap_or_default();
@@ -46,6 +54,13 @@ pub fn decision_message(id: Uuid, status: &str, note: Option<&str>, proposed: &V
     let msg = match status {
         "approved" => {
             let final_ = edited.unwrap_or(proposed);
+            if let Some(contact) = dnc {
+                return Some(format!(
+                    "[Familiar] Draft #{id} was approved, but it reaches or names a person marked do-not-contact in the \
+                     CRM now (contact {contact}): they asked not to be contacted, so the draft is not passed on. Don't \
+                     send it, and don't contact them in any other way. Only your owner can lift a do-not-contact."
+                ));
+            }
             if hidden(final_) {
                 // The API and Telegram never approve such a draft; this only guards a decision written some other way.
                 return Some(format!(
@@ -149,7 +164,27 @@ pub async fn sweep(ctx: &Ctx) -> Result<usize> {
     }
     let mut queued = 0;
     for d in ctx.db.decided_drafts().await? {
-        let msg = decision_message(d.id, &d.status, d.response.as_deref(), &d.input.0, d.edited.as_ref().map(|e| &e.0));
+        let final_ = d.edited.as_ref().map_or(&d.input.0, |e| &e.0);
+        // The recipient may have asked not to be contacted since the draft was proposed (or the owner's edit changed it).
+        let dnc = match (d.status == "approved").then_some(final_) {
+            Some(draft) => match crate::crm::teammate::draft_dnc(&ctx.db, draft, None).await {
+                Ok(contact) => contact,
+                Err(e) => {
+                    // not passed on unchecked: tried again on the next tick
+                    warn!(draft = %d.id, "checking the do-not-contact list failed: {e}");
+                    continue;
+                }
+            },
+            None => None,
+        };
+        let msg = decision_message(
+            d.id,
+            &d.status,
+            d.response.as_deref(),
+            &d.input.0,
+            d.edited.as_ref().map(|e| &e.0),
+            dnc,
+        );
         match ctx.db.queue_draft_followup(&d, msg.as_deref()).await {
             Ok(Some(run)) => {
                 queued += 1;
@@ -183,7 +218,7 @@ mod tests {
     #[test]
     fn decision_messages_say_what_to_do() {
         let proposed = json!({ "kind": "reply", "channel": "X", "to": "https://x.com/a/status/1", "body": "Thanks!" });
-        let m = decision_message(id(), "approved", None, &proposed, None).unwrap();
+        let m = decision_message(id(), "approved", None, &proposed, None, None).unwrap();
         assert!(m.starts_with("[Familiar] Draft #1a2b3c4d was approved by your owner. Post or send it now using exactly this text, character for character."), "{m}");
         assert!(m.contains("To: https://x.com/a/status/1\n") && m.contains("Channel: X\n"), "{m}");
         assert!(m.contains("\n----- BEGIN APPROVED TEXT -----\nThanks!\n----- END APPROVED TEXT -----\n"), "{m}");
@@ -192,37 +227,50 @@ mod tests {
         let mut edited = proposed.clone();
         edited["body"] = json!("Thank you, that means a lot.");
         edited["media"] = json!(["media/a.png"]);
-        let m = decision_message(id(), "approved", Some("  nice "), &proposed, Some(&edited)).unwrap();
+        let m = decision_message(id(), "approved", Some("  nice "), &proposed, Some(&edited), None).unwrap();
         assert!(m.contains("They edited it: use their version below, not yours."), "{m}");
         assert!(m.contains("\nThank you, that means a lot.\n") && !m.contains("Thanks!"), "{m}");
         assert!(m.contains("Media (files in your workspace): media/a.png\n") && m.ends_with("Their note: \"nice\""), "{m}");
         // An "edit" that changed nothing is a plain approval.
-        let m = decision_message(id(), "approved", None, &proposed, Some(&proposed)).unwrap();
+        let m = decision_message(id(), "approved", None, &proposed, Some(&proposed), None).unwrap();
         assert!(!m.contains("edited"), "{m}");
 
-        let m = decision_message(id(), "revise", Some("shorter, no emoji"), &proposed, None).unwrap();
+        let m = decision_message(id(), "revise", Some("shorter, no emoji"), &proposed, None, None).unwrap();
         assert!(m.starts_with("[Familiar] Your owner asked for changes to draft #1a2b3c4d (reply on X to https://x.com/a/status/1)."), "{m}");
         assert!(m.contains("Their note: \"shorter, no emoji\"") && m.contains("propose a revised draft"), "{m}");
         assert!(m.contains("Don't post or send") && m.contains("\nThanks!\n"), "{m}");
-        let m = decision_message(id(), "revise", Some("  "), &proposed, None).unwrap();
+        let m = decision_message(id(), "revise", Some("  "), &proposed, None, None).unwrap();
         assert!(m.contains("didn't say what to change"), "{m}");
 
-        let m = decision_message(id(), "denied", Some("not on brand"), &proposed, None).unwrap();
+        let m = decision_message(id(), "denied", Some("not on brand"), &proposed, None, None).unwrap();
         assert!(m.starts_with("[Familiar] Your owner rejected draft #1a2b3c4d") && m.contains("\"not on brand\""), "{m}");
         assert!(m.contains("Don't send it."), "{m}");
 
-        assert_eq!(decision_message(id(), "expired", None, &proposed, None), None);
-        assert_eq!(decision_message(id(), "pending", None, &proposed, None), None);
+        assert_eq!(decision_message(id(), "expired", None, &proposed, None, None), None);
+        assert_eq!(decision_message(id(), "pending", None, &proposed, None, None), None);
     }
 
     #[test]
     fn hidden_characters_are_never_passed_on() {
         let proposed = json!({ "kind": "post", "channel": "X", "body": "Pay at moc.live\u{202E} now" });
-        let m = decision_message(id(), "approved", None, &proposed, None).unwrap();
+        let m = decision_message(id(), "approved", None, &proposed, None, None).unwrap();
         assert!(m.contains("hidden characters") && !m.contains('\u{202E}') && !m.contains("BEGIN APPROVED"), "{m}");
         let clean = json!({ "kind": "post", "channel": "X", "body": "Pay at moc.live now" });
-        let m = decision_message(id(), "approved", None, &proposed, Some(&clean)).unwrap();
+        let m = decision_message(id(), "approved", None, &proposed, Some(&clean), None).unwrap();
         assert!(m.contains("\nPay at moc.live now\n") && !m.contains('\u{202E}'), "{m}");
+    }
+
+    #[test]
+    fn approved_drafts_to_do_not_contact_people_are_not_passed_on() {
+        let proposed = json!({ "kind": "email", "channel": "Gmail", "to": "sam@acme.com", "subject": "Hi", "body": "Hello Sam" });
+        let contact: Uuid = "99887766-0000-4000-8000-000000000000".parse().unwrap();
+        let m = decision_message(id(), "approved", Some("go"), &proposed, None, Some(contact)).unwrap();
+        assert!(m.starts_with("[Familiar] Draft #1a2b3c4d was approved, but it reaches or names a person marked do-not-contact"), "{m}");
+        assert!(m.contains("(contact 99887766-0000-4000-8000-000000000000)"), "named by id only: {m}");
+        assert!(m.contains("Don't send it") && !m.contains("BEGIN APPROVED") && !m.contains("Hello Sam"), "{m}");
+        // the other decisions don't send anything anyway
+        let m = decision_message(id(), "denied", None, &proposed, None, Some(contact)).unwrap();
+        assert!(m.contains("rejected"), "{m}");
     }
 
     #[test]

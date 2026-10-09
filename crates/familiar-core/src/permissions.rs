@@ -233,10 +233,14 @@ fn parse_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
     Some(std::net::Ipv4Addr::from(u32::try_from(value).ok()?))
 }
 
-fn is_public(ip: std::net::IpAddr) -> bool {
+/// A globally routable address: not loopback, private, carrier-grade NAT, link-local (cloud metadata), unspecified,
+/// broadcast, multicast, documentation, benchmarking or reserved. IPv4 carried inside IPv6 (mapped, compatible, NAT64,
+/// 6to4) is judged as that IPv4 address; Teredo tunnels are refused. Also the CRM webhooks' address rule.
+pub(crate) fn is_public(ip: std::net::IpAddr) -> bool {
+    use std::net::{IpAddr, Ipv4Addr};
     match ip {
-        std::net::IpAddr::V4(v4) => {
-            let [a, b, ..] = v4.octets();
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
             !(v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
@@ -245,14 +249,34 @@ fn is_public(ip: std::net::IpAddr) -> bool {
                 || v4.is_documentation()
                 || a == 0
                 || (a == 100 && (64..128).contains(&b)) // carrier-grade NAT
+                || (a == 192 && b == 0 && c == 0) // IETF protocol assignments
+                || (a == 198 && (b == 18 || b == 19)) // benchmarking
                 || a >= 224) // multicast + reserved
         }
-        std::net::IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_public(std::net::IpAddr::V4(v4));
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return false;
             }
-            let seg0 = v6.segments()[0];
-            !(v6.is_loopback() || v6.is_unspecified() || (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80 || v6.is_multicast())
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public(IpAddr::V4(v4));
+            }
+            let s = v6.segments();
+            let v4 = |hi: u16, lo: u16| IpAddr::V4(Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo)));
+            // IPv4-compatible (::a.b.c.d), NAT64 (64:ff9b::a.b.c.d) and 6to4 (2002:aabb:ccdd::) reach that IPv4 address
+            if s[..6] == [0; 6] || (s[0] == 0x64 && s[1] == 0xff9b && s[2..6] == [0; 4]) {
+                return is_public(v4(s[6], s[7]));
+            }
+            if s[0] == 0x2002 {
+                return is_public(v4(s[1], s[2]));
+            }
+            !((s[0] & 0xfe00) == 0xfc00 // unique local
+                || (s[0] & 0xffc0) == 0xfe80 // link-local
+                || (s[0] & 0xffc0) == 0xfec0 // site-local (deprecated)
+                || v6.is_multicast()
+                || (s[0] == 0x64 && s[1] == 0xff9b) // local-use NAT64 (64:ff9b:1::/48)
+                || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
+                || (s[0] == 0x2001 && s[1] == 0) // Teredo
+                || (s[0] == 0x0100 && s[1..4] == [0; 3])) // discard-only
         }
     }
 }
@@ -542,6 +566,23 @@ mod guard_tests {
         assert_eq!(ip("1.2.3.4").as_deref(), Some("1.2.3.4"));
         assert_eq!(ip("256.1.1.1"), None);
         assert_eq!(ip("1.2.3.4.5"), None);
+    }
+
+    #[test]
+    fn public_addresses() {
+        let public = |s: &str| is_public(s.parse().unwrap());
+        for a in ["8.8.8.8", "93.184.215.14", "2606:4700:4700::1111", "::ffff:8.8.8.8", "64:ff9b::808:808", "2002:808:808::1"] {
+            assert!(public(a), "{a}");
+        }
+        for a in [
+            "127.0.0.1", "10.0.0.1", "172.16.0.1", "192.168.1.1", "100.64.0.1", "169.254.169.254", "0.0.0.0", "0.1.2.3",
+            "255.255.255.255", "224.0.0.1", "240.0.0.1", "192.0.2.1", "192.0.0.8", "198.18.0.1", "::", "::1", "fd00::1",
+            "fe80::1", "fec0::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254", "::127.0.0.1",
+            "64:ff9b::a9fe:a9fe", "64:ff9b:1::1", "2002:a9fe:a9fe::1", "2002:7f00:1::", "2001:db8::1", "2001:0:1::1",
+            "100::1",
+        ] {
+            assert!(!public(a), "{a}");
+        }
     }
 
     #[tokio::test]

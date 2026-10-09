@@ -14,6 +14,8 @@ pub mod artifacts;
 pub mod bots;
 pub mod channels;
 pub mod connectors;
+pub mod crm;
+pub mod crm_webhooks;
 pub mod desktop;
 pub mod folders;
 pub mod live;

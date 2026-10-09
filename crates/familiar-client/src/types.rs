@@ -43,6 +43,15 @@ tolerant_enum!(ApprovalStatus {
 });
 tolerant_enum!(RuleDecision { Allow = "allow", Deny = "deny", Ask = "ask", Review = "review" });
 tolerant_enum!(Role { User = "user", Assistant = "assistant", System = "system" });
+tolerant_enum!(DealStage {
+    New = "new", Researching = "researching", Contacted = "contacted", Replied = "replied", Meeting = "meeting",
+    Proposal = "proposal", Won = "won", Lost = "lost",
+});
+tolerant_enum!(ActivityKind {
+    Note = "note", Research = "research", EmailSent = "email_sent", EmailReceived = "email_received",
+    DmSent = "dm_sent", DmReceived = "dm_received", Post = "post", Call = "call", Meeting = "meeting",
+    StageChange = "stage_change",
+});
 
 impl RunStatus {
     pub fn is_active(&self) -> bool {
@@ -547,6 +556,275 @@ pub struct Trigger {
     pub url: Option<String>,
 }
 
+// ---- CRM (`/api/crm/...`) ------------------------------------------------
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CrmCompany {
+    pub id: Uuid,
+    pub name: String,
+    /// Lowercase host name, e.g. `acme.com`.
+    pub domain: Option<String>,
+    pub website: Option<String>,
+    pub industry: Option<String>,
+    pub size: Option<String>,
+    pub location: Option<String>,
+    pub description: Option<String>,
+    /// 0-100: how good a lead it is.
+    pub fit_score: Option<i32>,
+    /// A real reason to contact them.
+    pub fit_reason: Option<String>,
+    pub tags: Vec<String>,
+    /// Where the facts came from.
+    pub source_urls: Vec<String>,
+    pub custom: Value,
+    /// The teammate that added it (None: the owner).
+    pub created_by_bot: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CrmContact {
+    pub id: Uuid,
+    pub company_id: Option<Uuid>,
+    /// Joined from the company.
+    pub company_name: Option<String>,
+    pub company_domain: Option<String>,
+    pub name: String,
+    pub title: Option<String>,
+    /// Lowercase.
+    pub email: Option<String>,
+    pub linkedin_url: Option<String>,
+    pub x_handle: Option<String>,
+    pub notes: Option<String>,
+    pub tags: Vec<String>,
+    pub source_urls: Vec<String>,
+    pub custom: Value,
+    /// They asked not to be contacted: teammates must not write to them.
+    pub do_not_contact: bool,
+    pub dnc_reason: Option<String>,
+    pub dnc_at: Option<DateTime<Utc>>,
+    pub created_by_bot: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CrmDeal {
+    pub id: Uuid,
+    pub company_id: Uuid,
+    pub contact_id: Option<Uuid>,
+    /// Joined from the company and the contact.
+    pub company_name: Option<String>,
+    pub company_domain: Option<String>,
+    pub contact_name: Option<String>,
+    pub contact_email: Option<String>,
+    /// The contact asked not to be contacted.
+    pub contact_do_not_contact: bool,
+    pub title: String,
+    pub stage: DealStage,
+    pub stage_changed_at: DateTime<Utc>,
+    pub value_cents: Option<i64>,
+    pub currency: String,
+    pub next_step: Option<String>,
+    pub next_step_at: Option<DateTime<Utc>>,
+    pub created_by_bot: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// One entry of a company's, contact's or deal's timeline.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CrmActivity {
+    pub id: Uuid,
+    pub company_id: Option<Uuid>,
+    pub contact_id: Option<Uuid>,
+    pub deal_id: Option<Uuid>,
+    pub kind: ActivityKind,
+    pub summary: String,
+    pub body: Option<String>,
+    pub url: Option<String>,
+    /// The approved draft this came from (an email or DM that was sent).
+    pub approval_id: Option<Uuid>,
+    pub bot_id: Option<Uuid>,
+    pub bot_name: Option<String>,
+    /// bot | user
+    pub actor_kind: String,
+    pub occurred_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// A write to a company, contact or deal (or a timeline entry): the row before and after.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CrmChange {
+    pub id: Uuid,
+    /// company | contact | deal | activity
+    pub entity: String,
+    pub entity_id: Uuid,
+    /// create | update | delete | undo
+    pub op: String,
+    pub before: Option<Value>,
+    pub after: Option<Value>,
+    /// bot | user
+    pub actor_kind: String,
+    pub bot_id: Option<Uuid>,
+    pub bot_name: Option<String>,
+    pub run_id: Option<Uuid>,
+    pub at: DateTime<Utc>,
+    /// Set once this change was undone.
+    pub undone_at: Option<DateTime<Utc>>,
+}
+
+/// A deal on the pipeline board.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PipelineDeal {
+    pub id: Uuid,
+    pub stage: DealStage,
+    pub title: String,
+    pub company_id: Uuid,
+    pub company_name: Option<String>,
+    pub contact_id: Option<Uuid>,
+    pub contact_name: Option<String>,
+    /// The contact asked not to be contacted.
+    pub contact_do_not_contact: bool,
+    pub stage_changed_at: Option<DateTime<Utc>>,
+    pub value_cents: Option<i64>,
+    pub currency: String,
+    pub next_step: Option<String>,
+    pub next_step_at: Option<DateTime<Utc>>,
+}
+
+/// One column of the pipeline board: every stage is present, in order. `count` and `value_cents` cover all the stage's
+/// deals; `deals` holds the newest 100.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PipelineStage {
+    pub stage: DealStage,
+    pub count: i64,
+    pub value_cents: i64,
+    pub deals: Vec<PipelineDeal>,
+}
+
+/// What a CSV import did (or, as a dry run, would do).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CrmImportResult {
+    pub created: u32,
+    pub updated: u32,
+    /// Blank rows, and rows whose record already has all of it.
+    pub skipped: u32,
+    pub errors: Vec<CrmImportError>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CrmImportError {
+    /// The row in the file (the header is row 1).
+    pub row: u32,
+    pub message: String,
+}
+
+/// An outgoing CRM webhook: every change in `events` is POSTed to `url`, signed with the webhook's secret
+/// (`Familiar-Signature: t=<unix>,v1=<hex HMAC-SHA256 of "<t>.<body>">`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CrmWebhook {
+    pub id: Uuid,
+    pub url: String,
+    /// company.created | company.updated | contact.created | contact.updated | contact.do_not_contact | deal.created |
+    /// deal.updated | deal.stage_changed | activity.created
+    pub events: Vec<String>,
+    pub enabled: bool,
+    pub created_at: Option<DateTime<Utc>>,
+    /// The signing secret: only in the answer to create. Store it then; it is never shown again.
+    pub secret: Option<String>,
+    /// The newest delivery, if any.
+    pub last_delivery: Option<CrmWebhookDelivery>,
+}
+
+/// One delivery of an event to a webhook (a `ping` for the Test button).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CrmWebhookDelivery {
+    /// Also the `Familiar-Delivery` header and the payload's `id`.
+    pub id: Uuid,
+    pub webhook_id: Option<Uuid>,
+    pub event: String,
+    /// `{id, event, at, data, previous?, actor: {kind, bot_id?, bot_slug?}}` (not in a webhook's `last_delivery`).
+    pub payload: Option<Value>,
+    /// pending | delivered | failed
+    pub status: String,
+    pub attempts: i32,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+/// Teammates hired together (`GET /api/templates/bundles`), from one set of shared `questions`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TemplateBundle {
+    pub id: String,
+    pub name: String,
+    pub summary: String,
+    /// Template ids, in hiring order.
+    pub templates: Vec<String>,
+    pub questions: Vec<TemplateQuestion>,
+}
+
+/// Response of `POST /api/templates/bundles/{id}/create`: every new teammate, in the bundle's order.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BundleHired {
+    pub hired: Vec<Hired>,
+}
+
+/// List filters for companies, contacts and deals; a filter that doesn't apply to the kind is ignored.
+#[derive(Debug, Clone, Default)]
+pub struct CrmListParams {
+    /// Text to look for.
+    pub q: Option<String>,
+    pub tag: Option<String>,
+    /// Deals: new | researching | contacted | replied | meeting | proposal | won | lost.
+    pub stage: Option<String>,
+    /// Contacts and deals.
+    pub company_id: Option<Uuid>,
+    /// Contacts: only those (not) marked do-not-contact.
+    pub dnc: Option<bool>,
+    /// updated (default) | name | fit.
+    pub sort: Option<String>,
+    /// At most 200 (default 50).
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+/// Timeline filters; newest first.
+#[derive(Debug, Clone, Default)]
+pub struct CrmActivityParams {
+    pub company_id: Option<Uuid>,
+    pub contact_id: Option<Uuid>,
+    pub deal_id: Option<Uuid>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+/// Change-log filters; newest first.
+#[derive(Debug, Clone, Default)]
+pub struct CrmChangeParams {
+    /// company | contact | deal | activity
+    pub entity: Option<String>,
+    pub entity_id: Option<Uuid>,
+    pub bot_id: Option<Uuid>,
+    pub limit: Option<u32>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeviceInfo {
@@ -692,6 +970,62 @@ body!(
 body!(
     /// Tick a template login (`done` defaults to true) and/or hide the Set up checklist.
     SetupPatch { login: String, done: bool, dismissed: bool }
+);
+
+body!(
+    /// Create a company, or update the one with the same domain (else the same name). An empty text clears a field.
+    NewCompany {
+        name: String, domain: String, website: String, industry: String, size: String, location: String,
+        description: String, fit_score: i32, fit_reason: String, tags: Vec<String>, source_urls: Vec<String>, custom: Value,
+    }
+);
+body!(CompanyPatch {
+    name: String, domain: String, website: String, industry: String, size: String, location: String,
+    description: String, fit_score: i32, fit_reason: String, tags: Vec<String>, source_urls: Vec<String>, custom: Value,
+});
+body!(
+    /// Create a contact, or update the one with the same email (else LinkedIn link, else name at the company).
+    NewContact {
+        company_id: Uuid, name: String, title: String, email: String, linkedin_url: String, x_handle: String,
+        notes: String, tags: Vec<String>, source_urls: Vec<String>, custom: Value, do_not_contact: bool,
+        dnc_reason: String,
+    }
+);
+body!(ContactPatch {
+    company_id: Uuid, name: String, title: String, email: String, linkedin_url: String, x_handle: String,
+    notes: String, tags: Vec<String>, source_urls: Vec<String>, custom: Value, do_not_contact: bool,
+    dnc_reason: String,
+});
+body!(
+    /// Create a deal, or update the one at the same company with the same title. `stage` defaults to new.
+    NewDeal {
+        company_id: Uuid, contact_id: Uuid, title: String, stage: String, value_cents: i64, currency: String,
+        next_step: String, next_step_at: DateTime<Utc>,
+    }
+);
+body!(DealPatch {
+    company_id: Uuid, contact_id: Uuid, title: String, stage: String, value_cents: i64, currency: String,
+    next_step: String, next_step_at: DateTime<Utc>,
+});
+body!(
+    /// A timeline entry; give at least one of `company_id`, `contact_id`, `deal_id`.
+    NewActivity {
+        company_id: Uuid, contact_id: Uuid, deal_id: Uuid, kind: String, summary: String, body: String, url: String,
+        approval_id: Uuid, occurred_at: DateTime<Utc>,
+    }
+);
+
+body!(
+    /// A webhook: an `https` URL (or `http` to this computer) and the events it gets. `enabled` defaults to true.
+    NewCrmWebhook { url: String, events: Vec<String>, enabled: bool }
+);
+body!(
+    /// Turning a webhook off fails its deliveries still waiting.
+    CrmWebhookPatch { url: String, events: Vec<String>, enabled: bool }
+);
+body!(
+    /// Hire a bundle: the shared answers by question key.
+    FromBundle { answers: std::collections::BTreeMap<String, String> }
 );
 
 /// Secrets for a connector: env vars (stdio) and/or headers (http). Write-only.

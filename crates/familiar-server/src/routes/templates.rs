@@ -96,16 +96,26 @@ pub struct FromTemplate {
     avatar: Option<Value>,
 }
 
-pub async fn create(
-    State(st): State<S>,
-    a: Auth,
-    Path(id): Path<String>,
-    Body(b): Body<FromTemplate>,
-) -> R<(StatusCode, Json<Value>)> {
-    let t = CATALOG.iter().find(|t| t.id == id).ok_or(ApiError::NotFound)?;
-    if b.answers.values().any(|v| v.chars().count() > 4000) {
+fn check_answers(answers: &BTreeMap<String, String>) -> R<()> {
+    if answers.values().any(|v| v.chars().count() > 4000) {
         return Err(ApiError::bad("answers must be at most 4000 characters each"));
     }
+    Ok(())
+}
+
+/// A hire, checked before anything is written.
+struct Hire<'a> {
+    t: &'a Template,
+    answers: &'a BTreeMap<String, String>,
+    name: String,
+    engine: String,
+    model: String,
+    avatar: Value,
+    persona: String,
+}
+
+fn plan<'a>(t: &'a Template, b: &'a FromTemplate) -> R<Hire<'a>> {
+    check_answers(&b.answers)?;
     let name = text(b.name.as_deref().unwrap_or(&t.name), "name", 100)?;
     let engine = one_of(b.engine.as_deref().unwrap_or("claude"), "engine", &bots::ENGINES)?;
     let model = match b.model.as_deref() {
@@ -113,19 +123,99 @@ pub async fn create(
         None if engine == "codex" => return Err(ApiError::bad("set a model for the codex engine")),
         None => bots::check_model(&engine, &t.model)?,
     };
-    let avatar = b.avatar.filter(|v| !v.is_null()).unwrap_or_else(|| t.avatar.clone());
+    let avatar = b.avatar.clone().filter(|v| !v.is_null()).unwrap_or_else(|| t.avatar.clone());
     bots::check_avatar(&avatar)?;
     let persona = fill(t, b.instructions.as_deref().unwrap_or(&t.instructions), &b.answers);
     if persona.chars().count() > 20_000 {
         return Err(ApiError::bad("instructions too long (max 20000)"));
     }
+    Ok(Hire { t, answers: &b.answers, name, engine, model, avatar, persona })
+}
 
+pub async fn create(
+    State(st): State<S>,
+    a: Auth,
+    Path(id): Path<String>,
+    Body(b): Body<FromTemplate>,
+) -> R<(StatusCode, Json<Value>)> {
+    let t = CATALOG.iter().find(|t| t.id == id).ok_or(ApiError::NotFound)?;
+    let h = plan(t, &b)?;
     let mut tx = st.pool.begin().await?;
+    let bot = hire(&mut tx, a.user, &h).await?;
+    tx.commit().await?;
+    let row = bots::bot_json(&st.pool, a.user, bot).await?;
+    let first_task = t.first_task.as_deref().map(|f| fill(t, f, &b.answers));
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "bot": row.0.0, "first_task": first_task })),
+    ))
+}
+
+/// Teammates hired together from one set of shared questions (`bundles.json`); the list endpoint serves the file.
+#[derive(Deserialize)]
+struct Bundle {
+    id: String,
+    templates: Vec<String>,
+}
+
+const BUNDLES: &str = include_str!("../bundles.json");
+
+/// Parsed once; the unit tests below keep the file valid.
+static BUNDLE_CATALOG: LazyLock<Vec<Bundle>> =
+    LazyLock::new(|| serde_json::from_str(BUNDLES).expect("bundles.json is valid"));
+
+pub async fn bundles(_a: Auth) -> R<Json<Value>> {
+    serde_json::from_str(BUNDLES)
+        .map(Json)
+        .map_err(|_| ApiError::Internal)
+}
+
+#[derive(Deserialize)]
+pub struct FromBundle {
+    #[serde(default)]
+    answers: BTreeMap<String, String>,
+}
+
+/// Hire every teammate of a bundle in one transaction (all or none). A teammate's question is answered from the shared
+/// answer with the same key; the others stay "(not set yet)" and the teammate asks. Every schedule starts off.
+/// 201 `{hired: [{bot, first_task}]}`, in the bundle's order.
+pub async fn create_bundle(
+    State(st): State<S>,
+    a: Auth,
+    Path(id): Path<String>,
+    Body(b): Body<FromBundle>,
+) -> R<(StatusCode, Json<Value>)> {
+    let bundle = BUNDLE_CATALOG.iter().find(|x| x.id == id).ok_or(ApiError::NotFound)?;
+    let from = FromTemplate { answers: b.answers, name: None, instructions: None, engine: None, model: None, avatar: None };
+    let mut plans = Vec::new();
+    for tid in &bundle.templates {
+        let t = CATALOG.iter().find(|t| &t.id == tid).ok_or(ApiError::Internal)?;
+        plans.push(plan(t, &from)?);
+    }
+    let mut tx = st.pool.begin().await?;
+    let mut ids = Vec::new();
+    for h in &plans {
+        ids.push(hire(&mut tx, a.user, h).await?);
+    }
+    tx.commit().await?;
+    let mut hired = Vec::new();
+    for (bot, h) in ids.into_iter().zip(&plans) {
+        let row = bots::bot_json(&st.pool, a.user, bot).await?;
+        let first_task = h.t.first_task.as_deref().map(|f| fill(h.t, f, h.answers));
+        hired.push(json!({ "bot": row.0.0, "first_task": first_task }));
+    }
+    Ok((StatusCode::CREATED, Json(json!({ "hired": hired }))))
+}
+
+/// Write one hire: the bot, its schedules (off, each on its own labelled thread), links to the owner's connectors from
+/// the suggested presets, and its Set up checklist. Returns the bot's id.
+async fn hire(tx: &mut sqlx::PgConnection, owner: Uuid, h: &Hire<'_>) -> R<Uuid> {
+    let t = h.t;
     // A taken slug (a second hire of the same template) gets a short suffix.
-    let base = bots::slugify(&name);
+    let base = bots::slugify(&h.name);
     let taken: bool =
         sqlx::query_scalar("select exists(select 1 from bots where owner_id = $1 and slug = $2)")
-            .bind(a.user)
+            .bind(owner)
             .bind(&base)
             .fetch_one(&mut *tx)
             .await?;
@@ -139,13 +229,13 @@ pub async fn create(
         "insert into bots (owner_id, slug, name, persona, model, engine, avatar)
          values ($1, $2, $3, $4, $5, $6, $7) returning id",
     )
-    .bind(a.user)
+    .bind(owner)
     .bind(&slug)
-    .bind(&name)
-    .bind(&persona)
-    .bind(&model)
-    .bind(&engine)
-    .bind(sqlx::types::Json(&avatar))
+    .bind(&h.name)
+    .bind(&h.persona)
+    .bind(&h.model)
+    .bind(&h.engine)
+    .bind(sqlx::types::Json(&h.avatar))
     .fetch_one(&mut *tx)
     .await?;
 
@@ -156,10 +246,10 @@ pub async fn create(
             "insert into schedules (owner_id, bot_id, cron, prompt, kind, enabled)
              values ($1, $2, $3, $4, 'scheduled', false) returning id, thread_id",
         )
-        .bind(a.user)
+        .bind(owner)
         .bind(bot)
         .bind(schedules::cron(&s.cron)?)
-        .bind(fill(t, &s.prompt, &b.answers))
+        .bind(fill(t, &s.prompt, h.answers))
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query("update threads set source = 'schedule', title = $2 where id = $1")
@@ -176,7 +266,7 @@ pub async fn create(
          on conflict do nothing",
     )
     .bind(bot)
-    .bind(a.user)
+    .bind(owner)
     .bind(&t.connectors)
     .execute(&mut *tx)
     .await?;
@@ -194,14 +284,7 @@ pub async fn create(
         .bind(sqlx::types::Json(&setup))
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
-
-    let row = bots::bot_json(&st.pool, a.user, bot).await?;
-    let first_task = t.first_task.as_deref().map(|f| fill(t, f, &b.answers));
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({ "bot": row.0.0, "first_task": first_task })),
-    ))
+    Ok(bot)
 }
 
 #[derive(Deserialize)]
@@ -349,6 +432,67 @@ mod tests {
                 assert!(preset_ids.contains(c), "{id}: unknown connector preset {c}");
             }
         }
+    }
+
+    /// A teammate that writes the CRM knows the trust rules: sources for every record, do-not-contact and the opt-out
+    /// words, drafts first, no guessed emails, fenced text, and CRM ids in the notes of the outreach it proposes.
+    #[test]
+    fn crm_teammates_know_the_rules() {
+        let writes = ["crm_upsert_company", "crm_upsert_contact", "crm_upsert_deal", "crm_move_deal", "crm_log_activity"];
+        let mut writers = Vec::new();
+        for t in CATALOG.iter() {
+            let rules = &t.instructions;
+            if !writes.iter().any(|w| rules.contains(w)) {
+                continue;
+            }
+            writers.push(t.id.as_str());
+            for must in ["`source_urls`", "do-not-contact", "`do_not_contact`", "`propose_draft`", "Never guess", "<data-", "\"stop\"", "unsubscribe"] {
+                assert!(rules.contains(must), "{}: CRM rules must mention {must}", t.id);
+            }
+            if rules.contains("kind email") {
+                assert!(rules.contains("CRM ids"), "{}: CRM ids in the draft note", t.id);
+            }
+        }
+        for id in ["lead-researcher", "outbound-drafter", "reply-follow-up-tracker", "inbox-assistant"] {
+            assert!(writers.contains(&id), "{id} writes the CRM");
+        }
+        // first emails carry a one-line opt-out; follow-ups are capped and on weekdays
+        let drafter = CATALOG.iter().find(|t| t.id == "outbound-drafter").unwrap();
+        assert!(drafter.instructions.contains("one-line opt-out"));
+        let tracker = CATALOG.iter().find(|t| t.id == "reply-follow-up-tracker").unwrap();
+        assert!(tracker.instructions.contains("At most 2 follow-ups per contact"));
+        assert!(tracker.schedules.iter().all(|s| s.cron.ends_with("1-5")), "weekdays only");
+        // the metrics reporter only reads
+        let reporter = CATALOG.iter().find(|t| t.id == "weekly-metrics-reporter").unwrap();
+        assert!(reporter.instructions.contains("crm_pipeline") && !writes.iter().any(|w| reporter.instructions.contains(w)));
+    }
+
+    #[test]
+    fn bundles_are_valid() {
+        let all: Vec<Value> = serde_json::from_str(BUNDLES).expect("bundles.json parses");
+        assert_eq!(all.len(), BUNDLE_CATALOG.len());
+        for b in &all {
+            let id = str_of(b, "id", "?");
+            for k in ["name", "summary"] {
+                assert!(!str_of(b, k, id).trim().is_empty(), "{id}: empty {k}");
+            }
+            let members: Vec<&Template> = b["templates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| CATALOG.iter().find(|c| t == c.id.as_str()).unwrap_or_else(|| panic!("{id}: unknown template {t}")))
+                .collect();
+            assert!(members.len() >= 2, "{id}: a bundle hires several teammates");
+            // every shared question answers a question of at least one member
+            for q in b["questions"].as_array().unwrap() {
+                let key = str_of(q, "key", id);
+                assert!(!str_of(q, "label", id).is_empty() && q["placeholder"].is_string() && q["multiline"].is_boolean());
+                assert!(members.iter().any(|t| t.questions.iter().any(|tq| tq.key == key)), "{id}: question {key} is used by no member");
+            }
+        }
+        let gtm = all.iter().find(|b| b["id"] == "gtm-crew").expect("the GTM crew");
+        let keys: Vec<&str> = gtm["questions"].as_array().unwrap().iter().map(|q| q["key"].as_str().unwrap()).collect();
+        assert_eq!(keys, ["product", "icp", "offer", "sender", "voice", "follow_up_days"]);
     }
 
     #[test]
