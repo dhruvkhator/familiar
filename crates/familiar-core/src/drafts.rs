@@ -88,12 +88,18 @@ pub fn decision_message(
                 " Post or send it now using exactly this text, character for character. Don't shorten, rephrase or add \
                  to it.",
             );
-            out.push_str(if grantable(final_) {
-                " Your owner won't be asked again for one send of exactly this: an email through your email connector \
-                 to exactly these recipients with this subject (no cc, bcc or attachments), or typing exactly this text \
-                 into the browser (the click that posts or sends it still asks them). Anything different asks.\n\n"
-            } else {
-                " Posting or sending it still goes through your normal approvals.\n\n"
+            out.push_str(match (grantable(final_), final_["kind"] == "email") {
+                (true, true) => {
+                    " Your owner won't be asked again for one send of exactly this: an email through your email \
+                     connector to exactly these recipients with this subject (no cc, bcc or attachments), or typing \
+                     exactly this text into the browser (the click that sends it still asks them). Anything different \
+                     asks.\n\n"
+                }
+                (true, false) => {
+                    " Your owner won't be asked again for typing exactly this text into the browser, once (the click \
+                     that posts or sends it still asks them). Anything different asks.\n\n"
+                }
+                (false, _) => " Posting or sending it still goes through your normal approvals.\n\n",
             });
             for (label, key) in [("Channel", "channel"), ("Kind", "kind"), ("To", "to"), ("Subject", "subject")] {
                 if let Some(v) = final_[key].as_str() {
@@ -709,7 +715,10 @@ mod tests {
         assert!(!grantable(&json!({ "body": "x", "media": ["a.png"] })));
         let proposed = json!({ "kind": "post", "channel": "X", "body": "Hi" });
         let m = decision_message(id(), "approved", None, &proposed, None, None).unwrap();
-        assert!(m.contains("won't be asked again for one send of exactly this") && m.contains("the click that posts or sends it still asks"), "{m}");
+        assert!(m.contains("won't be asked again for typing exactly this text into the browser, once") && m.contains("the click that posts or sends it still asks"), "{m}");
+        assert!(!m.contains("email connector"), "{m}");
+        let m = decision_message(id(), "approved", None, &email(), None, None).unwrap();
+        assert!(m.contains("won't be asked again for one send of exactly this: an email through your email connector"), "{m}");
         let mut with_media = proposed.clone();
         with_media["media"] = json!(["media/a.png"]);
         let m = decision_message(id(), "approved", None, &with_media, None, None).unwrap();
