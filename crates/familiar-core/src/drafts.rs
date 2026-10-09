@@ -466,7 +466,7 @@ pub async fn pre_approval(ctx: &Ctx, run: &Run, tool: &str, input: &Value, tool_
             continue;
         }
         if used.is_some() {
-            why_not = Some(format!("Draft #{short} was already sent as approved in this run: this would send it again."));
+            why_not = Some(format!("Draft #{short} already had its one send without asking in this run (check whether it arrived; it may have failed): this would send it again."));
             continue;
         }
         // Someone may have asked not to be contacted since the owner approved it.
@@ -490,7 +490,7 @@ pub async fn pre_approval(ctx: &Ctx, run: &Run, tool: &str, input: &Value, tool_
             Ok(Some(approval)) => return Some(PreApproval::Sent { draft: *draft, approval, reason }),
             // used up by a call racing this one
             Ok(None) => {
-                why_not = Some(format!("Draft #{short} was already sent as approved in this run: this would send it again."));
+                why_not = Some(format!("Draft #{short} already had its one send without asking in this run (check whether it arrived; it may have failed): this would send it again."));
             }
             Err(e) => {
                 warn!(run = %run.id, draft = %draft, "using the draft pre-approval failed: {e:#}");

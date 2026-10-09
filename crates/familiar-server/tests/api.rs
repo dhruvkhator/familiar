@@ -1997,8 +1997,8 @@ async fn crm_teammate_owner_edits_win_and_limits() {
         (d["stage"].as_str(), d["next_step"].as_str(), d["contact_do_not_contact"].clone()),
         (Some("won"), Some("send the invoice"), json!(false))
     );
-    // clearing: a teammate may empty the next step's date and the fit score (theirs to keep up), not the value the
-    // owner set; through the tool, only with an explicit `clear` (a null is "leave it")
+    // clearing: a teammate never empties a value the owner set, not even the next step's date it otherwise keeps up;
+    // through the tool, only with an explicit `clear` (a null is "leave it")
     app.patch(t, &format!("/api/crm/deals/{did}"), json!({"value_cents": 900, "next_step_at": "2026-11-01T10:00:00Z"})).await;
     let tool_args = |v: Value| serde_json::from_value::<familiar_core::crm::teammate::DealArgs>(v).unwrap();
     let out = familiar_core::crm::teammate::upsert_deal(&db, &who, tool_args(json!({ "id": did, "value_cents": null, "next_step_at": null })))
@@ -2008,9 +2008,18 @@ async fn crm_teammate_owner_edits_win_and_limits() {
     let out = familiar_core::crm::teammate::upsert_deal(&db, &who, tool_args(json!({ "id": did, "clear": ["value_cents", "next_step_at"] })))
         .await
         .unwrap();
-    assert!(out.contains("\"kept_owner_values\":[\"value_cents\"]"), "{out}");
+    assert!(out.contains("\"kept_owner_values\":[\"next_step_at\",\"value_cents\"]"), "{out}");
     let d = app.get(t, &format!("/api/crm/deals/{did}")).await.1;
-    assert_eq!((d["value_cents"].clone(), d["next_step_at"].clone()), (json!(900), Value::Null));
+    assert_eq!((d["value_cents"].clone(), d["next_step_at"].is_string()), (json!(900), true));
+    // a date the teammate set itself, it may clear
+    familiar_core::crm::teammate::upsert_deal(&db, &who, tool_args(json!({ "id": did, "next_step_at": "2026-11-08T10:00:00Z" })))
+        .await
+        .unwrap();
+    familiar_core::crm::teammate::upsert_deal(&db, &who, tool_args(json!({ "id": did, "clear": ["next_step_at"] })))
+        .await
+        .unwrap();
+    let d = app.get(t, &format!("/api/crm/deals/{did}")).await.1;
+    assert_eq!(d["next_step_at"].clone(), Value::Null);
     let err = familiar_core::crm::teammate::upsert_deal(&db, &who, tool_args(json!({ "id": did, "clear": ["next_step_at"], "next_step_at": "2026-12-01T10:00:00Z" })))
         .await
         .unwrap_err();

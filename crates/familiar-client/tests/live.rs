@@ -256,6 +256,8 @@ async fn crm_webhooks_and_bundles() {
         eprintln!("SKIP: TEST_DATABASE_URL not set");
         return;
     };
+    // As in the desktop app: the receiver below is on this computer.
+    familiar_core::crm::webhooks::set_allow_loopback(true);
     let db = format!("c_{}", Uuid::new_v4().simple());
     let mut c = PgConnection::connect(&admin).await.unwrap();
     sqlx::query(sqlx::AssertSqlSafe(format!("create database {db}"))).execute(&mut c).await.unwrap();

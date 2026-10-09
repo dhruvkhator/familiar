@@ -1969,7 +1969,7 @@ async fn approved_email_is_sent_once_without_asking_again() {
 
     // 1. the approved email (a trailing line break aside): no question. 2. the same email again: asks.
     let (second, reason) = next_pending(&h, follow, None).await;
-    assert_eq!(reason, Some(format!("Draft #{short} was already sent as approved in this run: this would send it again.")));
+    assert_eq!(reason, Some(format!("Draft #{short} already had its one send without asking in this run (check whether it arrived; it may have failed): this would send it again.")));
     h.decide(second, "denied", None).await;
     // 3. a changed word: asks, saying how it differs.
     let (third, reason) = next_pending(&h, follow, Some(second)).await;
@@ -2040,7 +2040,7 @@ async fn approved_post_is_typed_without_asking_but_the_click_asks() {
     assert_eq!(tool_name, "mcp__browser__browser_click");
     h.decide(click, "approved", None).await;
     let (again, reason) = next_pending(&h, follow, Some(click)).await;
-    assert_eq!(reason, Some(format!("Draft #{short} was already sent as approved in this run: this would send it again.")));
+    assert_eq!(reason, Some(format!("Draft #{short} already had its one send without asking in this run (check whether it arrived; it may have failed): this would send it again.")));
     h.decide(again, "denied", None).await;
     assert_eq!(h.finished(follow).await.0, "succeeded");
 

@@ -245,7 +245,10 @@ pub fn owner_edits_win(kind: Kind, before: &Value, m: &mut M, held: &BTreeSet<St
         let dnc_identity = kind == Kind::Contact
             && before["do_not_contact"] == json!(true)
             && DNC_IDENTITY.contains(&k.as_str());
-        if !dnc_identity && ((bot_maintained(kind, &k) && !closed_by_owner) || !held.contains(&k)) {
+        // A teammate keeps the fields it maintains up to date, but emptying one the owner filled in is not upkeep:
+        // that stays the owner's to do.
+        let clears_owner_value = held.contains(&k) && blank(m.get(&k)) && !blank(before.get(&k));
+        if !dnc_identity && ((bot_maintained(kind, &k) && !closed_by_owner && !clears_owner_value) || !held.contains(&k)) {
             continue;
         }
         m.remove(&k);
@@ -964,6 +967,14 @@ mod tests {
         assert_eq!(owner_edits_win(Kind::Deal, &won, &mut w, &held(&["stage"])), vec!["stage".to_string()]);
         let mut w = m(json!({ "stage": "contacted" }));
         assert!(owner_edits_win(Kind::Deal, &won, &mut w, &held(&[])).is_empty());
+        // the next step's date: a teammate updates the owner's, but never empties it; its own it may clear
+        let dated = json!({ "next_step_at": "2026-11-01T10:00:00+00:00" });
+        let mut w = m(json!({ "next_step_at": "2026-11-08T10:00:00+00:00" }));
+        assert!(owner_edits_win(Kind::Deal, &dated, &mut w, &held(&["next_step_at"])).is_empty());
+        let mut w = m(json!({ "next_step_at": null }));
+        assert_eq!(owner_edits_win(Kind::Deal, &dated, &mut w, &held(&["next_step_at"])), vec!["next_step_at".to_string()]);
+        let mut w = m(json!({ "next_step_at": null }));
+        assert!(owner_edits_win(Kind::Deal, &dated, &mut w, &held(&[])).is_empty());
 
         // setting do-not-contact (with its reason) always goes through, even over the owner's earlier "false"
         let c = json!({ "do_not_contact": false, "dnc_reason": "owner note", "notes": "owner" });
@@ -1057,13 +1068,24 @@ mod tests {
         assert_eq!(clearable::<i32>("fit_score", &BTreeSet::new(), None), None);
         assert!(clear_arg(&Some(vec!["name".into()]), &["fit_score"], &[]).unwrap_err().contains("clear can only name fit_score"));
         assert!(clear_arg(&Some(vec!["fit_score".into()]), &["fit_score"], &[("fit_score", true)]).unwrap_err().contains("both set and cleared"));
-        // a teammate may empty what it maintains (fit score, next step date), not a value the owner set
+        // a teammate may empty what it maintains (fit score, next step date) when a teammate set it, never a value the
+        // owner set — not even in the fields it otherwise keeps up
         let deal = json!({ "value_cents": 5000, "next_step_at": "2026-10-14T09:00:00+00:00" });
         let mut w = m(json!({ "value_cents": null, "next_step_at": null }));
-        assert_eq!(owner_edits_win(Kind::Deal, &deal, &mut w, &held(&["value_cents", "next_step_at"])), vec!["value_cents".to_string()]);
+        assert_eq!(
+            owner_edits_win(Kind::Deal, &deal, &mut w, &held(&["value_cents", "next_step_at"])),
+            vec!["next_step_at".to_string(), "value_cents".to_string()]
+        );
+        let mut w = m(json!({ "value_cents": null, "next_step_at": null }));
+        assert!(owner_edits_win(Kind::Deal, &deal, &mut w, &held(&[])).is_empty());
         assert_eq!(w.get("next_step_at"), Some(&Value::Null));
         let mut w = m(json!({ "fit_score": null }));
-        assert!(owner_edits_win(Kind::Company, &json!({ "fit_score": 40 }), &mut w, &held(&["fit_score"])).is_empty());
+        assert_eq!(
+            owner_edits_win(Kind::Company, &json!({ "fit_score": 40 }), &mut w, &held(&["fit_score"])),
+            vec!["fit_score".to_string()]
+        );
+        let mut w = m(json!({ "fit_score": null }));
+        assert!(owner_edits_win(Kind::Company, &json!({ "fit_score": 40 }), &mut w, &held(&[])).is_empty());
     }
 
     #[test]

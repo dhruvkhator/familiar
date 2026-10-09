@@ -374,7 +374,8 @@ update the match: same domain / same email (else LinkedIn link, else name at the
 a number or date only by naming it in `clear` (`crm_upsert_company`: `fit_score`; `crm_upsert_deal`: `value_cents`,
 `next_step_at`), never with a `null` (some models send `null` for every field they don't use, so `null` means "leave
 it" there); naming a field in `clear` and giving it a value is an error. Owner edits win as for any change: the fit
-score and the next step's date are the teammate's to keep up, a value the owner set stays.
+score and the next step's date are the teammate's to keep up (update), but whatever the owner set, a teammate never
+empties.
 
 **Trust model** (`crm::teammate`):
 - *Fenced text.* CRM text is partly copied from web pages and emails, so a record can carry instructions aimed at the
@@ -388,7 +389,8 @@ score and the next step's date are the teammate's to keep up, a value the owner 
   (`actor_kind = 'user'`; an owner undo or CSV import counts). A held field keeps its value and the tool answer lists
   it under `kept_owner_values` ("say so in your summary instead"). Teammates may always: fill fields nobody set, change
   what a teammate set, maintain `fit_score` / `fit_reason` (companies) and `stage` / `next_step` / `next_step_at`
-  (deals), except that a deal the owner closed (won/lost) stays closed; add tags and `source_urls` (merged, never
+  (deals), except that a deal the owner closed (won/lost) stays closed and a value the owner set is never emptied by
+  a teammate (maintaining means updating, not erasing the owner's date or score); add tags and `source_urls` (merged, never
   removed, at most 20); set do-not-contact. To let a teammate change a held field, the owner makes the change.
 - *Do-not-contact.* Anyone sets it; only the owner clears it (a teammate gets an error; a CSV import only ever sets it,
   so re-importing an old export never lifts one or its reason). Who a do-not-contact person is never changes through a
