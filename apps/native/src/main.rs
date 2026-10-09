@@ -125,7 +125,6 @@ fn window_options(cx: &App, title: &str, width: f32, height: f32, custom_titleba
 
 fn main() {
     let args = parse_args();
-    perf::init(args.bench);
     // One copy per user: a second launch shows the running window and exits. The gallery and the bench run beside it.
     let nudge = if args.quit { desktop::Nudge::Quit } else { desktop::Nudge::Show };
     let nudges = match (!args.gallery && !args.bench).then(|| desktop::single_instance(nudge)) {
@@ -135,6 +134,7 @@ fn main() {
         Some(desktop::Instance::First(rx)) => Some(rx),
         None => None,
     };
+    perf::init(args.bench);
     // Debug builds log to the console; release builds have none and log to ~/.familiar/logs/native.log.
     if args.bench {
         // The bench leaves the app's log alone.
@@ -152,7 +152,12 @@ fn main() {
         .build()
         .expect("start the tokio runtime");
     let handle = runtime.handle().clone();
+    // The app window: start the engine now, so the database comes up while the window is being created.
+    if !args.gallery && !args.bench {
+        engine::start_early(&handle);
+    }
     gpui_platform::application().with_assets(familiar_ui::icons::Assets).run(move |cx: &mut App| {
+        perf::milestone("app_ready");
         gpui_tokio::init_from_handle(cx, handle.clone());
         gpui_base::init(cx);
         let saved = prefs::load();
@@ -181,6 +186,7 @@ fn main() {
         let open = args.open.clone();
         let options = WindowOptions { show: !args.hidden, focus: !args.hidden, ..window_options(cx, "Familiar", 1180.0, 780.0, true) };
         let window = cx.open_window(options, move |window, cx| cx.new(|cx| root::Root::new(open, window, cx))).expect("open window");
+        perf::milestone("window_open");
         cx.set_global(desktop::MainWindow(window));
         tray::install(cx);
         if let Some(mut nudges) = nudges {

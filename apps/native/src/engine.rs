@@ -70,24 +70,27 @@ impl Engine {
         self.mode = Mode::Hosted;
         self._attach = None;
         let previous = self.host.take();
-        HOSTED.lock().unwrap().take();
+        // The first start may be under way already (`start_early`); a retry starts afresh.
+        let early = EARLY.lock().unwrap().take();
+        if early.is_none() {
+            HOSTED.lock().unwrap().take();
+        }
         cx.notify();
         self._task = Some(cx.spawn(async move |this, cx| {
             if let Some(old) = previous {
                 let _ = Tokio::spawn(cx, async move { old.shutdown().await }).await;
             }
-            // A Familiar from before the host lock (an older desktop app) runs without taking it: if something already
-            // serves our API port, attach instead of starting a second daemon on the same database.
-            let served = Tokio::spawn(cx, async {
-                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], api_port()));
-                tokio::time::timeout(Duration::from_millis(500), tokio::net::TcpStream::connect(addr)).await.is_ok_and(|c| c.is_ok())
-            });
-            if served.await.unwrap_or(false) {
+            let started = match early {
+                Some(task) => task.await.ok().flatten(),
+                None => {
+                    let handle = cx.update(|cx| Tokio::handle(cx));
+                    Tokio::spawn(cx, start(handle)).await.ok().flatten()
+                }
+            };
+            let Some(host) = started else {
                 let _ = this.update(cx, |e, cx| e.attach(cx));
                 return;
-            }
-            let handle = cx.update(|cx| Tokio::handle(cx));
-            let host = Host::start(handle);
+            };
             let mut boot = host.boot_watch();
             let _ = this.update(cx, |e, _| {
                 e.host = Some(host.clone());
@@ -185,6 +188,31 @@ impl Engine {
         }));
         false
     }
+}
+
+/// The first start, begun by [`start_early`] before the window opened: `None` means another Familiar serves the API.
+static EARLY: Mutex<Option<tokio::task::JoinHandle<Option<Host>>>> = Mutex::new(None);
+
+/// Begin starting the engine now, on `rt`, from `main` before the window opens: the built-in database then starts
+/// while the window is being created. The [`Engine`] picks the start up when it connects.
+pub fn start_early(rt: &tokio::runtime::Handle) {
+    *EARLY.lock().unwrap() = Some(rt.spawn(start(rt.clone())));
+}
+
+/// Host the engine, or `None` when something already serves our API port. A Familiar from before the host lock (an
+/// older desktop app) runs without taking it: then this window attaches instead of starting a second daemon on the
+/// same database. A listening loopback port accepts within microseconds, while a closed one makes Windows retry the
+/// connect for about a second: the short timeout keeps that wait off every start.
+async fn start(rt: tokio::runtime::Handle) -> Option<Host> {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], api_port()));
+    let served = tokio::time::timeout(Duration::from_millis(100), tokio::net::TcpStream::connect(addr)).await.is_ok_and(|c| c.is_ok());
+    if served {
+        return None;
+    }
+    let host = Host::start(rt);
+    // Drained by `main` even if no window ever takes it.
+    *HOSTED.lock().unwrap() = Some(host.clone());
+    Some(host)
 }
 
 /// Host mode: a token minted by the host, or `None` when no owner exists yet (first run). The API comes up and
