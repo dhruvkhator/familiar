@@ -281,6 +281,13 @@ impl BotSettings {
         }
     }
 
+    /// The page is on screen again: what went stale meanwhile is read afresh.
+    pub fn shown_again(&mut self, cx: &mut Context<Self>) {
+        if let Some(t) = self.triggers.clone() {
+            t.update(cx, |t, cx| t.shown_again(cx));
+        }
+    }
+
     /// Claude Code reported signed out (no plan check will come until it signs in).
     fn signed_out(&self) -> bool {
         self.catalog.as_ref().is_some_and(|c| c["claude"]["signed_in"] == false)

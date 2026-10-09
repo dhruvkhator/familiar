@@ -322,12 +322,18 @@ impl Shell {
             let shown = route == Route::Rules;
             p.update(cx, |p, cx| p.set_shown(shown, cx));
         }
-        // A teammate's page that leaves the screen wipes what it showed only once (a trigger's new address).
+        // A teammate's page that leaves the screen wipes what it showed only once (a trigger's new address) and lets
+        // notices only mark its tabs stale; one coming back reads what changed meanwhile.
         if let Route::Teammate(id) = self.route.current().clone()
             && route != Route::Teammate(id.clone())
             && let Some(page) = id.parse::<Uuid>().ok().and_then(|b| self.pages.get(&b).cloned())
         {
             page.update(cx, |p, cx| p.set_shown(false, cx));
+        }
+        if let Route::Teammate(id) = &route
+            && let Some(page) = id.parse::<Uuid>().ok().and_then(|b| self.pages.get(&b).cloned())
+        {
+            page.update(cx, |p, cx| p.set_shown(true, cx));
         }
         let shown = route.clone();
         if self.route.set(route) {

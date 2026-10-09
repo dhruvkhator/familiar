@@ -118,6 +118,8 @@ pub struct BotPage {
     computer_dismissed: bool,
     /// The live reply's caret: its run and when it first showed (the blink's phase).
     caret: Option<(Uuid, Instant)>,
+    /// The page is on screen (the shell says so).
+    on_screen: bool,
     setup: Entity<SetupCard>,
 }
 
@@ -186,6 +188,7 @@ impl BotPage {
             computer_open: false,
             computer_dismissed: false,
             caret: None,
+            on_screen: true,
             setup,
         };
         this.reload_threads(cx);
@@ -588,10 +591,23 @@ impl BotPage {
     }
 
     /// The shell shows or hides the page (it stays alive, cached): hidden, its Settings tab wipes what it showed only
-    /// once.
+    /// once and its tabs let notices only mark them stale; shown again, they read what changed meanwhile.
     pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
-        if !shown && let Some(s) = self.settings.clone() {
-            s.update(cx, |s, cx| s.hidden(cx));
+        if self.on_screen == shown {
+            return;
+        }
+        self.on_screen = shown;
+        if let Some(s) = self.settings.clone() {
+            s.update(cx, |s, cx| if shown { s.shown_again(cx) } else { s.hidden(cx) });
+        }
+        self.files_shown(cx);
+    }
+
+    /// The Files tab is on screen only while the page is and that tab is open (else its notices only mark it stale).
+    fn files_shown(&mut self, cx: &mut Context<Self>) {
+        let on = self.on_screen && self.tab == TAB_FILES;
+        if let Some(f) = self.files.clone() {
+            f.update(cx, |f, cx| f.set_shown(on, cx));
         }
     }
 
@@ -658,6 +674,7 @@ impl BotPage {
             }
             _ => {}
         }
+        self.files_shown(cx);
         cx.notify();
     }
 

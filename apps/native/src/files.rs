@@ -61,6 +61,9 @@ pub struct FilesTab {
     thumbs: HashMap<Uuid, Thumb>,
     /// Files being fetched to save or open.
     busy: HashSet<Uuid>,
+    /// The tab is on screen (its page shown, the Files tab open): notices refresh it, else mark it stale.
+    shown: bool,
+    stale: bool,
 }
 
 impl EventEmitter<OpenThread> for FilesTab {}
@@ -68,9 +71,9 @@ impl EventEmitter<OpenThread> for FilesTab {}
 impl FilesTab {
     pub fn new(data: Entity<AppData>, toasts: Entity<ToastStack>, bot: Uuid, cx: &mut Context<Self>) -> Self {
         cx.subscribe(&data, |this: &mut Self, _, ev: &DataEvent, cx| match ev {
-            DataEvent::Changed(None) => this.reload(cx),
+            DataEvent::Changed(None) => this.changed(cx),
             DataEvent::Changed(Some(n)) if n.t == "artifacts" && n.bot.as_deref().is_none_or(|b| b == this.bot.to_string()) => {
-                this.reload(cx)
+                this.changed(cx)
             }
             _ => {}
         })
@@ -85,6 +88,8 @@ impl FilesTab {
             threads: HashMap::new(),
             thumbs: HashMap::new(),
             busy: HashSet::new(),
+            shown: true,
+            stale: false,
         };
         this.reload(cx);
         this
@@ -97,6 +102,22 @@ impl FilesTab {
     fn toast(&self, tone: Tone, title: impl Into<SharedString>, body: Option<String>, cx: &mut Context<Self>) {
         let title = title.into();
         self.toasts.update(cx, |t, cx| t.push(tone, title, body.map(Into::into), cx));
+    }
+
+    /// The teammate's page shows or hides this tab: shown again, a list that went stale meanwhile is read afresh.
+    pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
+        self.shown = shown;
+        if shown && std::mem::take(&mut self.stale) {
+            self.reload(cx);
+        }
+    }
+
+    fn changed(&mut self, cx: &mut Context<Self>) {
+        if self.shown {
+            self.reload(cx);
+        } else {
+            self.stale = true;
+        }
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {

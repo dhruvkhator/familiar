@@ -44,6 +44,9 @@ enum Confirm {
     Delete,
 }
 
+/// Run notices refresh the list at most this often.
+const NOTICE_GAP: std::time::Duration = std::time::Duration::from_secs(3);
+
 pub struct BotTriggers {
     data: Entity<AppData>,
     toasts: Entity<ToastStack>,
@@ -57,6 +60,11 @@ pub struct BotTriggers {
     example: bool,
     confirm: Option<(Uuid, Confirm)>,
     busy: HashSet<Uuid>,
+    /// Its page is on screen: run notices refresh "last woke it" (else they mark the list stale).
+    shown: bool,
+    stale: bool,
+    /// A refresh waiting out [`NOTICE_GAP`].
+    reload_wait: Option<gpui::Task<()>>,
 }
 
 impl BotTriggers {
@@ -65,8 +73,8 @@ impl BotTriggers {
             // Triggers send no notices of their own; a run they started (or a resync) may have moved "last woke it".
             let mine = |n: &familiar_client::Notice| n.bot.as_deref().is_none_or(|b| b == this.bot.to_string());
             match ev {
-                crate::data::DataEvent::Changed(None) => this.reload(cx),
-                crate::data::DataEvent::Changed(Some(n)) if n.t == "runs" && mine(n) => this.reload(cx),
+                crate::data::DataEvent::Changed(None) => this.changed(cx),
+                crate::data::DataEvent::Changed(Some(n)) if n.t == "runs" && mine(n) => this.changed(cx),
                 _ => {}
             }
         })
@@ -83,6 +91,9 @@ impl BotTriggers {
             example: false,
             confirm: None,
             busy: HashSet::new(),
+            shown: true,
+            stale: false,
+            reload_wait: None,
         };
         this.reload(cx);
         this
@@ -99,10 +110,38 @@ impl BotTriggers {
 
     /// The page left the screen: the address shown once is wiped.
     pub fn hidden(&mut self, cx: &mut Context<Self>) {
+        self.shown = false;
+        self.reload_wait = None;
         if self.shown_once.take().is_some() {
             self.copied = false;
             self.example = false;
             cx.notify();
+        }
+    }
+
+    /// The page is on screen again: a list that went stale meanwhile is read afresh.
+    pub fn shown_again(&mut self, cx: &mut Context<Self>) {
+        self.shown = true;
+        if std::mem::take(&mut self.stale) {
+            self.reload(cx);
+        }
+    }
+
+    /// A run of this teammate changed (one a trigger started moves "last woke it"): while shown, refresh once the
+    /// notices pause ([`NOTICE_GAP`]: a working run sends many); hidden, only mark the list stale.
+    fn changed(&mut self, cx: &mut Context<Self>) {
+        if !self.shown {
+            self.stale = true;
+            return;
+        }
+        if self.reload_wait.is_none() {
+            self.reload_wait = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(NOTICE_GAP).await;
+                let _ = this.update(cx, |p, cx| {
+                    p.reload_wait = None;
+                    p.reload(cx);
+                });
+            }));
         }
     }
 
