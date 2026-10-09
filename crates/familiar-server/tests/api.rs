@@ -1447,3 +1447,448 @@ async fn models_come_from_the_newest_device() {
     let b = app.second().await;
     assert_eq!(app.get(&b.tok, "/api/models").await.1["claude"]["models"], json!([]), "owner-scoped");
 }
+
+// ------------------------------------------------------------------ CRM
+
+/// A CSV body (raw text, not JSON) to the import endpoint.
+async fn csv_post(app: &App, t: &str, path: &str, body: Vec<u8>) -> (u16, Value) {
+    let r = app.http.post(format!("{}{path}", app.base)).bearer_auth(t).header("content-type", "text/csv").body(body).send().await.unwrap();
+    let s = r.status().as_u16();
+    (s, serde_json::from_slice(&r.bytes().await.unwrap()).unwrap_or(Value::Null))
+}
+
+async fn csv_get(app: &App, t: &str, kind: &str) -> String {
+    let r = app.http.get(format!("{}/api/crm/export.csv?kind={kind}", app.base)).bearer_auth(t).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.headers()["content-type"].to_str().unwrap().starts_with("text/csv"));
+    r.text().await.unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crm_crud_and_dedupe() {
+    let app = app!();
+    let a = app.owner().await;
+    let t = &a.tok;
+
+    // companies: the same domain twice is one company (the second post updates it)
+    let c = app.ok_post(t, "/api/crm/companies", json!({"name": "Acme", "website": "https://www.Acme.com/pricing"}), 201).await;
+    assert_eq!((c["domain"].as_str(), c["name"].as_str()), (Some("acme.com"), Some("Acme")));
+    assert!(c.get("owner_id").is_none());
+    let cid = id(&c);
+    let c2 = app.ok_post(t, "/api/crm/companies", json!({"name": "Acme Inc", "domain": "ACME.com", "industry": "Rockets"}), 200).await;
+    assert_eq!((id(&c2), c2["name"].as_str(), c2["industry"].as_str()), (cid.clone(), Some("Acme Inc"), Some("Rockets")));
+    assert_eq!(len(&app.get(t, "/api/crm/companies").await.1), 1);
+    // no domain: matched by exact name (any case)
+    let n1 = app.ok_post(t, "/api/crm/companies", json!({"name": "Nameless Co"}), 201).await;
+    assert_eq!(id(&app.ok_post(t, "/api/crm/companies", json!({"name": "nameless co", "size": "10"}), 200).await), id(&n1));
+    assert_eq!(len(&app.get(t, "/api/crm/companies").await.1), 2);
+    // validation
+    for bad in [
+        json!({}), json!({"name": ""}), json!({"name": "x", "domain": "not a domain"}), json!({"name": "x", "website": "ftp://x.com"}),
+        json!({"name": "x", "fit_score": 101}), json!({"name": "x", "tags": (0..21).map(|i| format!("t{i}")).collect::<Vec<_>>()}),
+        json!({"name": "x", "source_urls": ["javascript:1"]}), json!({"name": "x".repeat(201)}), json!({"name": "x", "custom": [1]}),
+        json!({"name": 5}),
+    ] {
+        assert_eq!(app.post(t, "/api/crm/companies", bad.clone()).await.0, 400, "{bad}");
+    }
+    // get / patch
+    let (s, v) = app.patch(t, &format!("/api/crm/companies/{cid}"), json!({"fit_score": 80, "fit_reason": "ships weekly", "tags": ["ICP", "icp", " b2b "]})).await;
+    assert_eq!((s, v["fit_score"].clone(), v["tags"].clone()), (200, json!(80), json!(["ICP", "b2b"])));
+    assert_eq!(app.patch(t, &format!("/api/crm/companies/{cid}"), json!({"fit_score": -1})).await.0, 400);
+    assert_eq!(app.patch(t, &format!("/api/crm/companies/{}", Uuid::new_v4()), json!({"name": "x"})).await.0, 404);
+    assert_eq!(app.get(t, "/api/crm/companies/not-a-uuid").await.0, 400);
+    assert_eq!(app.get(t, "/api/crm/nothing").await.0, 404);
+    assert_eq!(app.get(t, &format!("/api/crm/activities/{}", Uuid::new_v4())).await.0, 404);
+    let (_, v) = app.patch(t, &format!("/api/crm/companies/{cid}"), json!({"industry": ""})).await;
+    assert_eq!(v["industry"], Value::Null, "an empty text clears the field");
+    // list: search, tag, sort, paging
+    assert_eq!(len(&app.get(t, "/api/crm/companies?q=acme").await.1), 1);
+    assert_eq!(len(&app.get(t, "/api/crm/companies?q=zzz").await.1), 0);
+    assert_eq!(len(&app.get(t, "/api/crm/companies?tag=B2B").await.1), 1);
+    let (_, l) = app.get(t, "/api/crm/companies?sort=name").await;
+    // (the upsert that matched by name also set the name as it was written)
+    assert_eq!((l[0]["name"].as_str(), l[1]["name"].as_str()), (Some("Acme Inc"), Some("nameless co")));
+    let (_, l) = app.get(t, "/api/crm/companies?sort=fit&limit=1").await;
+    assert_eq!((len(&l), id(&l[0])), (1, cid.clone()));
+    assert_eq!(len(&app.get(t, "/api/crm/companies?limit=1&offset=1").await.1), 1);
+    assert_eq!(app.get(t, "/api/crm/companies?sort=nope").await.0, 400);
+
+    // contacts: the same email in another case is one contact; rows carry the company's name
+    let p = app.ok_post(t, "/api/crm/contacts", json!({"name": "Sam", "email": " Sam@Acme.COM ", "company_id": cid, "x_handle": "@sam"}), 201).await;
+    assert_eq!((p["email"].as_str(), p["company_name"].as_str(), p["x_handle"].as_str()), (Some("sam@acme.com"), Some("Acme Inc"), Some("sam")));
+    let pid = id(&p);
+    let p2 = app.ok_post(t, "/api/crm/contacts", json!({"name": "Sam Smith", "email": "SAM@acme.com", "title": "CTO"}), 200).await;
+    assert_eq!((id(&p2), p2["title"].as_str(), p2["name"].as_str()), (pid.clone(), Some("CTO"), Some("Sam Smith")));
+    assert_eq!(len(&app.get(t, "/api/crm/contacts").await.1), 1);
+    // no email: matched by name + company
+    let q1 = app.ok_post(t, "/api/crm/contacts", json!({"name": "Pat", "company_id": cid}), 201).await;
+    assert_eq!(id(&app.ok_post(t, "/api/crm/contacts", json!({"name": "pat", "company_id": cid, "title": "VP"}), 200).await), id(&q1));
+    assert_ne!(id(&app.ok_post(t, "/api/crm/contacts", json!({"name": "Pat"}), 201).await), id(&q1), "no company = another contact");
+    for bad in [json!({"name": "x", "email": "nope"}), json!({"name": "x", "linkedin_url": "acme.com"}), json!({"email": "a@b.io"}), json!({"name": "x", "company_id": Uuid::new_v4()})] {
+        assert_eq!(app.post(t, "/api/crm/contacts", bad.clone()).await.0, 400, "{bad}");
+    }
+    assert_eq!(len(&app.get(t, &format!("/api/crm/contacts?company_id={cid}")).await.1), 2);
+    assert_eq!(len(&app.get(t, "/api/crm/contacts?q=acme").await.1), 2, "the search covers the company name");
+    assert_eq!(len(&app.get(t, "/api/crm/contacts?dnc=true").await.1), 0);
+    assert_eq!(app.patch(t, &format!("/api/crm/contacts/{pid}"), json!({"email": "pat@acme.com"})).await.0, 200);
+    let other = id(&app.ok_post(t, "/api/crm/contacts", json!({"name": "Other", "email": "other@acme.com"}), 201).await);
+    assert_eq!(app.patch(t, &format!("/api/crm/contacts/{other}"), json!({"email": "PAT@acme.com"})).await.0, 409, "email taken");
+
+    // deals
+    let d = app.ok_post(t, "/api/crm/deals", json!({"company_id": cid, "contact_id": pid, "title": "Pilot", "value_cents": 5000}), 201).await;
+    assert_eq!((d["stage"].as_str(), d["currency"].as_str(), d["company_name"].as_str(), d["contact_name"].as_str()), (Some("new"), Some("USD"), Some("Acme Inc"), Some("Sam Smith")));
+    let did = id(&d);
+    assert_eq!(id(&app.ok_post(t, "/api/crm/deals", json!({"company_id": cid, "title": "pilot", "currency": "eur"}), 200).await), did);
+    for bad in [
+        json!({"company_id": cid}), json!({"title": "x"}), json!({"company_id": cid, "title": "x", "stage": "nope"}),
+        json!({"company_id": cid, "title": "x", "value_cents": -1}), json!({"company_id": cid, "title": "x", "currency": "dollars"}),
+        json!({"company_id": Uuid::new_v4(), "title": "x"}), json!({"company_id": cid, "title": "x", "next_step": "y".repeat(501)}),
+    ] {
+        assert_eq!(app.post(t, "/api/crm/deals", bad.clone()).await.0, 400, "{bad}");
+    }
+    let (s, v) = app.patch(t, &format!("/api/crm/deals/{did}"), json!({"stage": "meeting", "next_step": "demo", "next_step_at": "2026-11-01T10:00:00Z"})).await;
+    assert_eq!((s, v["stage"].as_str(), v["next_step"].as_str()), (200, Some("meeting"), Some("demo")));
+    assert_eq!(len(&app.get(t, "/api/crm/deals?stage=meeting").await.1), 1);
+    assert_eq!(len(&app.get(t, "/api/crm/deals?stage=won").await.1), 0);
+    assert_eq!(app.get(t, "/api/crm/deals?stage=nope").await.0, 400);
+
+    // activities: a deal's timeline entry also shows on its company and contact
+    let act = app.ok_post(t, "/api/crm/activities", json!({"deal_id": did, "kind": "note", "summary": "Called", "body": "went well", "url": "https://x.io/1"}), 201).await;
+    assert_eq!((act["company_id"].as_str(), act["actor_kind"].as_str()), (Some(cid.as_str()), Some("user")));
+    assert_eq!(len(&app.get(t, &format!("/api/crm/activities?company_id={cid}")).await.1), 1);
+    assert_eq!(len(&app.get(t, &format!("/api/crm/activities?deal_id={did}")).await.1), 1);
+    assert_eq!(len(&app.get(t, &format!("/api/crm/activities?contact_id={}", Uuid::new_v4())).await.1), 0);
+    for bad in [
+        json!({"kind": "note", "summary": "x"}), json!({"deal_id": did, "kind": "sms", "summary": "x"}), json!({"deal_id": did, "kind": "note"}),
+        json!({"deal_id": did, "kind": "note", "summary": "x".repeat(501)}), json!({"deal_id": did, "kind": "note", "summary": "x", "body": "y".repeat(20_001)}),
+        json!({"deal_id": did, "kind": "note", "summary": "x", "url": "ftp://a"}), json!({"deal_id": Uuid::new_v4(), "kind": "note", "summary": "x"}),
+        json!({"deal_id": did, "kind": "note", "summary": "x", "approval_id": Uuid::new_v4()}),
+    ] {
+        assert_eq!(app.post(t, "/api/crm/activities", bad.clone()).await.0, 400, "{bad}");
+    }
+    // bodies are size-limited (the shared `Body` extractor answers an over-long one as a 400)
+    assert_eq!(app.post(t, "/api/crm/companies", json!({"name": "x", "description": "d".repeat(300_000)})).await.0, 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crm_soft_delete_hides_and_frees_keys() {
+    let app = app!();
+    let a = app.owner().await;
+    let t = &a.tok;
+    let c = id(&app.ok_post(t, "/api/crm/companies", json!({"name": "Acme", "domain": "acme.com"}), 201).await);
+    let p = id(&app.ok_post(t, "/api/crm/contacts", json!({"name": "Sam", "email": "sam@acme.com", "company_id": c}), 201).await);
+    let d = id(&app.ok_post(t, "/api/crm/deals", json!({"company_id": c, "title": "Pilot"}), 201).await);
+
+    assert_eq!(app.del(t, &format!("/api/crm/contacts/{p}")).await.0, 204);
+    assert_eq!(len(&app.get(t, "/api/crm/contacts").await.1), 0);
+    assert_eq!(app.get(t, &format!("/api/crm/contacts/{p}")).await.0, 404);
+    assert_eq!(app.del(t, &format!("/api/crm/contacts/{p}")).await.0, 404);
+    assert_eq!(app.patch(t, &format!("/api/crm/contacts/{p}"), json!({"title": "x"})).await.0, 404);
+    // the email is free again, and the old row stays in the table
+    let p2 = id(&app.ok_post(t, "/api/crm/contacts", json!({"name": "Sam again", "email": "sam@acme.com"}), 201).await);
+    assert_ne!(p, p2);
+    let gone: bool = sqlx::query_scalar("select deleted_at is not null from crm_contacts where id = $1").bind(p.parse::<Uuid>().unwrap()).fetch_one(&app.pool).await.unwrap();
+    assert!(gone);
+
+    // deleting a company hides its deals with it; the domain is free again
+    assert_eq!(len(&app.get(t, "/api/crm/deals").await.1), 1);
+    assert_eq!(app.del(t, &format!("/api/crm/companies/{c}")).await.0, 204);
+    assert_eq!(len(&app.get(t, "/api/crm/companies").await.1), 0);
+    assert_eq!(len(&app.get(t, "/api/crm/deals").await.1), 0);
+    assert_eq!(app.get(t, &format!("/api/crm/deals/{d}")).await.0, 404);
+    let pipe = app.get(t, "/api/crm/pipeline").await.1;
+    assert!(pipe.as_array().unwrap().iter().all(|s| s["count"] == 0));
+    let c2 = id(&app.ok_post(t, "/api/crm/companies", json!({"name": "Acme again", "domain": "acme.com"}), 201).await);
+    assert_ne!(c, c2);
+    // a deal can't be put on a deleted company
+    assert_eq!(app.post(t, "/api/crm/deals", json!({"company_id": c, "title": "x"})).await.0, 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crm_pipeline_counts_and_value() {
+    let app = app!();
+    let a = app.owner().await;
+    let t = &a.tok;
+    let c = id(&app.ok_post(t, "/api/crm/companies", json!({"name": "Acme"}), 201).await);
+    let p = id(&app.ok_post(t, "/api/crm/contacts", json!({"name": "Sam", "company_id": c}), 201).await);
+    let d1 = id(&app.ok_post(t, "/api/crm/deals", json!({"company_id": c, "title": "A", "value_cents": 1000, "contact_id": p, "next_step": "email"}), 201).await);
+    app.ok_post(t, "/api/crm/deals", json!({"company_id": c, "title": "B", "value_cents": 2500}), 201).await;
+    app.ok_post(t, "/api/crm/deals", json!({"company_id": c, "title": "C", "stage": "meeting", "value_cents": 4000}), 201).await;
+    app.ok_post(t, "/api/crm/deals", json!({"company_id": c, "title": "D", "stage": "meeting"}), 201).await;
+
+    let (s, pipe) = app.get(t, "/api/crm/pipeline").await;
+    assert_eq!(s, 200);
+    let stages: Vec<&str> = pipe.as_array().unwrap().iter().map(|s| s["stage"].as_str().unwrap()).collect();
+    assert_eq!(stages, ["new", "researching", "contacted", "replied", "meeting", "proposal", "won", "lost"]);
+    let by = |v: &Value, st: &str| v.as_array().unwrap().iter().find(|s| s["stage"] == st).unwrap().clone();
+    let new = by(&pipe, "new");
+    assert_eq!((new["count"].clone(), new["value_cents"].clone(), len(&new["deals"])), (json!(2), json!(3500), 2));
+    let meeting = by(&pipe, "meeting");
+    assert_eq!((meeting["count"].clone(), meeting["value_cents"].clone()), (json!(2), json!(4000)));
+    let card = new["deals"].as_array().unwrap().iter().find(|d| id(d) == d1).unwrap();
+    assert_eq!((card["title"].as_str(), card["company_name"].as_str(), card["contact_name"].as_str(), card["next_step"].as_str()), (Some("A"), Some("Acme"), Some("Sam"), Some("email")));
+    assert_eq!(by(&pipe, "won")["count"], 0);
+
+    // moving a deal changes both stages, and its stage_changed_at
+    let before = app.get(t, &format!("/api/crm/deals/{d1}")).await.1["stage_changed_at"].clone();
+    app.patch(t, &format!("/api/crm/deals/{d1}"), json!({"stage": "won"})).await;
+    let pipe = app.get(t, "/api/crm/pipeline").await.1;
+    assert_eq!((by(&pipe, "new")["count"].clone(), by(&pipe, "new")["value_cents"].clone()), (json!(1), json!(2500)));
+    assert_eq!((by(&pipe, "won")["count"].clone(), by(&pipe, "won")["value_cents"].clone()), (json!(1), json!(1000)));
+    assert_ne!(app.get(t, &format!("/api/crm/deals/{d1}")).await.1["stage_changed_at"], before);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crm_changes_and_undo() {
+    let app = app!();
+    let a = app.owner().await;
+    let t = &a.tok;
+    let c = id(&app.ok_post(t, "/api/crm/companies", json!({"name": "Acme", "domain": "acme.com"}), 201).await);
+    app.patch(t, &format!("/api/crm/companies/{c}"), json!({"name": "Acme Corp"})).await;
+    // an upsert that changes nothing writes nothing
+    app.ok_post(t, "/api/crm/companies", json!({"name": "Acme Corp", "domain": "acme.com"}), 200).await;
+
+    let (s, ch) = app.get(t, &format!("/api/crm/changes?entity=company&entity_id={c}")).await;
+    assert_eq!(s, 200);
+    assert_eq!(len(&ch), 2);
+    assert_eq!((ch[0]["op"].as_str(), ch[1]["op"].as_str()), (Some("update"), Some("create")));
+    assert_eq!((ch[0]["before"]["name"].as_str(), ch[0]["after"]["name"].as_str()), (Some("Acme"), Some("Acme Corp")));
+    assert_eq!((ch[0]["actor_kind"].as_str(), ch[1]["before"].clone()), (Some("user"), Value::Null));
+    assert_eq!(app.get(t, "/api/crm/changes?entity=nope").await.0, 400);
+    let (update, create) = (id(&ch[0]), id(&ch[1]));
+
+    // only the newest change can be undone
+    assert_eq!(app.post(t, &format!("/api/crm/changes/{create}/undo"), json!({})).await.0, 409);
+    let u = app.ok_post(t, &format!("/api/crm/changes/{update}/undo"), json!({}), 200).await;
+    assert_eq!((u["op"].as_str(), u["entity_id"].as_str()), (Some("undo"), Some(c.as_str())));
+    assert_eq!(app.get(t, &format!("/api/crm/companies/{c}")).await.1["name"], "Acme");
+    assert_eq!(app.post(t, &format!("/api/crm/changes/{update}/undo"), json!({})).await.0, 409, "already undone");
+    assert_eq!(app.post(t, &format!("/api/crm/changes/{}/undo", id(&u)), json!({})).await.0, 409, "an undo is not undone");
+    assert_eq!(app.post(t, &format!("/api/crm/changes/{}/undo", Uuid::new_v4()), json!({})).await.0, 404);
+    assert_eq!(len(&app.get(t, &format!("/api/crm/changes?entity_id={c}")).await.1), 3);
+    // ... and now the create is the newest: undoing it removes the company
+    app.ok_post(t, &format!("/api/crm/changes/{create}/undo"), json!({}), 200).await;
+    assert_eq!(app.get(t, &format!("/api/crm/companies/{c}")).await.0, 404);
+
+    // delete -> undo brings it back
+    let c2 = id(&app.ok_post(t, "/api/crm/companies", json!({"name": "Beta", "domain": "beta.io"}), 201).await);
+    assert_eq!(app.del(t, &format!("/api/crm/companies/{c2}")).await.0, 204);
+    let (_, ch) = app.get(t, &format!("/api/crm/changes?entity_id={c2}&limit=1")).await;
+    assert_eq!(ch[0]["op"], "delete");
+    app.ok_post(t, &format!("/api/crm/changes/{}/undo", id(&ch[0])), json!({}), 200).await;
+    assert_eq!(app.get(t, &format!("/api/crm/companies/{c2}")).await.1["domain"], "beta.io");
+    // delete again, take the domain with a new company: the undo can't restore it (409), nothing changed
+    assert_eq!(app.del(t, &format!("/api/crm/companies/{c2}")).await.0, 204);
+    app.ok_post(t, "/api/crm/companies", json!({"name": "Beta 2", "domain": "beta.io"}), 201).await;
+    let (_, ch) = app.get(t, &format!("/api/crm/changes?entity_id={c2}&limit=1")).await;
+    assert_eq!(app.post(t, &format!("/api/crm/changes/{}/undo", id(&ch[0])), json!({})).await.0, 409);
+    assert_eq!(app.get(t, &format!("/api/crm/companies/{c2}")).await.0, 404);
+
+    // undo of a contact update restores every field it replaced; of a deal create hides the deal
+    let p = id(&app.ok_post(t, "/api/crm/contacts", json!({"name": "Sam", "email": "sam@x.io", "tags": ["a"]}), 201).await);
+    app.patch(t, &format!("/api/crm/contacts/{p}"), json!({"name": "Samuel", "tags": ["b"], "title": "CEO"})).await;
+    let (_, ch) = app.get(t, &format!("/api/crm/changes?entity=contact&entity_id={p}&limit=1")).await;
+    app.ok_post(t, &format!("/api/crm/changes/{}/undo", id(&ch[0])), json!({}), 200).await;
+    let r = app.get(t, &format!("/api/crm/contacts/{p}")).await.1;
+    assert_eq!((r["name"].clone(), r["tags"].clone(), r["title"].clone()), (json!("Sam"), json!(["a"]), Value::Null));
+    let c3 = id(&app.ok_post(t, "/api/crm/companies", json!({"name": "Gamma"}), 201).await);
+    let d = id(&app.ok_post(t, "/api/crm/deals", json!({"company_id": c3, "title": "Big"}), 201).await);
+    let (_, ch) = app.get(t, &format!("/api/crm/changes?entity=deal&entity_id={d}")).await;
+    app.ok_post(t, &format!("/api/crm/changes/{}/undo", id(&ch[0])), json!({}), 200).await;
+    assert_eq!(app.get(t, &format!("/api/crm/deals/{d}")).await.0, 404);
+    // timeline entries are not undone
+    let act = app.ok_post(t, "/api/crm/activities", json!({"company_id": c3, "kind": "note", "summary": "x"}), 201).await;
+    let (_, ch) = app.get(t, &format!("/api/crm/changes?entity=activity&entity_id={}", id(&act))).await;
+    assert_eq!(len(&ch), 1);
+    assert_eq!(app.post(t, &format!("/api/crm/changes/{}/undo", id(&ch[0])), json!({})).await.0, 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crm_teammate_writes_and_do_not_contact() {
+    use familiar_core::{
+        crm::{self, ActivityFilters, Actor, ChangeFilters, CompanyInput, ContactInput, DealInput},
+        db::Db,
+    };
+    let app = app!();
+    let a = app.owner().await;
+    let t = &a.tok;
+    let bot = app.bot(t, "Scout").await;
+    let (_, run) = app.chat(t, &bot, "go").await;
+    let run_id = id(&run);
+    let db = Db { pool: app.pool.clone(), owner: a.id };
+    let who = Actor::Bot { bot: bot.parse().unwrap(), run: Some(uid(&run)) };
+
+    let (co, created) = crm::upsert_company(&db, &who, &CompanyInput { name: Some("Acme".into()), domain: Some("https://acme.com".into()), ..Default::default() }).await.unwrap();
+    assert!(created);
+    assert_eq!(co["created_by_bot"].as_str(), Some(bot.as_str()));
+    let cid = uid(&co);
+    let (p, _) = crm::upsert_contact(&db, &who, &ContactInput { name: Some("Sam".into()), email: Some("sam@acme.com".into()), company_id: Some(cid), ..Default::default() }).await.unwrap();
+    let pid = uid(&p);
+    // the change log says who (and in which run)
+    let ch = crm::changes(&db, &ChangeFilters { bot_id: Some(bot.parse().unwrap()), ..Default::default() }, None).await.unwrap();
+    assert_eq!(ch.len(), 2);
+    assert_eq!((ch[0]["actor_kind"].as_str(), ch[0]["bot_name"].as_str(), ch[0]["run_id"].as_str()), (Some("bot"), Some("Scout"), Some(run_id.as_str())));
+
+    // anyone can set do-not-contact; only the owner can clear it
+    let dnc = |v: bool| ContactInput { do_not_contact: Some(v), dnc_reason: v.then(|| "asked to stop".to_string()), ..Default::default() };
+    let r = crm::patch_contact(&db, &who, pid, &dnc(true)).await.unwrap();
+    assert_eq!((r["do_not_contact"].clone(), r["dnc_reason"].as_str(), r["dnc_at"].is_string()), (json!(true), Some("asked to stop"), true));
+    let err = crm::patch_contact(&db, &who, pid, &dnc(false)).await.unwrap_err();
+    assert!(matches!(err, crm::CrmError::Forbidden(_)), "{err:?}");
+    let err = crm::upsert_contact(&db, &who, &ContactInput { email: Some("sam@acme.com".into()), do_not_contact: Some(false), ..Default::default() }).await.unwrap_err();
+    assert!(matches!(err, crm::CrmError::Forbidden(_)), "{err:?}");
+    assert_eq!(app.get(t, &format!("/api/crm/contacts/{pid}")).await.1["do_not_contact"], true);
+    assert_eq!(len(&app.get(t, "/api/crm/contacts?dnc=true").await.1), 1);
+    let (s, v) = app.patch(t, &format!("/api/crm/contacts/{pid}"), json!({"do_not_contact": false})).await;
+    assert_eq!((s, v["do_not_contact"].clone(), v["dnc_at"].clone()), (200, json!(false), Value::Null));
+
+    // moving a deal logs a stage_change activity by the teammate
+    let (d, _) = crm::upsert_deal(&db, &who, &DealInput { company_id: Some(cid), contact_id: Some(pid), title: Some("Pilot".into()), ..Default::default() }).await.unwrap();
+    let did = uid(&d);
+    let moved = crm::move_deal(&db, &who, did, "contacted", Some("sent the intro")).await.unwrap();
+    assert_eq!(moved["stage"], "contacted");
+    let of_deal = ActivityFilters { deal_id: Some(did), ..Default::default() };
+    let acts = crm::activities(&db, &of_deal, None, None).await.unwrap();
+    assert_eq!(acts.len(), 1);
+    assert_eq!((acts[0]["kind"].as_str(), acts[0]["body"].as_str(), acts[0]["actor_kind"].as_str(), acts[0]["bot_name"].as_str()), (Some("stage_change"), Some("sent the intro"), Some("bot"), Some("Scout")));
+    assert_eq!((acts[0]["company_id"].as_str(), acts[0]["contact_id"].as_str()), (Some(cid.to_string().as_str()), Some(pid.to_string().as_str())));
+    // the same stage again does nothing
+    crm::move_deal(&db, &who, did, "contacted", None).await.unwrap();
+    assert_eq!(crm::activities(&db, &of_deal, None, None).await.unwrap().len(), 1);
+    assert!(matches!(crm::move_deal(&db, &who, did, "limbo", None).await, Err(crm::CrmError::Invalid(_))));
+    assert!(matches!(crm::move_deal(&db, &who, Uuid::new_v4(), "won", None).await, Err(crm::CrmError::NotFound)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crm_csv_export_import() {
+    let app = app!();
+    let a = app.owner().await;
+    let t = &a.tok;
+    let evil = "=HYPERLINK(\"http://evil\",\"x\")";
+    let c = id(&app.ok_post(t, "/api/crm/companies", json!({"name": evil, "domain": "acme.com", "description": "line one\nline, two \"quoted\"", "fit_score": 70, "tags": ["a", "b"], "source_urls": ["https://x.io/1", "https://x.io/2"]}), 201).await);
+    app.ok_post(t, "/api/crm/companies", json!({"name": "Beta"}), 201).await;
+    let p = id(&app.ok_post(t, "/api/crm/contacts", json!({"name": "+Sam", "email": "sam@acme.com", "company_id": c, "notes": "@home", "do_not_contact": true, "dnc_reason": "said stop"}), 201).await);
+    app.ok_post(t, "/api/crm/contacts", json!({"name": "Pat"}), 201).await;
+    app.ok_post(t, "/api/crm/deals", json!({"company_id": c, "contact_id": p, "title": "-Pilot", "value_cents": 1234, "stage": "meeting", "next_step_at": "2026-11-01T10:00:00Z"}), 201).await;
+    app.ok_post(t, "/api/crm/deals", json!({"company_id": c, "title": "Second"}), 201).await;
+
+    for kind in ["companies", "contacts", "deals"] {
+        let csv = csv_get(&app, t, kind).await;
+        assert!(csv.starts_with("name,") || csv.starts_with("title,"), "{csv}");
+        // formulas are neutralised
+        for line in csv.split("\r\n") {
+            assert!(!line.starts_with(['=', '+', '@']), "{line}");
+        }
+        // an export reads back as a dry run that creates nothing, changes nothing
+        let (s, r) = csv_post(&app, t, &format!("/api/crm/import?kind={kind}&dry_run=true"), csv.clone().into_bytes()).await;
+        assert_eq!(s, 200, "{kind}: {r}");
+        assert_eq!((r["created"].clone(), r["updated"].clone(), r["skipped"].clone(), r["errors"].clone()), (json!(0), json!(0), json!(2), json!([])), "{kind}: {r}");
+        // ... and so does the real thing
+        let (_, r) = csv_post(&app, t, &format!("/api/crm/import?kind={kind}"), csv.into_bytes()).await;
+        assert_eq!((r["created"].clone(), r["updated"].clone()), (json!(0), json!(0)), "{kind}: {r}");
+    }
+    assert!(csv_get(&app, t, "companies").await.contains("'=HYPERLINK("));
+    assert_eq!(app.get(t, &format!("/api/crm/companies/{c}")).await.1["name"], evil);
+    assert_eq!(len(&app.get(t, "/api/crm/changes?limit=200").await.1), 6, "an import that changes nothing writes nothing");
+
+    // a mixed file: one new, one update, one unchanged, one blank, two bad rows; a dry run first
+    let csv = "Name,Domain,Fit Score,Tags,ignored\r\nNew Co,new.io,50,x; y,zzz\r\nAcme Renamed,acme.com,71,,\r\nBeta,,,,\r\nBad,bad.io,lots,,\r\n,,,,\r\nNot A Domain,nope,,,\r\n";
+    let (s, r) = csv_post(&app, t, "/api/crm/import?kind=companies&dry_run=true", csv.as_bytes().to_vec()).await;
+    assert_eq!((s, r["created"].clone(), r["updated"].clone(), r["skipped"].clone()), (200, json!(1), json!(1), json!(2)), "{r}");
+    let errs: Vec<(i64, String)> = r["errors"].as_array().unwrap().iter().map(|e| (e["row"].as_i64().unwrap(), e["message"].as_str().unwrap().to_string())).collect();
+    assert_eq!(errs.iter().map(|e| e.0).collect::<Vec<_>>(), [5, 7]);
+    assert!(errs[0].1.contains("fit_score"), "{errs:?}");
+    assert_eq!(len(&app.get(t, "/api/crm/companies").await.1), 2, "a dry run changes nothing");
+    assert_eq!(app.get(t, &format!("/api/crm/companies/{c}")).await.1["fit_score"], 70);
+    let (_, r) = csv_post(&app, t, "/api/crm/import?kind=companies&dry_run=false", csv.as_bytes().to_vec()).await;
+    assert_eq!((r["created"].clone(), r["updated"].clone(), r["skipped"].clone(), len(&r["errors"])), (json!(1), json!(1), json!(2), 2));
+    assert_eq!(len(&app.get(t, "/api/crm/companies").await.1), 3);
+    assert_eq!(app.get(t, &format!("/api/crm/companies/{c}")).await.1["fit_score"], 71);
+    assert_eq!(app.get(t, "/api/crm/companies?q=new.io").await.1[0]["tags"], json!(["x", "y"]));
+
+    // contacts and deals name their company; one that doesn't exist yet is created
+    let csv = "name,email,company,company_domain\r\nZed,zed@omega.io,Omega,omega.io\r\nSam Again,sam@acme.com,,acme.com\r\n";
+    let (_, r) = csv_post(&app, t, "/api/crm/import?kind=contacts", csv.as_bytes().to_vec()).await;
+    assert_eq!((r["created"].clone(), r["updated"].clone(), len(&r["errors"])), (json!(1), json!(1), 0), "{r}");
+    assert_eq!(app.get(t, "/api/crm/companies?q=omega").await.1[0]["domain"], "omega.io");
+    let csv = "title,company,stage,value_cents,contact_email\r\nNew deal,Omega,proposal,900,zed@omega.io\r\nBad stage,Omega,limbo,,\r\nNo contact,Omega,,,ghost@omega.io\r\n";
+    let (_, r) = csv_post(&app, t, "/api/crm/import?kind=deals", csv.as_bytes().to_vec()).await;
+    assert_eq!((r["created"].clone(), len(&r["errors"])), (json!(1), 2), "{r}");
+    assert_eq!(app.get(t, "/api/crm/deals?stage=proposal").await.1[0]["contact_name"], "Zed");
+
+    // limits and bad files
+    let big = format!("name\r\n{}", "a\r\n".repeat(5001));
+    assert_eq!(csv_post(&app, t, "/api/crm/import?kind=companies&dry_run=true", big.into_bytes()).await.0, 400);
+    let ok = format!("name\r\n{}", "b\r\n".repeat(5000));
+    let (s, r) = csv_post(&app, t, "/api/crm/import?kind=companies&dry_run=true", ok.into_bytes()).await;
+    assert_eq!((s, r["created"].clone()), (200, json!(1)), "5000 rows is fine (all the same company here)");
+    assert_eq!(csv_post(&app, t, "/api/crm/import?kind=companies", format!("name\r\n{}", "x".repeat(5 * 1024 * 1024 + 10)).into_bytes()).await.0, 400);
+    for (q, body) in [
+        ("kind=companies", b"".to_vec()), ("kind=companies", b"domain\r\nacme.com\r\n".to_vec()), ("kind=deals", b"title\r\nx\r\n".to_vec()),
+        ("kind=companies", b"name\r\n\"oops\r\n".to_vec()), ("kind=companies", vec![0xff, 0xfe, 0x41]), ("kind=nope", b"name\r\n".to_vec()),
+        ("kind=activities", b"name\r\n".to_vec()), ("", b"name\r\n".to_vec()),
+    ] {
+        assert_eq!(csv_post(&app, t, &format!("/api/crm/import?{q}"), body.clone()).await.0, 400, "{q} {}", String::from_utf8_lossy(&body));
+    }
+    assert_eq!(app.http.get(format!("{}/api/crm/export.csv?kind=nope", app.base)).bearer_auth(t).send().await.unwrap().status(), 400);
+    assert_eq!(app.http.get(format!("{}/api/crm/export.csv?kind=companies", app.base)).send().await.unwrap().status(), 401);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crm_second_user_sees_nothing() {
+    let app = app!();
+    let a = app.owner().await;
+    let ta = &a.tok;
+    let b = app.second().await;
+    let tb = &b.tok;
+
+    let c = id(&app.ok_post(ta, "/api/crm/companies", json!({"name": "Private Co", "domain": "private.io"}), 201).await);
+    let p = id(&app.ok_post(ta, "/api/crm/contacts", json!({"name": "Sam", "email": "sam@private.io", "company_id": c}), 201).await);
+    let d = id(&app.ok_post(ta, "/api/crm/deals", json!({"company_id": c, "contact_id": p, "title": "Secret", "value_cents": 99}), 201).await);
+    let act = id(&app.ok_post(ta, "/api/crm/activities", json!({"deal_id": d, "kind": "note", "summary": "hush"}), 201).await);
+    let (_, ch) = app.get(ta, &format!("/api/crm/changes?entity_id={c}")).await;
+    let change = id(&ch[0]);
+
+    for path in ["/api/crm/companies", "/api/crm/contacts", "/api/crm/deals", "/api/crm/activities", "/api/crm/changes"] {
+        assert_eq!(len(&app.get(tb, path).await.1), 0, "{path}");
+    }
+    for q in [format!("/api/crm/activities?deal_id={d}"), format!("/api/crm/activities?company_id={c}"), format!("/api/crm/changes?entity_id={c}"), "/api/crm/companies?q=private".into()] {
+        assert_eq!(len(&app.get(tb, &q).await.1), 0, "{q}");
+    }
+    let pipe = app.get(tb, "/api/crm/pipeline").await.1;
+    assert!(pipe.as_array().unwrap().iter().all(|s| s["count"] == 0 && s["value_cents"] == 0 && len(&s["deals"]) == 0));
+    for (m, path, body) in [
+        (Method::GET, format!("/api/crm/companies/{c}"), None),
+        (Method::PATCH, format!("/api/crm/companies/{c}"), Some(json!({"name": "pwned"}))),
+        (Method::DELETE, format!("/api/crm/companies/{c}"), None),
+        (Method::GET, format!("/api/crm/contacts/{p}"), None),
+        (Method::PATCH, format!("/api/crm/contacts/{p}"), Some(json!({"do_not_contact": true}))),
+        (Method::DELETE, format!("/api/crm/contacts/{p}"), None),
+        (Method::GET, format!("/api/crm/deals/{d}"), None),
+        (Method::PATCH, format!("/api/crm/deals/{d}"), Some(json!({"stage": "won"}))),
+        (Method::DELETE, format!("/api/crm/deals/{d}"), None),
+        (Method::POST, format!("/api/crm/changes/{change}/undo"), Some(json!({}))),
+    ] {
+        let (s, v) = app.call(m.clone(), &path, Some(tb), body).await;
+        assert_eq!(s, 404, "{m} {path} -> {v}");
+    }
+    // B can't hang its own records on A's
+    assert_eq!(app.post(tb, "/api/crm/contacts", json!({"name": "x", "company_id": c})).await.0, 400);
+    assert_eq!(app.post(tb, "/api/crm/deals", json!({"title": "x", "company_id": c})).await.0, 400);
+    assert_eq!(app.post(tb, "/api/crm/activities", json!({"kind": "note", "summary": "x", "deal_id": d})).await.0, 400);
+    assert_eq!(app.post(tb, "/api/crm/activities", json!({"kind": "note", "summary": "x", "company_id": c})).await.0, 400);
+    // the same domain and email are free for B; B's export has none of A's data; A's export, imported by B, matches B's own
+    app.ok_post(tb, "/api/crm/companies", json!({"name": "Mine", "domain": "private.io"}), 201).await;
+    app.ok_post(tb, "/api/crm/contacts", json!({"name": "Sam B", "email": "sam@private.io"}), 201).await;
+    assert!(!csv_get(&app, tb, "companies").await.contains("Private Co"));
+    let theirs = csv_get(&app, ta, "contacts").await;
+    let (_, r) = csv_post(&app, tb, "/api/crm/import?kind=contacts&dry_run=true", theirs.into_bytes()).await;
+    assert_eq!((r["created"].clone(), r["updated"].clone()), (json!(0), json!(1)), "{r}");
+
+    // ... and none of it changed for A
+    assert_eq!(app.get(ta, &format!("/api/crm/companies/{c}")).await.1["name"], "Private Co");
+    assert_eq!(app.get(ta, &format!("/api/crm/contacts/{p}")).await.1["do_not_contact"], false);
+    assert_eq!(app.get(ta, &format!("/api/crm/deals/{d}")).await.1["stage"], "new");
+    assert_eq!(len(&app.get(ta, &format!("/api/crm/activities?company_id={c}")).await.1), 1);
+    assert_eq!(id(&app.get(ta, &format!("/api/crm/activities?deal_id={d}")).await.1[0]), act);
+}
