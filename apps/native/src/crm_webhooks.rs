@@ -13,10 +13,11 @@ use familiar_ui::theme::{RADIUS_CARD, RADIUS_CONTROL, Theme, Tone, text};
 use familiar_ui::toast::ToastStack;
 use gpui::{
     AnyElement, ClipboardItem, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Task, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_base::input::{InputEvent, InputState};
 use gpui_tokio::Tokio;
+use zeroize::Zeroizing;
 use uuid::Uuid;
 
 use crate::bot_settings::checkbox;
@@ -37,8 +38,8 @@ pub struct CrmWebhooks {
     hooks: Option<Vec<CrmWebhook>>,
     error: Option<String>,
     adding: Option<Adding>,
-    /// The new webhook's signing secret: shown until "I've saved it".
-    secret: Option<(Uuid, String)>,
+    /// The new webhook's signing secret: shown until "I've saved it" or Settings is left (wiped from memory then).
+    secret: Option<(Uuid, Zeroizing<String>)>,
     copied: bool,
     /// The webhook whose deliveries are open.
     open: Option<Uuid>,
@@ -48,13 +49,21 @@ pub struct CrmWebhooks {
     confirm_delete: Option<Uuid>,
     busy: HashSet<Uuid>,
     saving: bool,
+    /// Settings is on screen: delivery notices refresh the list (else they mark it stale).
+    shown: bool,
+    stale: bool,
+    /// A refresh waiting out [`NOTICE_GAP`].
+    reload_wait: Option<Task<()>>,
 }
+
+/// Delivery notices refresh the list at most this often.
+const NOTICE_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl CrmWebhooks {
     pub fn new(data: Entity<AppData>, toasts: Entity<ToastStack>, cx: &mut Context<Self>) -> Self {
         cx.subscribe(&data, |this: &mut Self, _, ev: &DataEvent, cx| match ev {
-            DataEvent::Changed(None) => this.reload(cx),
-            DataEvent::Changed(Some(n)) if n.t == "crm_webhook_deliveries" => this.reload(cx),
+            DataEvent::Changed(None) => this.changed(cx),
+            DataEvent::Changed(Some(n)) if n.t == "crm_webhook_deliveries" => this.changed(cx),
             _ => {}
         })
         .detach();
@@ -72,9 +81,42 @@ impl CrmWebhooks {
             confirm_delete: None,
             busy: HashSet::new(),
             saving: false,
+            shown: true,
+            stale: false,
+            reload_wait: None,
         };
         this.reload(cx);
         this
+    }
+
+    /// Settings shows or hides this section: hidden, notices only mark it stale and the shown-once secret is wiped.
+    pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
+        self.shown = shown;
+        if !shown {
+            self.secret = None;
+            self.copied = false;
+            self.reload_wait = None;
+        } else if std::mem::take(&mut self.stale) {
+            self.reload(cx);
+        }
+        cx.notify();
+    }
+
+    /// A delivery changed: refresh once the notices pause ([`NOTICE_GAP`]).
+    fn changed(&mut self, cx: &mut Context<Self>) {
+        if !self.shown {
+            self.stale = true;
+            return;
+        }
+        if self.reload_wait.is_none() {
+            self.reload_wait = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(NOTICE_GAP).await;
+                let _ = this.update(cx, |p, cx| {
+                    p.reload_wait = None;
+                    p.reload(cx);
+                });
+            }));
+        }
     }
 
     fn client(&self, cx: &gpui::App) -> familiar_client::Client {
@@ -176,7 +218,7 @@ impl CrmWebhooks {
                         p.adding = None;
                         p.copied = false;
                         if let Some(s) = w.secret.clone() {
-                            p.secret = Some((w.id, s));
+                            p.secret = Some((w.id, Zeroizing::new(s)));
                         }
                         p.toast(Tone::Ok, "Webhook added", None, cx);
                         p.reload(cx);
@@ -223,6 +265,10 @@ impl CrmWebhooks {
     }
 
     fn toggle(&mut self, w: &CrmWebhook, on: bool, cx: &mut Context<Self>) {
+        // A call for it is on its way: flipping the switch now would show a state never sent.
+        if self.busy.contains(&w.id) {
+            return;
+        }
         let client = self.client(cx);
         let id = w.id;
         if let Some(h) = self.hooks.as_mut().and_then(|l| l.iter_mut().find(|x| x.id == id)) {
@@ -273,7 +319,7 @@ impl CrmWebhooks {
     fn secret_view(&self, secret: &str, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let (copy, done) = (cx.entity(), cx.entity());
-        let s = secret.to_owned();
+        let s = Zeroizing::new(secret.to_owned());
         div()
             .flex()
             .flex_col()
@@ -319,7 +365,7 @@ impl CrmWebhooks {
                             .size(ButtonSize::Small)
                             .icon(if self.copied { icons::CHECK } else { icons::COPY })
                             .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(s.clone()));
+                                cx.write_to_clipboard(ClipboardItem::new_string(s.to_string()));
                                 copy.update(cx, |p, cx| {
                                     p.copied = true;
                                     cx.notify()

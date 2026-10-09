@@ -53,8 +53,14 @@ const ACT_PAGE: u32 = 100;
 const ROW_H: f32 = 52.0;
 /// Cards per board column before "Show more".
 const BOARD_PAGE: usize = 25;
-/// A refresh asked for during a refresh runs this long after it.
-const REFRESH_GAP: Duration = Duration::from_millis(700);
+/// A re-paging asked for during a re-paging runs this long after it.
+const REFRESH_GAP: Duration = Duration::from_millis(2500);
+/// Change notices are gathered this long, then the changed rows are read (one request each).
+const NOTICE_BATCH: Duration = Duration::from_millis(300);
+/// The board and the activity list are re-read at most this often while records change.
+const AGGREGATE_GAP: Duration = Duration::from_millis(1500);
+/// A row the owner just saved here: its own stream notice within this long needs no second read.
+const SAVED_QUIET: Duration = Duration::from_secs(3);
 /// How long "Deleted … · Undo" stays.
 const UNDO_FOR: Duration = Duration::from_secs(12);
 
@@ -114,23 +120,106 @@ struct OpenMenu {
     cursor: usize,
 }
 
-/// A row with an id (a list is de-duplicated by it after paging).
-trait Row {
+/// A row of one of the paged lists: its id (a list is de-duplicated by it after paging), and how a fresh copy of it
+/// (or `None`: it is gone) goes into the page's list.
+trait Row: Sized {
     fn row_id(&self) -> Uuid;
+    fn put(page: &mut CrmPage, id: Uuid, fresh: Option<Self>);
 }
+
+/// `a` comes before `b` in a list sorted by `sort`, as the API orders it (ties by id).
+fn company_before(sort: &'static str) -> impl Fn(&CrmCompany, &CrmCompany) -> bool {
+    move |a, b| match sort {
+        "name" => (a.name.to_lowercase(), a.id) < (b.name.to_lowercase(), b.id),
+        "fit" => (a.fit_score.is_none(), std::cmp::Reverse(a.fit_score), a.id) < (b.fit_score.is_none(), std::cmp::Reverse(b.fit_score), b.id),
+        _ => (std::cmp::Reverse(a.updated_at), a.id) < (std::cmp::Reverse(b.updated_at), b.id),
+    }
+}
+
 impl Row for CrmCompany {
     fn row_id(&self) -> Uuid {
         self.id
     }
+    fn put(p: &mut CrmPage, id: Uuid, fresh: Option<Self>) {
+        if p.companies.key.is_none() {
+            return;
+        }
+        // Contacts and deals show their company's name.
+        if let Some(c) = &fresh {
+            for ct in p.contacts.rows.iter_mut().filter(|x| x.company_id == Some(c.id)) {
+                ct.company_name = Some(c.name.clone());
+                ct.company_domain = c.domain.clone();
+            }
+            for d in p.deals.rows.iter_mut().filter(|x| x.company_id == c.id) {
+                d.company_name = Some(c.name.clone());
+                d.company_domain = c.domain.clone();
+            }
+        }
+        let (q, tag) = (p.q.clone(), p.tag.clone());
+        let change = model::upsert(
+            &mut p.companies.rows,
+            id,
+            fresh,
+            |c| c.id,
+            |c| model::company_matches(c, &q, tag.as_deref()),
+            company_before(p.sort_companies),
+        );
+        CrmPage::count(&mut p.company_total, p.companies.unfiltered, change);
+    }
 }
+
 impl Row for CrmContact {
     fn row_id(&self) -> Uuid {
         self.id
     }
+    fn put(p: &mut CrmPage, id: Uuid, fresh: Option<Self>) {
+        if p.contacts.key.is_none() {
+            return;
+        }
+        // Deals show their contact's name and whether they opted out.
+        if let Some(c) = &fresh {
+            for d in p.deals.rows.iter_mut().filter(|x| x.contact_id == Some(c.id)) {
+                d.contact_name = Some(c.name.clone());
+                d.contact_email = c.email.clone();
+                d.contact_do_not_contact = c.do_not_contact;
+            }
+        }
+        let (q, tag, dnc, sort) = (p.q.clone(), p.tag.clone(), p.dnc, p.sort_contacts);
+        let change = model::upsert(
+            &mut p.contacts.rows,
+            id,
+            fresh,
+            |c| c.id,
+            |c| model::contact_matches(c, &q, tag.as_deref(), dnc),
+            move |a: &CrmContact, b: &CrmContact| match sort {
+                "name" => (a.name.to_lowercase(), a.id) < (b.name.to_lowercase(), b.id),
+                _ => (std::cmp::Reverse(a.updated_at), a.id) < (std::cmp::Reverse(b.updated_at), b.id),
+            },
+        );
+        CrmPage::count(&mut p.contact_total, p.contacts.unfiltered, change);
+    }
 }
+
 impl Row for CrmDeal {
     fn row_id(&self) -> Uuid {
         self.id
+    }
+    fn put(p: &mut CrmPage, id: Uuid, fresh: Option<Self>) {
+        if p.deals.key.is_none() {
+            return;
+        }
+        let (q, stage, sort) = (p.q.clone(), p.stage, p.sort_deals);
+        model::upsert(
+            &mut p.deals.rows,
+            id,
+            fresh,
+            |d| d.id,
+            |d| model::deal_matches(d, &q, stage),
+            move |a: &CrmDeal, b: &CrmDeal| match sort {
+                "name" => (a.title.to_lowercase(), a.id) < (b.title.to_lowercase(), b.id),
+                _ => (std::cmp::Reverse(a.updated_at), a.id) < (std::cmp::Reverse(b.updated_at), b.id),
+            },
+        );
     }
 }
 
@@ -223,7 +312,7 @@ pub struct CrmPage {
     contacts: Listing<CrmContact>,
     deals: Listing<CrmDeal>,
     activities: Activities,
-    pipeline: Option<Vec<PipelineStage>>,
+    pipeline: Option<std::rc::Rc<Vec<PipelineStage>>>,
     pipeline_error: Option<String>,
     pipeline_task: Option<Task<()>>,
     /// Totals of the unfiltered lists (the header's counts).
@@ -253,6 +342,13 @@ pub struct CrmPage {
     /// The page is on screen: notices refresh at once (else they mark it stale).
     shown: bool,
     stale: bool,
+    /// Change notices gathered for the next refresh.
+    pending: model::Refresh,
+    pending_task: Option<Task<()>>,
+    /// Rows the owner just saved here (their stream notice is skipped for a moment).
+    saved: HashMap<Uuid, Instant>,
+    pipeline_wait: Option<Task<()>>,
+    activities_wait: Option<Task<()>>,
     /// The teammates' names (rows show who added what): a redraw when they change.
     bots_seen: Vec<(Uuid, String)>,
 }
@@ -270,8 +366,15 @@ impl CrmPage {
         })
         .detach();
         cx.subscribe(&data, |this: &mut Self, data, ev: &DataEvent, cx| match ev {
-            DataEvent::Changed(None) => this.notice(None, cx),
-            DataEvent::Changed(Some(n)) if n.t.starts_with("crm_") => this.notice(Some(n.t.as_str()), cx),
+            DataEvent::Changed(None) => this.refresh_all(cx),
+            DataEvent::Changed(Some(n)) if n.t.starts_with("crm_") => {
+                let id = n.id.as_deref().and_then(|s| s.parse::<Uuid>().ok());
+                // The owner's own save here was already read.
+                if id.is_some_and(|id| this.saved.get(&id).is_some_and(|at| at.elapsed() < SAVED_QUIET)) {
+                    return;
+                }
+                this.queue(|r| r.add(&n.t, id), cx);
+            }
             DataEvent::Updated(Part::Overview) => {
                 let seen: Vec<(Uuid, String)> = data.read(cx).bots().iter().map(|b| (b.id, b.name.clone())).collect();
                 if seen != this.bots_seen {
@@ -323,6 +426,11 @@ impl CrmPage {
             undo: None,
             shown: true,
             stale: false,
+            pending: model::Refresh::default(),
+            pending_task: None,
+            saved: HashMap::new(),
+            pipeline_wait: None,
+            activities_wait: None,
             bots_seen,
         };
         this.reload(Which::Companies, cx);
@@ -344,7 +452,7 @@ impl CrmPage {
     pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
         self.shown = shown;
         if shown && std::mem::take(&mut self.stale) {
-            self.notice(None, cx);
+            self.refresh_all(cx);
         }
     }
 
@@ -433,12 +541,18 @@ impl CrmPage {
                     });
                 })
                 .detach();
-                self.notice(Some(rec.table()), cx);
+                self.saved_here(*rec, cx);
             }
             PanelEvent::OpenNeeds => cx.emit(CrmEvent::OpenNeeds),
+            PanelEvent::Removed { rec, name } => {
+                self.close_panel(cx);
+                let title = format!("“{}” is out of the CRM again", excerpt(&model::shown(name), 48));
+                self.toast(Tone::Ok, title, Some("Undoing how it was added removes it; that can't be undone.".into()), cx);
+                self.saved_here(*rec, cx);
+            }
             PanelEvent::Saved(rec) => {
                 // Shown at once rather than after the notice's round trip.
-                self.notice(Some(rec.table()), cx);
+                self.saved_here(*rec, cx);
             }
         }
     }
@@ -470,7 +584,7 @@ impl CrmPage {
                 match r {
                     Ok(()) => {
                         p.toast(Tone::Ok, "Brought back", None, cx);
-                        p.notice(Some(rec.table()), cx);
+                        p.saved_here(rec, cx);
                         p.open(rec, false, window, cx);
                     }
                     Err(e) => p.toast(Tone::Bad, "Couldn't undo it", Some(e), cx),
@@ -678,18 +792,18 @@ impl CrmPage {
     fn rebuild_names(&mut self) {
         let mut names = HashMap::new();
         for c in &self.companies.rows {
-            names.insert(c.id, (Rec::Company(c.id), SharedString::from(c.name.clone())));
+            names.insert(c.id, (Rec::Company(c.id), SharedString::from(model::shown(&c.name))));
         }
         for c in &self.contacts.rows {
-            names.insert(c.id, (Rec::Contact(c.id), SharedString::from(c.name.clone())));
+            names.insert(c.id, (Rec::Contact(c.id), SharedString::from(model::shown(&c.name))));
         }
-        for s in self.pipeline.iter().flatten() {
+        for s in self.pipeline.iter().flat_map(|p| p.iter()) {
             for d in &s.deals {
-                names.insert(d.id, (Rec::Deal(d.id), SharedString::from(d.title.clone())));
+                names.insert(d.id, (Rec::Deal(d.id), SharedString::from(model::shown(&d.title))));
             }
         }
         for d in &self.deals.rows {
-            names.insert(d.id, (Rec::Deal(d.id), SharedString::from(d.title.clone())));
+            names.insert(d.id, (Rec::Deal(d.id), SharedString::from(model::shown(&d.title))));
         }
         self.names = names;
     }
@@ -699,7 +813,7 @@ impl CrmPage {
         if self.pipeline.is_none()
             && let Some(cached) = client.peek::<Vec<PipelineStage>>("/api/crm/pipeline")
         {
-            self.pipeline = Some(cached);
+            self.pipeline = Some(std::rc::Rc::new(cached));
         }
         let task = Tokio::spawn(cx, async move { client.crm_pipeline().await });
         self.pipeline_task = Some(cx.spawn(async move |this, cx| {
@@ -707,7 +821,7 @@ impl CrmPage {
             let _ = this.update(cx, |p, cx| {
                 match r {
                     Ok(stages) => {
-                        p.pipeline = Some(stages);
+                        p.pipeline = Some(std::rc::Rc::new(stages));
                         p.pipeline_error = None;
                         p.rebuild_names();
                     }
@@ -785,29 +899,156 @@ impl CrmPage {
         }
     }
 
-    /// A change notice for `table` (`None`: everything may have changed).
-    fn notice(&mut self, table: Option<&str>, cx: &mut Context<Self>) {
+    /// Everything may have changed (a resync, an import, the page shown after a while): re-page every list.
+    fn refresh_all(&mut self, cx: &mut Context<Self>) {
+        self.queue(|r| *r = model::Refresh::all(), cx);
+    }
+
+    /// Gather a change notice; the changed rows are read once the notices stop for [`NOTICE_BATCH`]. While the page is
+    /// hidden notices only mark it stale.
+    fn queue(&mut self, add: impl FnOnce(&mut model::Refresh), cx: &mut Context<Self>) {
         if !self.shown {
             self.stale = true;
             return;
         }
-        let all = table.is_none();
-        let t = table.unwrap_or("");
-        // A contact or deal row shows its company's name; a deal shows its contact's and whether they opted out.
-        if all || t == "crm_companies" {
+        add(&mut self.pending);
+        if self.pending_task.is_none() && !self.pending.is_empty() {
+            self.pending_task = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(NOTICE_BATCH).await;
+                let _ = this.update(cx, |p, cx| {
+                    p.pending_task = None;
+                    p.flush(cx);
+                });
+            }));
+        }
+    }
+
+    /// The owner changed a row here: read just it (and skip its stream notice for a moment).
+    fn saved_here(&mut self, rec: Rec, cx: &mut Context<Self>) {
+        self.saved.retain(|_, at| at.elapsed() < SAVED_QUIET);
+        self.saved.insert(rec.id(), Instant::now());
+        self.queue(|r| r.add(rec.table(), Some(rec.id())), cx);
+    }
+
+    /// Refresh what the gathered notices touched: changed rows one by one (a list re-paged only when the notices
+    /// named no row or too many), the board and the activity list at most every [`AGGREGATE_GAP`].
+    fn flush(&mut self, cx: &mut Context<Self>) {
+        let r = std::mem::take(&mut self.pending);
+        let client = self.client(cx);
+        if r.full[0] {
             self.reload(Which::Companies, cx);
+        } else if !r.companies.is_empty() {
+            let c = client.clone();
+            self.read_rows(Which::Companies, r.companies, move |id| {
+                let c = c.clone();
+                async move { c.crm_company(id).await }
+            }, cx);
         }
-        if all || t == "crm_companies" || t == "crm_contacts" {
+        if r.full[1] {
             self.reload(Which::Contacts, cx);
+        } else if !r.contacts.is_empty() {
+            let c = client.clone();
+            self.read_rows(Which::Contacts, r.contacts, move |id| {
+                let c = c.clone();
+                async move { c.crm_contact(id).await }
+            }, cx);
         }
-        if all || matches!(t, "crm_companies" | "crm_contacts" | "crm_deals") {
-            if self.deals.key.is_some() {
+        // The deal list only once it was opened.
+        if self.deals.key.is_some() {
+            if r.full[2] {
                 self.reload(Which::Deals, cx);
+            } else if !r.deals.is_empty() {
+                let c = client.clone();
+                self.read_rows(Which::Deals, r.deals, move |id| {
+                    let c = c.clone();
+                    async move { c.crm_deal(id).await }
+                }, cx);
             }
-            self.load_pipeline(cx);
         }
-        if (all || t == "crm_activities") && self.activities.loaded {
-            self.load_activities(false, cx);
+        if r.pipeline {
+            self.pipeline_soon(cx);
+        }
+        if r.activities && self.activities.loaded {
+            self.activities_soon(cx);
+        }
+    }
+
+    /// Read rows `ids` of a list again and put each where it belongs (a row that is gone, or no longer matches the
+    /// filters, leaves). A list still paging re-pages once more instead.
+    fn read_rows<T, F, Fut>(&mut self, which: Which, ids: Vec<Uuid>, read: F, cx: &mut Context<Self>)
+    where
+        T: Row + Send + 'static,
+        F: Fn(Uuid) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, ApiError>> + Send + 'static,
+    {
+        let paging = match which {
+            Which::Companies => self.companies.loading || !self.companies.loaded,
+            Which::Contacts => self.contacts.loading || !self.contacts.loaded,
+            Which::Deals => self.deals.loading || !self.deals.loaded,
+        };
+        if paging {
+            self.reload(which, cx);
+            return;
+        }
+        let task = Tokio::spawn(cx, async move {
+            let reads = ids.into_iter().map(|id| {
+                let f = read(id);
+                async move { (id, f.await) }
+            });
+            futures::future::join_all(reads).await
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(rows) = task.await else { return };
+            let _ = this.update(cx, |p, cx| {
+                for (id, r) in rows {
+                    match r {
+                        Ok(row) => T::put(p, id, Some(row)),
+                        Err(ApiError::Http { status: 404, .. }) => T::put(p, id, None),
+                        Err(e) => tracing::warn!("crm row {id}: {e}"),
+                    }
+                }
+                p.rebuild_names();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Re-read the board soon (once per [`AGGREGATE_GAP`] however many deals change).
+    fn pipeline_soon(&mut self, cx: &mut Context<Self>) {
+        if self.pipeline_wait.is_some() {
+            return;
+        }
+        self.pipeline_wait = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(AGGREGATE_GAP).await;
+            let _ = this.update(cx, |p, cx| {
+                p.pipeline_wait = None;
+                p.load_pipeline(cx);
+            });
+        }));
+    }
+
+    fn activities_soon(&mut self, cx: &mut Context<Self>) {
+        if self.activities_wait.is_some() {
+            return;
+        }
+        self.activities_wait = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(AGGREGATE_GAP).await;
+            let _ = this.update(cx, |p, cx| {
+                p.activities_wait = None;
+                p.load_activities(false, cx);
+            });
+        }));
+    }
+
+    /// A list's total moves with a row that came or went (when the list is the whole of it).
+    fn count(total: &mut Option<usize>, unfiltered: bool, change: model::Upsert) {
+        if let (true, Some(n)) = (unfiltered, total.as_mut()) {
+            match change {
+                model::Upsert::Inserted => *n += 1,
+                model::Upsert::Removed => *n = n.saturating_sub(1),
+                _ => {}
+            }
         }
     }
 
@@ -885,7 +1126,7 @@ impl CrmPage {
             MenuId::Stage => {
                 let mut v = vec![MenuItem::new("Every stage").checked(self.stage.is_none())];
                 let counts: HashMap<DealStage, i64> =
-                    self.pipeline.iter().flatten().map(|s| (s.stage, s.count)).collect();
+                    self.pipeline.iter().flat_map(|p| p.iter()).map(|s| (s.stage, s.count)).collect();
                 v.extend(STAGES.iter().map(|s| {
                     MenuItem::new(model::stage_label(*s))
                         .detail(counts.get(s).map(|n| n.to_string()).unwrap_or_default())
@@ -986,12 +1227,12 @@ impl CrmPage {
     // ---- the board ----------------------------------------------------------------------------------------------
 
     fn find_card(&self, deal: Uuid) -> Option<&PipelineDeal> {
-        self.pipeline.iter().flatten().flat_map(|s| &s.deals).find(|d| d.id == deal)
+        self.pipeline.iter().flat_map(|p| p.iter()).flat_map(|s| &s.deals).find(|d| d.id == deal)
     }
 
     /// Move a deal to another stage: on the board at once, then through the API (a failure puts it back).
     fn move_deal(&mut self, deal: Uuid, to: DealStage, cx: &mut Context<Self>) {
-        let Some(stages) = self.pipeline.as_mut() else { return };
+        let Some(stages) = self.pipeline.as_mut().map(std::rc::Rc::make_mut) else { return };
         let Some((from, at)) = stages.iter().enumerate().find_map(|(si, s)| s.deals.iter().position(|d| d.id == deal).map(|di| (si, di)))
         else {
             return;
@@ -1019,7 +1260,7 @@ impl CrmPage {
             let r = task.await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.message()));
             let _ = this.update(cx, |p, cx| {
                 if let Err(e) = r {
-                    p.toast(Tone::Bad, format!("Couldn't move “{}”", excerpt(&title, 40)), Some(e), cx);
+                    p.toast(Tone::Bad, format!("Couldn't move “{}”", excerpt(&model::shown(&title), 40)), Some(e), cx);
                     p.load_pipeline(cx);
                 }
             });
@@ -1228,7 +1469,7 @@ impl CrmPage {
         let id = d.id;
         let key = id.as_u128() as u64;
         let selected = self.panel_rec(cx) == Some(Rec::Deal(id));
-        let who = [d.company_name.as_deref(), d.contact_name.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+        let who = model::shown(&[d.company_name.as_deref(), d.contact_name.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" · "));
         let next = d.next_step.as_deref().filter(|s| !s.trim().is_empty()).map(|s| {
             let due = d.next_step_at.map(|t| model::due_words(t, Utc::now()));
             div()
@@ -1243,7 +1484,7 @@ impl CrmPage {
                         .min_w_0()
                         .text_color(theme.ink)
                         .line_clamp(2)
-                        .child(excerpt(s, 90))
+                        .child(excerpt(&model::shown(s), 90))
                         .when_some(due, |el, (w, late)| {
                             el.child(div().text_color(if late { theme.warn } else { theme.muted }).child(w))
                         }),
@@ -1276,7 +1517,7 @@ impl CrmPage {
                     .flex()
                     .items_start()
                     .gap(px(6.0))
-                    .child(div().flex_1().min_w_0().font_weight(FontWeight::MEDIUM).text_size(px(text::SMALL)).line_clamp(2).child(d.title.clone()))
+                    .child(div().flex_1().min_w_0().font_weight(FontWeight::MEDIUM).text_size(px(text::SMALL)).line_clamp(2).child(model::shown(&d.title)))
                     .child(
                         div()
                             .flex()
@@ -1458,13 +1699,13 @@ impl CrmPage {
                                         .flex()
                                         .flex_col()
                                         .min_w_0()
-                                        .child(div().truncate().font_weight(FontWeight::MEDIUM).child(c.name.clone()))
+                                        .child(div().truncate().font_weight(FontWeight::MEDIUM).child(model::shown(&c.name)))
                                         .child(
                                             div()
                                                 .truncate()
                                                 .text_size(px(text::CAPTION))
                                                 .text_color(theme.muted)
-                                                .child(c.domain.clone().or_else(|| c.industry.clone()).unwrap_or_default()),
+                                                .child(model::shown(c.domain.as_deref().or(c.industry.as_deref()).unwrap_or_default())),
                                         ),
                                 ),
                         ),
@@ -1504,13 +1745,13 @@ impl CrmPage {
                                         .flex()
                                         .flex_col()
                                         .min_w_0()
-                                        .child(div().truncate().font_weight(FontWeight::MEDIUM).child(c.name.clone()))
+                                        .child(div().truncate().font_weight(FontWeight::MEDIUM).child(model::shown(&c.name)))
                                         .child(
                                             div()
                                                 .truncate()
                                                 .text_size(px(text::CAPTION))
                                                 .text_color(theme.muted)
-                                                .child(c.title.clone().unwrap_or_default()),
+                                                .child(model::shown(c.title.as_deref().unwrap_or_default())),
                                         ),
                                 ),
                         ),
@@ -1518,13 +1759,13 @@ impl CrmPage {
                     .when(mid, |el| {
                         el.child(
                             cell(Some(170.0), false)
-                                .child(div().truncate().text_size(px(text::SMALL)).child(c.company_name.clone().unwrap_or_default())),
+                                .child(div().truncate().text_size(px(text::SMALL)).child(model::shown(c.company_name.as_deref().unwrap_or_default()))),
                         )
                     })
                     .when(wide, |el| {
                         el.child(
                             cell(Some(220.0), false).child(
-                                div().truncate().text_size(px(text::CAPTION)).text_color(theme.muted).child(c.email.clone().unwrap_or_default()),
+                                div().truncate().text_size(px(text::CAPTION)).text_color(theme.muted).child(model::shown(c.email.as_deref().unwrap_or_default())),
                             ),
                         )
                     })
@@ -1546,8 +1787,8 @@ impl CrmPage {
             let Some(d) = self.deals.rows.get(ix) else { continue };
             let id = d.id;
             let this = cx.entity();
-            let who = [d.company_name.as_deref(), d.contact_name.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" · ");
-            let next = d.next_step.clone().filter(|s| !s.trim().is_empty());
+            let who = model::shown(&[d.company_name.as_deref(), d.contact_name.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" · "));
+            let next = d.next_step.as_deref().filter(|s| !s.trim().is_empty()).map(model::shown);
             let due = d.next_step_at.map(|t| model::due_words(t, now));
             out.push(
                 Self::row_shell(("crm-dl", ix), sel == Some(Rec::Deal(id)), &theme)
@@ -1563,7 +1804,7 @@ impl CrmPage {
                                         .flex()
                                         .items_center()
                                         .gap(px(8.0))
-                                        .child(div().truncate().font_weight(FontWeight::MEDIUM).child(d.title.clone()))
+                                        .child(div().truncate().font_weight(FontWeight::MEDIUM).child(model::shown(&d.title)))
                                         .when(d.contact_do_not_contact, |el| el.child(dnc_badge(cx))),
                                 )
                                 .child(div().truncate().text_size(px(text::CAPTION)).text_color(theme.muted).child(who)),
@@ -1661,7 +1902,7 @@ impl CrmPage {
                                 .gap(px(8.0))
                                 .min_w_0()
                                 .child(chip(model::kind_tone(a.kind), model::kind_label(a.kind), cx))
-                                .child(div().flex_1().min_w_0().truncate().text_size(px(text::SMALL)).child(a.summary.clone()))
+                                .child(div().flex_1().min_w_0().truncate().text_size(px(text::SMALL)).child(model::shown(&a.summary)))
                                 .when(waiting, |el| el.child(chip(Tone::Warn, "Waiting for you", cx))),
                         ),
                     )
@@ -1717,9 +1958,10 @@ impl CrmPage {
             let task = cx.update(|cx| {
                 Tokio::spawn(cx, async move {
                     let csv = client.crm_export_csv(kind).await.map_err(|e| e.message())?;
-                    let rows = csv.lines().count().saturating_sub(1);
+                    // A byte-order mark first, so Excel reads it as UTF-8 (names with accents stay intact).
+                    let csv = if csv.starts_with('\u{feff}') { csv } else { format!("\u{feff}{csv}") };
                     std::fs::write(&target, csv).map_err(|e| format!("Couldn't write the file: {e}"))?;
-                    Ok::<_, String>(rows)
+                    Ok::<_, String>(())
                 })
             });
             let r = task.await.map_err(|e| e.to_string()).and_then(|r| r);
@@ -1727,7 +1969,7 @@ impl CrmPage {
                 p.exporting = false;
                 let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
                 match r {
-                    Ok(_) => p.toast(Tone::Ok, format!("Saved {file}"), Some(path.display().to_string()), cx),
+                    Ok(()) => p.toast(Tone::Ok, format!("Saved {file}"), Some(path.display().to_string()), cx),
                     Err(e) => p.toast(Tone::Bad, "Couldn't export", Some(e), cx),
                 }
                 cx.notify();
@@ -1816,7 +2058,7 @@ impl CrmPage {
                         let msg = format!("Imported: {} new, {} updated", res.created, res.updated);
                         imp.done = Some(res);
                         p.toast(Tone::Ok, msg, None, cx);
-                        p.notice(None, cx);
+                        p.refresh_all(cx);
                     }
                     Err(e) => imp.error = Some(e),
                 }
@@ -2126,7 +2368,7 @@ impl CrmPage {
         let currency = self
             .pipeline
             .iter()
-            .flatten()
+            .flat_map(|p| p.iter())
             .flat_map(|s| s.deals.first())
             .map(|d| d.currency.clone())
             .next()
@@ -2398,7 +2640,7 @@ impl CrmPage {
                         .text_color(theme.tooltip_ink)
                         .shadow(theme.float_shadow())
                         .text_size(px(text::SMALL))
-                        .child(format!("Deleted “{}”", excerpt(&u.name, 48)))
+                        .child(format!("Deleted “{}”", excerpt(&model::shown(&u.name), 48)))
                         .child(
                             div()
                                 .id("crm-undo-btn")
@@ -2576,7 +2818,7 @@ pub fn tag_chips(tags: &[String], n: usize, cx: &App) -> gpui::Div {
     let theme = Theme::of(cx).clone();
     let mut row = div().flex().items_center().gap(px(4.0)).min_w_0().overflow_hidden();
     for t in tags.iter().take(n) {
-        row = row.child(chip(Tone::Muted, excerpt(t, 18), cx));
+        row = row.child(chip(Tone::Muted, excerpt(&model::shown(t), 18), cx));
     }
     if tags.len() > n {
         row = row.child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(format!("+{}", tags.len() - n)));

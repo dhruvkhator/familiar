@@ -134,6 +134,9 @@ impl AppSettings {
             self.autostart = desktop::autostart_enabled();
             self.check(cx);
         }
+        if shown != was {
+            self.webhooks.update(cx, |w, cx| w.set_shown(shown, cx));
+        }
     }
 
     fn check(&mut self, cx: &mut Context<Self>) {

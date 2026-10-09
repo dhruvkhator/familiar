@@ -86,6 +86,85 @@ pub enum PanelEvent {
     OpenNeeds,
     /// The owner changed it here.
     Saved(Rec),
+    /// Undoing how it was added took it out of the CRM (an undo can't itself be undone).
+    Removed { rec: Rec, name: String },
+}
+
+/// The pieces of the panel that are read from the API (the change log goes with the record).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Parts {
+    pub record: bool,
+    pub contacts: bool,
+    pub deals: bool,
+    pub activities: bool,
+}
+
+impl Parts {
+    pub const NONE: Parts = Parts { record: false, contacts: false, deals: false, activities: false };
+    pub const ALL: Parts = Parts { record: true, contacts: true, deals: true, activities: true };
+    fn is_empty(self) -> bool {
+        self == Self::NONE
+    }
+    fn or(self, o: Parts) -> Parts {
+        Parts {
+            record: self.record || o.record,
+            contacts: self.contacts || o.contacts,
+            deals: self.deals || o.deals,
+            activities: self.activities || o.activities,
+        }
+    }
+}
+
+/// What an open panel shows: the record, the company and contact it links to, the people and deals it lists.
+#[derive(Debug, Clone, Default)]
+pub struct Ctx {
+    pub rec: Option<Rec>,
+    pub company: Option<Uuid>,
+    pub contact: Option<Uuid>,
+    pub contacts: Vec<Uuid>,
+    pub deals: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Contact,
+    Deal,
+}
+
+/// What a change notice means for an open panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Nothing,
+    Parts(Parts),
+    /// A contact or deal the panel doesn't list: read it to see whether it belongs here.
+    Check(Kind, Uuid),
+}
+
+/// Which parts of a panel a change notice (`table`, the row's id) touches. Rows of other records are ignored; the
+/// timeline's notices name only the entry, so any re-reads the timeline.
+pub fn scope(ctx: &Ctx, table: &str, id: Option<Uuid>) -> Scope {
+    let Some(rec) = ctx.rec else { return Scope::Nothing };
+    let record = Scope::Parts(Parts { record: true, ..Parts::NONE });
+    if table == "crm_activities" {
+        return Scope::Parts(Parts { activities: true, ..Parts::NONE });
+    }
+    if !matches!(table, "crm_companies" | "crm_contacts" | "crm_deals") {
+        return Scope::Nothing;
+    }
+    let Some(id) = id else { return Scope::Parts(Parts::ALL) };
+    match (rec, table) {
+        (r, _) if r.id() == id && r.table() == table => record,
+        // A contact or deal shows its company's name; a deal its contact's.
+        (Rec::Contact(_) | Rec::Deal(_), "crm_companies") if ctx.company == Some(id) => record,
+        (Rec::Deal(_), "crm_contacts") if ctx.contact == Some(id) => record,
+        (Rec::Company(_), "crm_contacts") if ctx.contacts.contains(&id) => Scope::Parts(Parts { contacts: true, ..Parts::NONE }),
+        (Rec::Company(_), "crm_contacts") => Scope::Check(Kind::Contact, id),
+        (Rec::Company(_) | Rec::Contact(_), "crm_deals") if ctx.deals.contains(&id) => {
+            Scope::Parts(Parts { deals: true, ..Parts::NONE })
+        }
+        (Rec::Company(_) | Rec::Contact(_), "crm_deals") => Scope::Check(Kind::Deal, id),
+        _ => Scope::Nothing,
+    }
 }
 
 /// The record itself.
@@ -164,6 +243,7 @@ impl Field {
             Field::Value => "12,500 or 12.5k",
             Field::Currency => "USD, EUR, GBP…",
             Field::NextStepAt => "2026-10-20, tomorrow, in 3 days",
+            Field::NextStep => "What happens next (clear it to drop the step)",
             Field::Domain => "acme.com",
             Field::Website | Field::Linkedin => "https://…",
             _ => "",
@@ -209,6 +289,8 @@ fn field_text(r: &Record, f: Field) -> String {
 fn field_shown(r: &Record, f: Field) -> Option<String> {
     let t = match (r, f) {
         (Record::Deal(d), Field::Value) => d.value_cents.map(|v| model::money(v, &d.currency)),
+        // A date without a step is left over from a step that was cleared (a date can't be cleared yet): not shown.
+        (Record::Deal(d), Field::NextStepAt) if d.next_step.as_deref().is_none_or(|s| s.trim().is_empty()) => None,
         (Record::Deal(d), Field::NextStepAt) => d.next_step_at.map(|t| {
             let (words, _) = model::due_words(t, Utc::now());
             format!("{} · {words}", t.with_timezone(&Local).format("%a %b %-d"))
@@ -242,6 +324,7 @@ pub fn patch_for(rec: Rec, f: Field, text: &str) -> Result<Patch, String> {
                 Field::Description => p.description = some(),
                 Field::FitReason => p.fit_reason = some(),
                 Field::Tags => p.tags = Some(model::parse_tags(&t)),
+                Field::FitScore if t.is_empty() => return Err("A fit score can't be cleared yet: give it a number from 0 to 100.".into()),
                 Field::FitScore => match t.parse::<i32>() {
                     Ok(n) if (0..=100).contains(&n) => p.fit_score = Some(n),
                     _ => return Err("A fit score is a whole number from 0 to 100.".into()),
@@ -275,8 +358,8 @@ pub fn patch_for(rec: Rec, f: Field, text: &str) -> Result<Patch, String> {
                 Field::Name | Field::Title => p.title = some(),
                 Field::Value => match model::parse_money(&t) {
                     Some(Some(c)) => p.value_cents = Some(c),
-                    // The API reads an absent value as "unchanged"; zero is the closest to clearing it.
-                    Some(None) => p.value_cents = Some(0),
+                    // The API reads an absent value as "unchanged": a value can't be cleared yet.
+                    Some(None) => return Err("A value can't be cleared yet: set it to 0.".into()),
                     None => return Err("Write an amount, like 12,500 or 12.5k.".into()),
                 },
                 Field::Currency if t.len() == 3 && t.chars().all(|c| c.is_ascii_alphabetic()) => p.currency = Some(t.to_uppercase()),
@@ -342,7 +425,8 @@ pub struct RecordPanel {
     focus: FocusHandle,
     scroll: ScrollHandle,
     loading: Option<Task<()>>,
-    again: bool,
+    /// Parts asked for during a read: read after it.
+    queued: Parts,
     /// It was opened from another record: the top bar offers Back.
     back: bool,
 }
@@ -352,8 +436,11 @@ impl EventEmitter<PanelEvent> for RecordPanel {}
 impl RecordPanel {
     pub fn new(data: Entity<AppData>, toasts: Entity<ToastStack>, rec: Rec, window: &mut Window, cx: &mut Context<Self>) -> Self {
         cx.subscribe(&data, |this: &mut Self, _, ev: &DataEvent, cx| match ev {
-            DataEvent::Changed(None) => this.reload(cx),
-            DataEvent::Changed(Some(n)) if n.t.starts_with("crm_") && n.t != "crm_webhook_deliveries" => this.reload(cx),
+            DataEvent::Changed(None) => this.reload(Parts::ALL, cx),
+            DataEvent::Changed(Some(n)) if n.t.starts_with("crm_") => {
+                let id = n.id.as_deref().and_then(|s| s.parse::<Uuid>().ok());
+                this.on_notice(&n.t, id, cx)
+            }
             // A draft on the timeline may have been decided; teammates' names.
             DataEvent::Updated(Part::Pending | Part::Overview) => cx.notify(),
             _ => {}
@@ -388,10 +475,10 @@ impl RecordPanel {
             focus: cx.focus_handle(),
             scroll: ScrollHandle::new(),
             loading: None,
-            again: false,
+            queued: Parts::NONE,
             back: false,
         };
-        this.reload(cx);
+        this.reload(Parts::ALL, cx);
         this
     }
 
@@ -417,64 +504,93 @@ impl RecordPanel {
         self.toasts.update(cx, |t, cx| t.push(tone, title, body.map(Into::into), cx));
     }
 
-    /// Read the record and everything around it (one at a time: a notice during a read queues one more).
-    fn reload(&mut self, cx: &mut Context<Self>) {
+    /// Read again the `parts` of the panel (one read at a time: notices during a read gather into one more, run after
+    /// a breath, since a teammate may be writing a lot).
+    fn reload(&mut self, parts: Parts, cx: &mut Context<Self>) {
+        if parts.is_empty() {
+            return;
+        }
         if self.loading.is_some() {
-            self.again = true;
+            self.queued = self.queued.or(parts);
             return;
         }
         let client = self.client(cx);
         let rec = self.rec;
+        // A contact's deals are their company's where they are the contact: the company comes from the record.
+        let contact_company = match &self.record {
+            Some(Record::Contact(c)) => c.company_id,
+            _ => None,
+        };
         let task = Tokio::spawn(cx, async move {
-            let acts = |company_id, contact_id, deal_id| CrmActivityParams { company_id, contact_id, deal_id, limit: Some(60), ..Default::default() };
+            let acts = match rec {
+                Rec::Company(id) => CrmActivityParams { company_id: Some(id), limit: Some(60), ..Default::default() },
+                Rec::Contact(id) => CrmActivityParams { contact_id: Some(id), limit: Some(60), ..Default::default() },
+                Rec::Deal(id) => CrmActivityParams { deal_id: Some(id), limit: Some(60), ..Default::default() },
+            };
             let changes = CrmChangeParams { entity: Some(rec.entity().into()), entity_id: Some(rec.id()), limit: Some(30), ..Default::default() };
-            let (record, contacts, deals, activities) = match rec {
-                Rec::Company(id) => {
-                    let by = CrmListParams { company_id: Some(id), limit: Some(200), sort: Some("name".into()), ..Default::default() };
-                    let (by_updated, a) = (CrmListParams { sort: Some("updated".into()), ..by.clone() }, acts(Some(id), None, None));
-                    let (r, c, d, a) = tokio::join!(
-                        client.crm_company(id),
-                        client.crm_contacts(&by),
-                        client.crm_deals(&by_updated),
-                        client.crm_activities(&a),
-                    );
-                    (r.map(Record::Company), c.ok(), d.ok(), a.ok())
+            let record = async {
+                if !parts.record {
+                    return None;
                 }
-                Rec::Contact(id) => {
-                    let a = acts(None, Some(id), None);
-                    let (r, a) = tokio::join!(client.crm_contact(id), client.crm_activities(&a));
-                    // A contact's deals: their company's, where they are the contact.
-                    let deals = match r.as_ref().ok().and_then(|c| c.company_id) {
-                        Some(co) => client
-                            .crm_deals(&CrmListParams { company_id: Some(co), limit: Some(200), ..Default::default() })
-                            .await
-                            .ok()
-                            .map(|v| v.into_iter().filter(|d| d.contact_id == Some(id)).collect()),
-                        None => Some(Vec::new()),
-                    };
-                    (r.map(Record::Contact), None, deals, a.ok())
-                }
-                Rec::Deal(id) => {
-                    let a = acts(None, None, Some(id));
-                    let (r, a) = tokio::join!(client.crm_deal(id), client.crm_activities(&a));
-                    (r.map(Record::Deal), None, None, a.ok())
+                Some(match rec {
+                    Rec::Company(id) => client.crm_company(id).await.map(Record::Company),
+                    Rec::Contact(id) => client.crm_contact(id).await.map(Record::Contact),
+                    Rec::Deal(id) => client.crm_deal(id).await.map(Record::Deal),
+                })
+            };
+            let contacts = async {
+                match rec {
+                    Rec::Company(id) if parts.contacts => {
+                        let by = CrmListParams { company_id: Some(id), limit: Some(200), sort: Some("name".into()), ..Default::default() };
+                        client.crm_contacts(&by).await.ok()
+                    }
+                    _ => None,
                 }
             };
-            let changes = client.crm_changes(&changes).await.ok();
-            (record, contacts, deals, activities, changes)
+            let deals = async {
+                if !parts.deals {
+                    return None;
+                }
+                match rec {
+                    Rec::Company(id) => {
+                        let by = CrmListParams { company_id: Some(id), limit: Some(200), sort: Some("updated".into()), ..Default::default() };
+                        client.crm_deals(&by).await.ok()
+                    }
+                    Rec::Contact(id) => {
+                        // Before the contact itself is in, its company comes from reading it.
+                        let company = match contact_company {
+                            Some(co) => Some(co),
+                            None => client.crm_contact(id).await.ok().and_then(|c| c.company_id),
+                        };
+                        match company {
+                            Some(co) => client
+                                .crm_deals(&CrmListParams { company_id: Some(co), limit: Some(200), ..Default::default() })
+                                .await
+                                .ok()
+                                .map(|v| v.into_iter().filter(|d| d.contact_id == Some(id)).collect()),
+                            None => Some(Vec::new()),
+                        }
+                    }
+                    Rec::Deal(_) => None,
+                }
+            };
+            let activities = async { if parts.activities { client.crm_activities(&acts).await.ok() } else { None } };
+            let changes = async { if parts.record { client.crm_changes(&changes).await.ok() } else { None } };
+            tokio::join!(record, contacts, deals, activities, changes)
         });
         self.loading = Some(cx.spawn(async move |this, cx| {
             let Ok((record, contacts, deals, activities, changes)) = task.await else { return };
             let _ = this.update(cx, |p, cx| {
                 p.loading = None;
                 match record {
-                    Ok(r) => {
+                    Some(Ok(r)) => {
                         p.record = Some(r);
                         p.error = None;
                         p.gone = false;
                     }
-                    Err(familiar_client::ApiError::Http { status: 404, .. }) => p.gone = true,
-                    Err(e) => p.error = Some(e.message()),
+                    Some(Err(familiar_client::ApiError::Http { status: 404, .. })) => p.gone = true,
+                    Some(Err(e)) => p.error = Some(e.message()),
+                    None => {}
                 }
                 if contacts.is_some() {
                     p.contacts = contacts;
@@ -489,16 +605,67 @@ impl RecordPanel {
                     p.changes = changes;
                 }
                 cx.notify();
-                // Notices that came meanwhile: read once more, after a breath (a teammate may be writing a lot).
-                if std::mem::take(&mut p.again) {
+                let more = std::mem::take(&mut p.queued);
+                if !more.is_empty() {
                     cx.spawn(async move |this, cx| {
                         cx.background_executor().timer(std::time::Duration::from_millis(700)).await;
-                        let _ = this.update(cx, |p, cx| p.reload(cx));
+                        let _ = this.update(cx, |p, cx| p.reload(more, cx));
                     })
                     .detach();
                 }
             });
         }));
+    }
+
+    /// What this panel shows of the CRM, for deciding whether a change notice concerns it.
+    fn ctx(&self) -> Ctx {
+        let (company, contact) = match &self.record {
+            Some(Record::Contact(c)) => (c.company_id, None),
+            Some(Record::Deal(d)) => (Some(d.company_id), d.contact_id),
+            _ => (None, None),
+        };
+        Ctx {
+            rec: Some(self.rec),
+            company,
+            contact,
+            contacts: self.contacts.iter().flatten().map(|c| c.id).collect(),
+            deals: self.deals.iter().flatten().map(|d| d.id).collect(),
+        }
+    }
+
+    /// A change notice: read again only what it touches. A contact or deal the panel doesn't list yet is read first
+    /// to see whether it belongs here.
+    fn on_notice(&mut self, table: &str, id: Option<Uuid>, cx: &mut Context<Self>) {
+        match scope(&self.ctx(), table, id) {
+            Scope::Nothing => {}
+            Scope::Parts(p) => self.reload(p, cx),
+            Scope::Check(kind, id) => {
+                let client = self.client(cx);
+                let rec = self.rec;
+                let task = Tokio::spawn(cx, async move {
+                    match kind {
+                        Kind::Contact => client.crm_contact(id).await.map(|c| (c.company_id, None)).ok(),
+                        Kind::Deal => client.crm_deal(id).await.map(|d| (Some(d.company_id), d.contact_id)).ok(),
+                    }
+                });
+                cx.spawn(async move |this, cx| {
+                    let Ok(Some((company, contact))) = task.await else { return };
+                    let ours = match rec {
+                        Rec::Company(me) => company == Some(me),
+                        Rec::Contact(me) => contact == Some(me),
+                        Rec::Deal(_) => false,
+                    };
+                    if ours {
+                        let parts = match kind {
+                            Kind::Contact => Parts { contacts: true, ..Parts::NONE },
+                            Kind::Deal => Parts { deals: true, ..Parts::NONE },
+                        };
+                        let _ = this.update(cx, |p, cx| p.reload(parts, cx));
+                    }
+                })
+                .detach();
+            }
+        }
     }
 
     /// Run a write; `done` gets the answer. The panel is busy meanwhile and reloads after.
@@ -528,7 +695,7 @@ impl RecordPanel {
                         p.toast(Tone::Bad, failed, Some(e), cx);
                     }
                 }
-                p.reload(cx);
+                p.reload(Parts::ALL, cx);
                 cx.notify();
             });
         })
@@ -611,12 +778,18 @@ impl RecordPanel {
         });
     }
 
-    fn undo(&mut self, change: Uuid, cx: &mut Context<Self>) {
+    /// Undo `change`. Undoing how the record was added takes it out of the CRM again: the panel closes.
+    fn undo(&mut self, change: Uuid, added: bool, cx: &mut Context<Self>) {
         let client = self.client(cx);
         let rec = self.rec;
+        let name = self.record.as_ref().map(|r| r.name().to_owned()).unwrap_or_default();
         self.write(async move { client.undo_crm_change(change).await }, "Couldn't undo it", cx, move |p, _, cx| {
-            p.toast(Tone::Ok, "Undone", None, cx);
-            cx.emit(PanelEvent::Saved(rec));
+            if added {
+                cx.emit(PanelEvent::Removed { rec, name });
+            } else {
+                p.toast(Tone::Ok, "Undone", None, cx);
+                cx.emit(PanelEvent::Saved(rec));
+            }
         });
     }
 
@@ -637,6 +810,11 @@ impl RecordPanel {
 
     fn set_stage(&mut self, stage: DealStage, cx: &mut Context<Self>) {
         self.stage_menu = None;
+        // Another write is on its way: showing the new stage now would show one that is never sent.
+        if self.busy {
+            cx.notify();
+            return;
+        }
         if let Some(Record::Deal(d)) = self.record.as_mut() {
             if d.stage == stage {
                 cx.notify();
@@ -712,7 +890,7 @@ impl RecordPanel {
         let c = model::undoable(self.changes.as_deref()?)?.clone();
         let (face, who) = self.who(&c.actor_kind, c.bot_id, c.bot_name.as_deref(), 22.0, cx);
         let bot = c.actor_kind == "bot";
-        let id = c.id;
+        let (id, added) = (c.id, c.op == "create");
         let this = cx.entity();
         Some(
             div()
@@ -750,7 +928,7 @@ impl RecordPanel {
                         .icon(icons::UNDO)
                         .disabled(self.busy)
                         .tooltip("Put back what it was before this change")
-                        .on_click(move |_, _, cx| this.update(cx, |p, cx| p.undo(id, cx))),
+                        .on_click(move |_, _, cx| this.update(cx, |p, cx| p.undo(id, added, cx))),
                 )
                 .into_any_element(),
         )
@@ -818,7 +996,7 @@ impl RecordPanel {
                 };
                 tag_chips(&tags, 8, cx).flex_wrap().into_any_element()
             }
-            (_, Some(v)) => div().text_size(px(text::SMALL)).text_color(theme.ink).child(v.clone()).into_any_element(),
+            (_, Some(v)) => div().text_size(px(text::SMALL)).text_color(theme.ink).child(model::revealed(v, f.multiline())).into_any_element(),
             (_, None) => div().text_size(px(text::SMALL)).text_color(theme.muted.opacity(0.7)).child("Add…").into_any_element(),
         };
         let link = shown.as_deref().filter(|_| matches!(f, Field::Website | Field::Linkedin)).and_then(model::safe_url);
@@ -914,7 +1092,7 @@ impl RecordPanel {
                 detail.push(format!("Set {}", ago(Some(at))));
             }
             if let Some(r) = c.dnc_reason.as_deref().filter(|r| !r.trim().is_empty()) {
-                detail.push(format!("Reason: {}", excerpt(r, 160)));
+                detail.push(format!("Reason: {}", model::revealed(&excerpt(r, 160), false)));
             }
             if !detail.is_empty() {
                 col = col.child(div().pl(px(26.0)).text_size(px(text::CAPTION)).text_color(theme.ink).child(detail.join(". ")));
@@ -959,7 +1137,7 @@ impl RecordPanel {
                     .pl(px(26.0))
                     .child(div().text_size(px(text::SMALL)).child(format!(
                         "Let teammates contact {} again? Only do this if they asked to hear from you.",
-                        c.name
+                        model::revealed(&c.name, false)
                     )))
                     .child(
                         div()
@@ -1016,9 +1194,9 @@ impl RecordPanel {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .child(div().truncate().text_size(px(text::SMALL)).child(title))
+                    .child(div().truncate().text_size(px(text::SMALL)).child(model::revealed(&title, false)))
                     .when_some(detail.filter(|d| !d.is_empty()), |el, d| {
-                        el.child(div().truncate().text_size(px(text::CAPTION)).text_color(theme.muted).child(d))
+                        el.child(div().truncate().text_size(px(text::CAPTION)).text_color(theme.muted).child(model::revealed(&d, false)))
                     }),
             )
             .children(trailing)
@@ -1090,9 +1268,9 @@ impl RecordPanel {
                                     .child("·")
                                     .child(div().flex_none().child(ago(Some(a.occurred_at)))),
                             )
-                            .child(div().text_size(px(text::SMALL)).child(a.summary.clone()))
+                            .child(div().text_size(px(text::SMALL)).child(model::revealed(&a.summary, false)))
                             .when_some(a.body.clone().filter(|b| !b.trim().is_empty() && b.trim() != a.summary.trim()), |el, b| {
-                                el.child(div().text_size(px(text::CAPTION)).text_color(theme.muted).line_clamp(4).child(excerpt(&b, 600)))
+                                el.child(div().text_size(px(text::CAPTION)).text_color(theme.muted).line_clamp(4).child(model::revealed(&excerpt(&b, 600), true)))
                             })
                             .when(a.approval_id.is_some(), |el| {
                                 el.child(if waiting {
@@ -1325,7 +1503,7 @@ impl RecordPanel {
                 .rounded(px(6.0))
                 .hover(|s| s.bg(theme.hover))
                 .on_click(move |_, window, cx| this.update(cx, |p, cx| p.edit(title_field, window, cx)))
-                .child(r.name().to_owned())
+                .child(model::revealed(r.name(), false))
                 .into_any_element()
         };
         let subtitle: Vec<AnyElement> = match r {
@@ -1453,7 +1631,7 @@ impl RecordPanel {
                         .text_color(theme.accent)
                         .when_some(url, |el, url| el.cursor_pointer().on_click(move |_, _, cx| cx.open_url(&url)))
                         .child(icon(icons::LINK).size(px(12.0)).text_color(theme.accent))
-                        .child(div().truncate().child(excerpt(u.trim_start_matches("https://").trim_start_matches("http://"), 60))),
+                        .child(div().truncate().child(model::revealed(&excerpt(u.trim_start_matches("https://").trim_start_matches("http://"), 60), false))),
                 );
             }
             col = col.child(Self::section("Sources", Some(sources.len()), &theme)).child(s);
@@ -1506,7 +1684,7 @@ impl RecordPanel {
                 .border_color(theme.bad.opacity(0.5))
                 .child(div().text_size(px(text::SMALL)).child(format!(
                     "Delete “{}”? It leaves every list{}. You can undo it.",
-                    excerpt(r.name(), 60),
+                    model::revealed(&excerpt(r.name(), 60), false),
                     if matches!(rec, Rec::Company(_)) { ", with its deals" } else { "" }
                 )))
                 .child(
@@ -1574,6 +1752,51 @@ mod tests {
         assert!(patch_for(dl, Field::NextStepAt, "tomorrow").is_ok());
         assert!(patch_for(dl, Field::NextStepAt, "soon").is_err());
         assert!(patch_for(dl, Field::Title, "").is_err());
+    }
+
+    #[test]
+    fn numbers_and_dates_say_they_cant_be_cleared() {
+        let co = Rec::Company(Uuid::nil());
+        assert!(patch_for(co, Field::FitScore, " ").is_err_and(|e| e.contains("can't be cleared")));
+        let dl = Rec::Deal(Uuid::nil());
+        assert!(patch_for(dl, Field::Value, "").is_err_and(|e| e.contains("set it to 0")));
+        assert!(patch_for(dl, Field::NextStep, "").is_ok(), "a step clears");
+        // Its leftover date isn't shown once the step is gone.
+        let at = Some(Utc::now());
+        let gone = Record::Deal(CrmDeal { next_step: None, next_step_at: at, ..Default::default() });
+        assert_eq!(field_shown(&gone, Field::NextStepAt), None);
+        let set = Record::Deal(CrmDeal { next_step: Some("Call".into()), next_step_at: at, ..Default::default() });
+        assert!(field_shown(&set, Field::NextStepAt).is_some_and(|s| s.contains("today")));
+    }
+
+    #[test]
+    fn notices_reach_only_the_panel_they_concern() {
+        let n = |x: u128| Uuid::from_u128(x);
+        let only = |p: Parts| Scope::Parts(p);
+        let record = only(Parts { record: true, ..Parts::NONE });
+        // A company panel: its own row, its people and deals; others are read first, the rest ignored.
+        let company = Ctx { rec: Some(Rec::Company(n(1))), contacts: vec![n(10)], deals: vec![n(20)], ..Default::default() };
+        assert_eq!(scope(&company, "crm_companies", Some(n(1))), record);
+        assert_eq!(scope(&company, "crm_companies", Some(n(2))), Scope::Nothing);
+        assert_eq!(scope(&company, "crm_contacts", Some(n(10))), only(Parts { contacts: true, ..Parts::NONE }));
+        assert_eq!(scope(&company, "crm_contacts", Some(n(11))), Scope::Check(Kind::Contact, n(11)));
+        assert_eq!(scope(&company, "crm_deals", Some(n(20))), only(Parts { deals: true, ..Parts::NONE }));
+        assert_eq!(scope(&company, "crm_deals", Some(n(21))), Scope::Check(Kind::Deal, n(21)));
+        assert_eq!(scope(&company, "crm_activities", Some(n(99))), only(Parts { activities: true, ..Parts::NONE }));
+        assert_eq!(scope(&company, "crm_webhook_deliveries", Some(n(99))), Scope::Nothing);
+        assert_eq!(scope(&company, "crm_contacts", None), only(Parts::ALL));
+        // A deal panel: its row, its company and contact (their names show), nothing else.
+        let deal = Ctx { rec: Some(Rec::Deal(n(20))), company: Some(n(1)), contact: Some(n(10)), ..Default::default() };
+        assert_eq!(scope(&deal, "crm_deals", Some(n(20))), record);
+        assert_eq!(scope(&deal, "crm_deals", Some(n(21))), Scope::Nothing);
+        assert_eq!(scope(&deal, "crm_companies", Some(n(1))), record);
+        assert_eq!(scope(&deal, "crm_contacts", Some(n(10))), record);
+        assert_eq!(scope(&deal, "crm_contacts", Some(n(11))), Scope::Nothing);
+        // A contact panel: its row, its company, its deals.
+        let contact = Ctx { rec: Some(Rec::Contact(n(10))), company: Some(n(1)), ..Default::default() };
+        assert_eq!(scope(&contact, "crm_contacts", Some(n(10))), record);
+        assert_eq!(scope(&contact, "crm_contacts", Some(n(11))), Scope::Nothing);
+        assert_eq!(scope(&contact, "crm_deals", Some(n(30))), Scope::Check(Kind::Deal, n(30)));
     }
 
     #[test]

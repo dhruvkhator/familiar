@@ -420,7 +420,12 @@ impl AppData {
                         let _ = tx.unbounded_send(LiveMsg::Delta(d));
                     }
                     LiveEvent::Notice(n) => {
-                        let scope = n.run.clone().or_else(|| n.bot.clone()).unwrap_or_default();
+                        // CRM notices are kept per record: the CRM page refreshes just the rows that changed.
+                        let scope = if n.t.starts_with("crm_") {
+                            n.id.clone().unwrap_or_default()
+                        } else {
+                            n.run.clone().or_else(|| n.bot.clone()).unwrap_or_default()
+                        };
                         coalescer.push(format!("{}|{scope}", n.t), Some(n));
                     }
                     LiveEvent::Resync => coalescer.push("*".into(), None),

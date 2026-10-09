@@ -27,6 +27,8 @@ serde.workspace = true
 serde_json.workspace = true
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 tokio = { version = "1", features = ["full"] }
+# The CRM webhook secret is wiped from memory once it was shown.
+zeroize = "1"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

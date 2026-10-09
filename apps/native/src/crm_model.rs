@@ -1,11 +1,13 @@
 //! The CRM's plain logic, kept apart from the views so it can be tested: stage and activity words, money and dates,
 //! tags, what a change touched, a CSV file's shape before it is imported, the hints a webhook address gets while it is
-//! typed, and the stage menu's keyboard steps.
+//! typed, the stage menu's keyboard steps, record text made safe to show, and how a change notice keeps a list current
+//! (which rows to read again, where a changed row goes).
 
 use chrono::{DateTime, Local, NaiveDate, TimeZone as _, Utc};
-use familiar_client::{ActivityKind, CrmChange, DealStage};
+use familiar_client::{ActivityKind, CrmChange, CrmCompany, CrmContact, CrmDeal, DealStage};
 use familiar_ui::theme::Tone;
 use serde_json::Value;
+use uuid::Uuid;
 
 /// Every stage, in board order.
 pub const STAGES: [DealStage; 8] = [
@@ -291,20 +293,26 @@ pub fn change_words(c: &CrmChange) -> String {
                 return "deleted it".to_owned();
             }
             let dnc = |v: &Option<Value>| v.as_ref().map(|v| v["do_not_contact"] == Value::Bool(true));
-            match (dnc(&c.before), dnc(&c.after)) {
-                (Some(false) | None, Some(true)) if c.after.as_ref().is_some_and(|a| a.get("do_not_contact").is_some()) => {
-                    return "marked them do-not-contact".to_owned();
-                }
-                (Some(true), Some(false)) => return "allowed contacting them again".to_owned(),
-                _ => {}
-            }
-            let fields = changed_fields(c);
-            if fields.is_empty() {
-                "saved it".to_owned()
-            } else if fields.len() > 4 {
+            let lead = match (dnc(&c.before), dnc(&c.after)) {
+                (Some(false) | None, Some(true)) => Some("marked them do-not-contact"),
+                (Some(true), Some(false)) => Some("allowed contacting them again"),
+                _ => None,
+            };
+            // The rest of what changed (do-not-contact and its reason are said by `lead`).
+            let fields: Vec<&str> = changed_fields(c)
+                .into_iter()
+                .filter(|f| lead.is_none() || !matches!(*f, "do-not-contact" | "do-not-contact reason"))
+                .collect();
+            let rest = if fields.len() > 4 {
                 format!("changed {} and {} more", fields[..3].join(", "), fields.len() - 3)
             } else {
                 format!("changed {}", join_and(&fields))
+            };
+            match (lead, fields.is_empty()) {
+                (Some(l), true) => l.to_owned(),
+                (Some(l), false) => format!("{l} and {rest}"),
+                (None, true) => "saved it".to_owned(),
+                (None, false) => rest,
             }
         }
     }
@@ -534,6 +542,137 @@ pub fn matches(q: &str, fields: &[Option<&str>]) -> bool {
     q.is_empty() || fields.iter().flatten().any(|f| f.to_lowercase().contains(&q))
 }
 
+// ---- who a record is, safely ----------------------------------------------------------------------------------
+
+/// A record's text on one line (a table row, a card): hidden characters (bidi overrides, zero-width marks) left out,
+/// so text copied from a web page can't make one name look like another.
+pub fn shown(s: &str) -> String {
+    crate::approval::strip_hidden(s, false)
+}
+
+/// A record's text where the owner reads or decides on it (the panel, the do-not-contact confirmation): hidden
+/// characters written out as `⟨U+202E⟩`.
+pub fn revealed(s: &str, multiline: bool) -> String {
+    crate::approval::reveal(s, multiline).0
+}
+
+// ---- keeping a list current from one changed row ----------------------------------------------------------------
+
+/// Whether a company passes the list's search and tag, as the API decides (any case, anywhere in the field).
+pub fn company_matches(c: &CrmCompany, q: &str, tag: Option<&str>) -> bool {
+    let tagged = tag.is_none_or(|t| c.tags.iter().any(|x| x.trim().eq_ignore_ascii_case(t.trim())));
+    tagged
+        && matches(q, &[Some(&c.name), c.domain.as_deref(), c.industry.as_deref(), c.location.as_deref(), c.description.as_deref()])
+}
+
+pub fn contact_matches(c: &CrmContact, q: &str, tag: Option<&str>, dnc: Option<bool>) -> bool {
+    let tagged = tag.is_none_or(|t| c.tags.iter().any(|x| x.trim().eq_ignore_ascii_case(t.trim())));
+    tagged
+        && dnc.is_none_or(|d| c.do_not_contact == d)
+        && matches(q, &[Some(&c.name), c.email.as_deref(), c.title.as_deref(), c.notes.as_deref(), c.company_name.as_deref()])
+}
+
+pub fn deal_matches(d: &CrmDeal, q: &str, stage: Option<DealStage>) -> bool {
+    stage.is_none_or(|s| d.stage == s) && matches(q, &[Some(&d.title), d.next_step.as_deref(), d.company_name.as_deref()])
+}
+
+/// What putting a changed row into a list did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upsert {
+    Inserted,
+    Updated,
+    Removed,
+    /// It isn't in the list and doesn't belong there.
+    Unchanged,
+}
+
+/// Put the fresh copy of row `id` into `rows` (sorted by `before`): `fresh` is `None` when it is gone (deleted),
+/// `keep` says whether it passes the list's filters. The row moves to where the sort puts it.
+pub fn upsert<T>(
+    rows: &mut Vec<T>,
+    id: Uuid,
+    fresh: Option<T>,
+    id_of: impl Fn(&T) -> Uuid,
+    keep: impl Fn(&T) -> bool,
+    before: impl Fn(&T, &T) -> bool,
+) -> Upsert {
+    let old = rows.iter().position(|r| id_of(r) == id);
+    if let Some(i) = old {
+        rows.remove(i);
+    }
+    match fresh.filter(|r| keep(r)) {
+        Some(r) => {
+            let at = rows.iter().position(|x| before(&r, x)).unwrap_or(rows.len());
+            rows.insert(at, r);
+            if old.is_some() { Upsert::Updated } else { Upsert::Inserted }
+        }
+        None if old.is_some() => Upsert::Removed,
+        None => Upsert::Unchanged,
+    }
+}
+
+/// What a change notice for `table` asks the CRM page to refresh: rows of a list (by id, or the whole list when the
+/// notice names no row), and the cheap aggregates (the board, the activity list).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Refresh {
+    pub companies: Vec<Uuid>,
+    pub contacts: Vec<Uuid>,
+    pub deals: Vec<Uuid>,
+    /// Re-page these lists from the start: `[companies, contacts, deals]`.
+    pub full: [bool; 3],
+    pub pipeline: bool,
+    pub activities: bool,
+}
+
+/// More changed rows than this in one batch: re-page the list instead of fetching them one by one.
+pub const ROW_BATCH: usize = 25;
+
+impl Refresh {
+    /// Everything (a resync).
+    pub fn all() -> Self {
+        Self { full: [true; 3], pipeline: true, activities: true, ..Default::default() }
+    }
+
+    /// Add one notice: `table` (`crm_companies`…) and the row's id. Whatever the operation, the row is read again:
+    /// a deleted (or soft-deleted) row comes back missing and leaves the list.
+    pub fn add(&mut self, table: &str, id: Option<Uuid>) {
+        let slot = match table {
+            "crm_companies" => Some(0),
+            "crm_contacts" => Some(1),
+            "crm_deals" => Some(2),
+            "crm_activities" => {
+                self.activities = true;
+                None
+            }
+            _ => None,
+        };
+        let Some(slot) = slot else { return };
+        // A deal card shows its company's and contact's names and do-not-contact.
+        self.pipeline = true;
+        let list = match slot {
+            0 => &mut self.companies,
+            1 => &mut self.contacts,
+            _ => &mut self.deals,
+        };
+        match id {
+            Some(id) if !list.contains(&id) => list.push(id),
+            Some(_) => {}
+            None => self.full[slot] = true,
+        }
+        if list.len() > ROW_BATCH {
+            list.clear();
+            self.full[slot] = true;
+        }
+        if self.full[slot] {
+            list.clear();
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +755,8 @@ mod tests {
         assert_eq!(change_words(&dnc), "marked them do-not-contact");
         let cleared = ch("update", json!({"do_not_contact": true}), json!({"do_not_contact": false}));
         assert_eq!(change_words(&cleared), "allowed contacting them again");
+        let both = ch("update", json!({"do_not_contact": false, "title": "CTO"}), json!({"do_not_contact": true, "dnc_reason": "x", "title": "CEO"}));
+        assert_eq!(change_words(&both), "marked them do-not-contact and changed title");
     }
 
     #[test]
@@ -682,6 +823,77 @@ mod tests {
             assert!(webhook_url_problem(bad).is_err(), "{bad}");
         }
         assert!(webhook_url_problem("https://192.168.1.20/hook").unwrap_err().contains("local network"));
+    }
+
+    #[test]
+    fn hidden_characters_never_pass_as_a_name() {
+        // "Sam" + right-to-left override + "nimdA": looks like "Sam Admin" in a bidi-aware renderer.
+        let spoof = "Sam\u{202e}nimdA\u{200b}";
+        assert_eq!(shown(spoof), "SamnimdA");
+        assert_eq!(revealed(spoof, false), "Sam⟨U+202E⟩nimdA⟨U+200B⟩");
+        assert_eq!(shown("Ann\nLee"), "AnnLee");
+        assert_eq!(revealed("a\nb", true), "a\nb");
+        assert_eq!(shown("Zoë Müller"), "Zoë Müller");
+    }
+
+    #[test]
+    fn rows_match_like_the_api() {
+        let co = CrmCompany { name: "Acme Robotics".into(), domain: Some("acme.io".into()), tags: vec!["SaaS".into()], ..Default::default() };
+        assert!(company_matches(&co, "ROBOT", None));
+        assert!(company_matches(&co, "", Some("saas")));
+        assert!(!company_matches(&co, "", Some("eu")));
+        assert!(!company_matches(&co, "globex", None));
+        let ct = CrmContact { name: "Sam".into(), company_name: Some("Acme".into()), do_not_contact: true, ..Default::default() };
+        assert!(contact_matches(&ct, "acme", None, Some(true)));
+        assert!(!contact_matches(&ct, "", None, Some(false)));
+        let d = CrmDeal { title: "Pilot".into(), stage: DealStage::Meeting, ..Default::default() };
+        assert!(deal_matches(&d, "pil", Some(DealStage::Meeting)));
+        assert!(!deal_matches(&d, "", Some(DealStage::Won)));
+    }
+
+    #[test]
+    fn a_changed_row_finds_its_place() {
+        let id = |n: u128| Uuid::from_u128(n);
+        // (id, score): sorted by score, high first.
+        let mut rows = vec![(id(1), 90), (id(2), 50), (id(3), 10)];
+        let before = |a: &(Uuid, i32), b: &(Uuid, i32)| a.1 > b.1;
+        let of = |r: &(Uuid, i32)| r.0;
+        assert_eq!(upsert(&mut rows, id(3), Some((id(3), 95)), of, |_| true, before), Upsert::Updated);
+        assert_eq!(rows.iter().map(|r| r.1).collect::<Vec<_>>(), vec![95, 90, 50]);
+        assert_eq!(upsert(&mut rows, id(4), Some((id(4), 60)), of, |_| true, before), Upsert::Inserted);
+        assert_eq!(rows.iter().map(|r| r.1).collect::<Vec<_>>(), vec![95, 90, 60, 50]);
+        // It no longer passes the filter, or it was deleted: it leaves.
+        assert_eq!(upsert(&mut rows, id(1), Some((id(1), 91)), of, |r| r.1 < 91, before), Upsert::Removed);
+        assert_eq!(upsert(&mut rows, id(2), None, of, |_| true, before), Upsert::Removed);
+        assert_eq!(upsert(&mut rows, id(9), None, of, |_| true, before), Upsert::Unchanged);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn notices_refresh_only_what_they_touch() {
+        let a = Uuid::from_u128(1);
+        let mut r = Refresh::default();
+        r.add("crm_companies", Some(a));
+        r.add("crm_companies", Some(a));
+        assert_eq!(r.companies, vec![a]);
+        assert!(r.pipeline && !r.activities && r.contacts.is_empty() && r.full == [false; 3]);
+        let mut r = Refresh::default();
+        r.add("crm_activities", Some(a));
+        assert!(r.activities && !r.pipeline && r.companies.is_empty());
+        let mut r = Refresh::default();
+        r.add("crm_webhook_deliveries", Some(a));
+        assert!(r.is_empty());
+        // No id: the whole list; a burst: the whole list too.
+        let mut r = Refresh::default();
+        r.add("crm_contacts", None);
+        assert_eq!(r.full, [false, true, false]);
+        let mut r = Refresh::default();
+        for n in 0..=ROW_BATCH as u128 {
+            r.add("crm_deals", Some(Uuid::from_u128(n)));
+        }
+        assert!(r.full[2] && r.deals.is_empty());
+        r.add("crm_deals", Some(a));
+        assert!(r.deals.is_empty(), "a list being re-paged needs no single rows");
     }
 
     #[test]
