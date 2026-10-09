@@ -377,8 +377,9 @@ impl Db {
 
     /// Pass one decision on: mark the draft handled and, with a message, add it to the draft's thread (as Familiar's
     /// own `system` message) and queue the `followup` run that delivers it. One transaction; None when the draft was
-    /// already handled (or changed since it was read) or there is nothing to deliver.
-    pub async fn queue_draft_followup(&self, d: &DecidedDraft, message: Option<&str>) -> Result<Option<Uuid>> {
+    /// already handled (or changed since it was read) or there is nothing to deliver. `grant`: that run may send the
+    /// approved text once without asking again (see [`crate::drafts::pre_approval`]).
+    pub async fn queue_draft_followup(&self, d: &DecidedDraft, message: Option<&str>, grant: bool) -> Result<Option<Uuid>> {
         let mut tx = self.pool.begin().await?;
         let claimed: Option<Uuid> = sqlx::query_scalar(
             "update approvals set followed_up_at = now()
@@ -408,14 +409,69 @@ impl Db {
         .bind(message)
         .fetch_one(&mut *tx)
         .await?;
-        sqlx::query("update approvals set followup_run_id = $1 where id = $2 and owner_id = $3")
+        sqlx::query("update approvals set followup_run_id = $1, send_granted = $4 where id = $2 and owner_id = $3")
             .bind(run)
             .bind(d.id)
             .bind(self.owner)
+            .bind(grant && d.status == "approved")
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
         Ok(Some(run))
+    }
+
+    /// The approved drafts this `followup` run was given to send once without asking: (draft id, the draft as
+    /// approved, the tool that already used the pre-approval up, if one did).
+    pub async fn send_grants(&self, run: Uuid) -> Result<Vec<(Uuid, Value, Option<String>)>> {
+        let rows: Vec<(Uuid, Json<Value>, Option<String>)> = sqlx::query_as(
+            "select d.id, coalesce(d.edited_input, d.input, '{}'::jsonb), s.tool_name
+             from approvals d
+             join runs r on r.id = d.followup_run_id and r.owner_id = d.owner_id
+             left join approvals s on s.draft_id = d.id
+             where d.followup_run_id = $1 and d.owner_id = $2 and r.kind = 'followup' and d.tool_name = 'propose_draft'
+               and d.status = 'approved' and d.send_granted
+             order by d.decided_at",
+        )
+        .bind(run)
+        .bind(self.owner)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id, j, used)| (id, j.0, used)).collect())
+    }
+
+    /// Use up a draft's send pre-approval for this tool call: records the call as approved by Familiar (`draft_id` =
+    /// the draft, `reason` for the history). None when it was already used (at most one send per draft, enforced by a
+    /// unique index, so two calls racing for it can't both win) or is no longer this run's to use.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn use_send_grant(
+        &self,
+        run: &Run,
+        draft: Uuid,
+        tool_use_id: Option<&str>,
+        tool_name: &str,
+        input: &Value,
+        reason: &str,
+    ) -> Result<Option<Uuid>> {
+        Ok(sqlx::query_scalar(
+            "insert into approvals (run_id, bot_id, owner_id, tool_use_id, tool_name, input, reason, status, decided_by,
+                                    decided_at, draft_id)
+             select $1, $2, $3, $4, $5, $6, $7, 'approved', 'rule', now(), d.id
+             from approvals d
+             where d.id = $8 and d.owner_id = $3 and d.followup_run_id = $1 and d.tool_name = 'propose_draft'
+               and d.status = 'approved' and d.send_granted
+             on conflict (draft_id) where draft_id is not null do nothing
+             returning id",
+        )
+        .bind(run.id)
+        .bind(run.bot_id)
+        .bind(self.owner)
+        .bind(tool_use_id)
+        .bind(tool_name)
+        .bind(Json(input))
+        .bind(reason)
+        .bind(draft)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     /// The draft decisions a `followup` run delivers: (approval id, status).

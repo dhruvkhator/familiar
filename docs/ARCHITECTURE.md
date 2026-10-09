@@ -72,7 +72,9 @@ query in both server and daemon filters by owner** (server: the session's user; 
   (`payload.truncated=true`). The daemon deletes events older than 30 days, daily.
 - `approvals(id, run_id, bot_id, tool_use_id, tool_name, input jsonb, reason, status
    pending|approved|denied|expired, decided_by user|rule|reviewer, response text null, decided_at, created_at)`
-  — also used for `ask_user` questions (tool_name `ask_user`, `input.question`, answer in `response`).
+  — also used for `ask_user` questions (tool_name `ask_user`, `input.question`, answer in `response`), drafts
+  (`propose_draft`; `send_granted` when its follow-up may send it once) and sends Familiar let through as approved
+  drafts (`draft_id`; see "Sending an approved draft" under CRM).
 - `rules(id, bot_id null = all bots, pattern, decision allow|deny|ask|review, note, created_at)`
 - `schedules(id, bot_id, thread_id, cron, prompt, kind scheduled|proactive, enabled, last_run_at, next_run_at)`
 - `memories(id, bot_id, content, source user|bot, created_at)`
@@ -400,6 +402,52 @@ update the match: same domain / same email (else LinkedIn link, else name at the
   needs `source_urls`. One run makes at most `MAX_WRITES_PER_RUN` = 200 changes (counted in `crm_changes` by `run_id`, indexed,
   with the run row locked so parallel calls count in order); past it every write fails with "stop changing the CRM,
   summarise, a later run can carry on".
+
+**Sending an approved draft: one approval per outgoing message** (`familiar_core::drafts`, migration
+`20261010000000_draft_send.sql`). The owner approving a draft (edits allowed) also approves sending it — once, exactly
+as approved, from that draft's own follow-up run. Without this every message was approved twice: the draft, then the
+connector's send (or the browser typing it).
+- *Bound to one run and one draft.* `drafts::sweep` sets `approvals.send_granted` on the draft only when its follow-up
+  message actually passes the text on (approved, no do-not-contact hit, no hidden characters, no media) and the draft's
+  `followup_run_id` is that run. `runner::decide_tool` asks `drafts::pre_approval` only in a `followup` run, after
+  the research-only refusal, the owner's deny rules, the shared-folder and desktop checks and the always-human check
+  (so all of those still win), and before allow rules, auto-review and the owner. No other run (a later chat on the same
+  thread resumes the same session, but it is another run) and no other draft can use it.
+- *Exactly as approved* (`drafts::send_matches`, the draft as the owner approved it, i.e. `edited_input` when they
+  edited it):
+  - **Connector email tools** listed in `drafts::EMAIL_TOOLS`, by the tool name after `mcp__<connector>__` (the
+    connector's name is the owner's choice; Familiar's own `familiar`, `browser` and `desktop` servers never count):
+    `send_gmail_message` (the google-workspace preset, `uvx workspace-mcp`: `to` a string) and `send_email` (the Gmail
+    MCP server `@gongrzhe/server-gmail-autoauth-mcp`: `to` a list). Only for an `email` draft. Recipients: the same
+    set of addresses as the approved `to` (lowercased, any order, `Name <addr>` and `,`/`;` lists understood; no
+    `+tag`/Gmail-dot folding — a different address is a different address); a display name, when the call gives one,
+    must be the approved one; one that doesn't parse as an address asks. `cc`, `bcc`, `attachments` (and `htmlBody`)
+    must be absent or empty; the format field, when present, plain text (`body_format: plain`, `mimeType: text/plain`).
+    Subject: equal (surrounding spaces aside) to the approved one; a draft without one may not gain one. Free: the
+    sending account (`user_google_email`, one the owner connected) and threading fields (`thread_id`, `in_reply_to`,
+    `references`, `threadId`, `inReplyTo`). Any other field asks. Draft-creating tools (`draft_gmail_message`), Slack
+    and anything unrecognised ask as before.
+  - **The browser typing the approved text** (`mcp__browser__browser_type`, any draft kind): `text` equal, `element`
+    / `ref` / `slowly` free, `submit` must be absent or false (Enter can post or send, which is the unverifiable
+    part). Typing is not sending: the **click** on Post/Send still asks. Familiar can't tell what a click (or Enter)
+    lands on — the conversation, the account, a different button — so allowing "one click after the type" would hand
+    every approved draft a free unverifiable click on whatever the page offers. That click's card says the draft's text
+    was just typed in as approved and to check the live view.
+  - *Text normalisation*: `\r\n` = `\n`, and line breaks at the very end are ignored (models often add one; nobody sees
+    it). Nothing else: no trimming of spaces, no case or Unicode folding, no inner whitespace changes.
+  - *Media*: a draft with media gets no pre-approval at all (the files live in the teammate's workspace and can change
+    after the owner looked at them, even between the check and the connector reading them; and its text alone is not
+    what was approved), and a call with any attachment asks.
+- *One shot.* The first matching call uses the pre-approval up: Familiar records it as its own `approvals` row
+  (`status approved`, `decided_by rule`, `reason` "Sent as approved (draft #id)", `draft_id` = the draft, the call's
+  tool and input), so the Approvals history and the run's activity (an `approval` event with `approval_id` and
+  `draft_id`) show exactly what went out. A unique index on `draft_id` makes it one per draft even when two calls race;
+  a second send of the same text, or a retry after the first failed, asks. The pre-approval ends with its run (bound
+  to the run id). CRM activity logging is unchanged (the teammate logs `email_sent`/`dm_sent` with the draft id).
+- *Do-not-contact first.* Right before using it, `crm::teammate::draft_dnc` runs again on the approved draft; a hit (or
+  a failed check) asks the owner instead, and the card says why. A call that relates to a draft but differs from it
+  asks with a line saying how ("Not exactly draft #id as you approved it: the recipients differ…").
+- The follow-up message tells the teammate which one send won't ask again (and that the click still does).
 
 **Webhooks** (`crm::webhooks`, API `routes/crm_webhooks.rs`, owner only: teammates have no API access). `GET/POST
 /api/crm/webhooks`, `GET/PATCH/DELETE /api/crm/webhooks/{id}`, `POST /api/crm/webhooks/{id}/test` (a `ping`, sent at

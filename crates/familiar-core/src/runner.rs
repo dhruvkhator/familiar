@@ -663,7 +663,9 @@ impl Decision {
 }
 
 /// The engine-neutral permission decision for one tool call (Claude's can_use_tool, Codex's approval requests):
-/// research-only → deny; owner deny rules → deny; always-human → owner; safe navigation / owner allow rules → allow; `review` rules → reviewer; everything else → owner. The rules are
+/// research-only → deny; owner deny rules → deny; always-human → owner; a draft follow-up sending its approved draft
+/// exactly as approved → allow, once ([`drafts::pre_approval`]); safe navigation / owner allow rules → allow; `review`
+/// rules → reviewer; everything else → owner. The rules are
 /// read again for every decision, so one the owner adds or removes counts at once, also in a running session (`rules`,
 /// the run's copy, is only the fallback when the database can't be reached, minus its allow rules). Records an
 /// `approval` event. `can_edit`: the engine runs an edited input (Claude's `updatedInput`; Codex can only accept or
@@ -692,6 +694,9 @@ pub async fn decide_tool(
     let owner = |reason: String| async move {
         human(ctx, run, tool_use_id, tool, input, &reason, rules, can_edit, events, cancel).await
     };
+    // A draft this call relates to (draft follow-ups only): sent as approved, or a line for the owner's card.
+    let mut sent: Option<(Uuid, Uuid)> = None;
+    let mut draft_note: Option<String> = None;
     let (status, by, message, edited) = if run.research() {
         ("denied".to_owned(), "rule", "This is a research-only run: it can look things up but cannot act.".to_owned(), None)
     } else if let Some(rule) = permissions::owner_denies(rules, tool, input) {
@@ -717,12 +722,23 @@ pub async fn decide_tool(
     } else if let Some(why) = permissions::always_human(tool, input) {
         // Neither owner rules nor the reviewer can unlock these.
         owner(format!("Always needs you: this {why}.")).await
+    } else if let Some((draft, approval, reason)) = match drafts::pre_approval(ctx, run, tool, input, tool_use_id).await {
+        // The owner approved this exact message as a draft: its one send needs no second approval.
+        Some(drafts::PreApproval::Sent { draft, approval, reason }) => Some((draft, approval, reason)),
+        Some(drafts::PreApproval::Ask(note)) => {
+            draft_note = Some(note);
+            None
+        }
+        None => None,
+    } {
+        sent = Some((draft, approval));
+        ("approved".to_owned(), "rule", reason, None)
     } else if permissions::safe_navigation(tool, input).await {
         ("approved".to_owned(), "rule", String::new(), None)
     } else if let Some(rule) = permissions::owner_allows(rules, tool, input) {
         ("approved".to_owned(), "rule", format!("allowed by rule `{}`", rule.pattern), None)
     } else {
-        let mut reason = engine_reason.map(str::to_owned);
+        let mut reason = draft_note.or_else(|| engine_reason.map(str::to_owned));
         let mut verdict = None;
         if let Some(rule) = permissions::review_rule(rules, tool, input) {
             match reviewer::review(ctx, run, tool, input, rules).await {
@@ -737,11 +753,14 @@ pub async fn decide_tool(
         }
     };
     let allow = status == "approved";
-    send(
-        events,
-        "approval",
-        json!({ "tool_name": tool, "status": status, "decided_by": by, "reason": message, "edited": edited.is_some() }),
-    );
+    let mut event =
+        json!({ "tool_name": tool, "status": status, "decided_by": by, "reason": message, "edited": edited.is_some() });
+    if let Some((draft, approval)) = sent {
+        event["approval_id"] = json!(approval);
+        event["draft_id"] = json!(draft);
+        event["input"] = input.clone();
+    }
+    send(events, "approval", event);
     Verdict { allow, message: if allow { String::new() } else { message }, input: edited.filter(|_| allow) }
 }
 

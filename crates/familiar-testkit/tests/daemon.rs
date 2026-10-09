@@ -1905,5 +1905,209 @@ async fn drafts_to_do_not_contact_people() {
     let p = h.invocation(1).prompt();
     assert!(p.contains(&format!("marked do-not-contact in the CRM now (contact {kim_id})")) && p.contains("Don't send it"), "{p}");
     assert!(!p.contains("BEGIN APPROVED") && !p.contains("Hello Kim") && !p.contains("Kim is"), "{p}");
+    let granted: bool = sqlx::query_scalar("select send_granted from approvals where id = $1").bind(drafts[0]).fetch_one(&h.pool).await.unwrap();
+    assert!(!granted, "a draft that isn't passed on can't be sent without asking either");
+    h.finish().await;
+}
+
+/// The approvals of a run: (tool, status, decided_by, reason, draft_id), oldest first.
+async fn approval_rows(h: &H, run: Uuid) -> Vec<(String, String, Option<String>, Option<String>, Option<Uuid>)> {
+    sqlx::query_as("select tool_name, status, decided_by, reason, draft_id from approvals where run_id = $1 order by created_at")
+        .bind(run)
+        .fetch_all(&h.pool)
+        .await
+        .unwrap()
+}
+
+/// The run's pending approval other than `prev`: (id, reason).
+async fn next_pending(h: &H, run: Uuid, prev: Option<Uuid>) -> (Uuid, Option<String>) {
+    wait_for("the next pending approval", || async {
+        Ok(sqlx::query_as::<_, (Uuid, Option<String>)>(
+            "select id, reason from approvals where run_id = $1 and status = 'pending' and id is distinct from $2",
+        )
+        .bind(run)
+        .bind(prev)
+        .fetch_optional(&h.pool)
+        .await?)
+    })
+    .await
+}
+
+/// One approval per outgoing message: the follow-up of an approved (and edited) email draft sends it through the email
+/// connector without asking again, once, recorded as "sent as approved"; sending it a second time, a changed version,
+/// or the same email from a run that isn't that follow-up all ask.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approved_email_is_sent_once_without_asking_again() {
+    let Some(mut h) = setup("approved_email_is_sent_once_without_asking_again").await else { return };
+    let send = |body: &str| {
+        tool("mcp__google-workspace__send_gmail_message", json!({
+            "user_google_email": "me@mycorp.com", "to": "sam@acme.com", "subject": "Hi", "body": body,
+        }))
+    };
+    h.scenario(json!([
+        [{ "init": {} },
+         mcp("propose_draft", json!({ "kind": "email", "channel": "Gmail", "to": "Sam <sam@acme.com>", "subject": "Hi", "body": "Hello Sam" })),
+         { "result": "proposed" }],
+        [{ "init": {} }, send("Hello Sam, as promised.\n"), send("Hello Sam, as promised."), send("Hello Sam, as promised!"),
+         { "result": "sent" }],
+        [{ "init": {} }, send("Hello Sam, as promised."), { "result": "tried" }],
+    ]));
+    h.start();
+    let bot = h.bot("outbound").await;
+    let thread = h.thread(bot).await;
+    let run = h.say(thread, "write to Sam").await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+    let (draft, input): (Uuid, sqlx::types::Json<Value>) =
+        sqlx::query_as("select id, input from approvals where run_id = $1").bind(run).fetch_one(&h.pool).await.unwrap();
+    let short = draft.simple().to_string()[..8].to_owned();
+    let mut edited = input.0.clone();
+    edited["body"] = json!("Hello Sam, as promised.");
+    h.decide_edited(draft, edited).await;
+    let follow = followup_run(&h, draft).await;
+    let granted: bool = sqlx::query_scalar("select send_granted from approvals where id = $1").bind(draft).fetch_one(&h.pool).await.unwrap();
+    assert!(granted);
+
+    // 1. the approved email (a trailing line break aside): no question. 2. the same email again: asks.
+    let (second, reason) = next_pending(&h, follow, None).await;
+    assert_eq!(reason, Some(format!("Draft #{short} was already sent as approved in this run: this would send it again.")));
+    h.decide(second, "denied", None).await;
+    // 3. a changed word: asks, saying how it differs.
+    let (third, reason) = next_pending(&h, follow, Some(second)).await;
+    assert_eq!(reason, Some(format!("Not exactly draft #{short} as you approved it: the text differs from the approved one.")));
+    h.decide(third, "denied", None).await;
+    assert_eq!(h.finished(follow).await.0, "succeeded");
+
+    let inv = h.invocation(1);
+    assert!(inv.prompt().contains("won't be asked again for one send of exactly this"), "{}", inv.prompt());
+    let d = inv.decisions();
+    assert_eq!(d.len(), 3, "{d:?}");
+    assert_eq!(d[0]["behavior"], "allow");
+    assert_eq!(d[0]["updatedInput"]["body"], "Hello Sam, as promised.\n", "the call runs exactly as checked");
+    assert_eq!((d[1]["behavior"].as_str(), d[2]["behavior"].as_str()), (Some("deny"), Some("deny")));
+    let rows = approval_rows(&h, follow).await;
+    let sent_reason = format!("Sent as approved (draft #{short})");
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(
+        rows[0],
+        ("mcp__google-workspace__send_gmail_message".into(), "approved".into(), Some("rule".into()), Some(sent_reason.clone()), Some(draft))
+    );
+    assert!(rows[1..].iter().all(|r| r.1 == "denied" && r.4.is_none()), "{rows:?}");
+    // the run's activity shows the send and the draft it carried out
+    let ev = h.events(follow).await;
+    let shown = ev.iter().find(|e| e.1 == "approval" && e.2["reason"] == sent_reason.as_str()).expect("the send's approval event");
+    assert_eq!(
+        (shown.2["status"].as_str(), shown.2["decided_by"].as_str(), shown.2["draft_id"].as_str()),
+        (Some("approved"), Some("rule"), Some(draft.to_string().as_str()))
+    );
+
+    // Another run on the same thread (same session) gets no pre-approval: the exact email asks.
+    let later = h.say(thread, "send it again").await;
+    let (ask, reason) = next_pending(&h, later, None).await;
+    assert!(reason.as_deref().is_none_or(|r| !r.contains("draft #")), "{reason:?}");
+    h.decide(ask, "denied", None).await;
+    assert_eq!(h.finished(later).await.0, "succeeded");
+    assert_eq!(h.invocation(2).decisions()[0]["behavior"], "deny");
+    let sends: i64 = sqlx::query_scalar("select count(*) from approvals where draft_id is not null").fetch_one(&h.pool).await.unwrap();
+    assert_eq!(sends, 1);
+    h.finish().await;
+}
+
+/// The browser: typing exactly the approved post doesn't ask again, once; the click that posts it still asks (its card
+/// says the draft's text was just typed in); typing it again asks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approved_post_is_typed_without_asking_but_the_click_asks() {
+    let Some(mut h) = setup("approved_post_is_typed_without_asking_but_the_click_asks").await else { return };
+    let typed = tool("mcp__browser__browser_type", json!({ "element": "Post text", "ref": "e5", "text": "Drafts ship today." }));
+    h.scenario(json!([
+        [{ "init": {} }, mcp("propose_draft", json!({ "kind": "post", "channel": "X", "body": "Drafts ship today." })), { "result": "proposed" }],
+        [{ "init": {} }, typed.clone(), tool("mcp__browser__browser_click", json!({ "element": "Post button", "ref": "e9" })), typed,
+         { "result": "posted" }],
+    ]));
+    h.start();
+    let bot = h.bot("poster").await;
+    let thread = h.thread(bot).await;
+    let run = h.say(thread, "draft a post").await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+    let draft: Uuid = sqlx::query_scalar("select id from approvals where run_id = $1").bind(run).fetch_one(&h.pool).await.unwrap();
+    let short = draft.simple().to_string()[..8].to_owned();
+    h.decide(draft, "approved", None).await;
+    let follow = followup_run(&h, draft).await;
+
+    let (click, reason) = next_pending(&h, follow, None).await;
+    let reason = reason.unwrap_or_default();
+    assert!(reason.starts_with(&format!("Draft #{short}'s approved text was typed in without asking you again.")), "{reason}");
+    let tool_name: String = sqlx::query_scalar("select tool_name from approvals where id = $1").bind(click).fetch_one(&h.pool).await.unwrap();
+    assert_eq!(tool_name, "mcp__browser__browser_click");
+    h.decide(click, "approved", None).await;
+    let (again, reason) = next_pending(&h, follow, Some(click)).await;
+    assert_eq!(reason, Some(format!("Draft #{short} was already sent as approved in this run: this would send it again.")));
+    h.decide(again, "denied", None).await;
+    assert_eq!(h.finished(follow).await.0, "succeeded");
+
+    let d: Vec<String> = h.invocation(1).decisions().iter().map(|d| d["behavior"].as_str().unwrap().to_owned()).collect();
+    assert_eq!(d, ["allow", "allow", "deny"]);
+    let rows: Vec<(String, String, Option<Uuid>)> = approval_rows(&h, follow).await.into_iter().map(|r| (r.0, r.1, r.4)).collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("mcp__browser__browser_type".to_owned(), "approved".to_owned(), Some(draft)),
+            ("mcp__browser__browser_click".to_owned(), "approved".to_owned(), None),
+            ("mcp__browser__browser_type".to_owned(), "denied".to_owned(), None),
+        ]
+    );
+    h.finish().await;
+}
+
+/// The do-not-contact check runs again right before the pre-approved send: a recipient who opted out after the
+/// follow-up was queued gets nothing without the owner (who is told why).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pre_approved_send_rechecks_do_not_contact() {
+    use familiar_core::crm::{self, Actor, ContactInput};
+    let Some(mut h) = setup("pre_approved_send_rechecks_do_not_contact").await else { return };
+    let db = familiar_core::db::Db { pool: h.pool.clone(), owner: h.owner };
+    let (kim, _) = crm::upsert_contact(&db, &Actor::User, &ContactInput {
+        name: Some("Kim".into()), email: Some("kim@acme.com".into()), ..Default::default()
+    })
+    .await
+    .unwrap();
+    let kim: Uuid = kim["id"].as_str().unwrap().parse().unwrap();
+    let email = json!({ "to": ["kim@acme.com"], "subject": "Hi", "body": "Hello Kim" });
+    h.scenario(json!([
+        [{ "init": {} },
+         mcp("propose_draft", json!({ "kind": "email", "channel": "Gmail", "to": "kim@acme.com", "subject": "Hi", "body": "Hello Kim" })),
+         { "result": "proposed" }],
+        [{ "init": {} }, { "sleep_ms": 2500 }, { "result": "long job done" }],
+        [{ "init": {} }, tool("mcp__gmail__send_email", email), { "result": "tried" }],
+    ]));
+    h.start();
+    let bot = h.bot("outbound").await;
+    let thread = h.thread(bot).await;
+    let run = h.say(thread, "write to Kim").await;
+    assert_eq!(h.finished(run).await.0, "succeeded");
+    let draft: Uuid = sqlx::query_scalar("select id from approvals where run_id = $1").bind(run).fetch_one(&h.pool).await.unwrap();
+    // approved while the teammate is busy: the follow-up waits in the queue, pre-approved...
+    let work = h.thread(bot).await;
+    let long = h.say(work, "long job").await;
+    h.wait_status(long, "running").await;
+    h.decide(draft, "approved", None).await;
+    let follow = followup_run(&h, draft).await;
+    let granted: bool = sqlx::query_scalar("select send_granted from approvals where id = $1").bind(draft).fetch_one(&h.pool).await.unwrap();
+    assert!(granted);
+    // ...and Kim says stop before it runs
+    crm::patch_contact(&db, &Actor::User, kim, &ContactInput { do_not_contact: Some(true), ..Default::default() }).await.unwrap();
+    assert_eq!(h.finished(long).await.0, "succeeded");
+    let (ask, reason) = next_pending(&h, follow, None).await;
+    let short = draft.simple().to_string()[..8].to_owned();
+    assert_eq!(
+        reason,
+        Some(format!(
+            "Not sent as approved: draft #{short} now reaches or names a person marked do-not-contact in the CRM (contact {kim})."
+        ))
+    );
+    h.decide(ask, "denied", None).await;
+    assert_eq!(h.finished(follow).await.0, "succeeded");
+    assert_eq!(h.invocation(2).decisions()[0]["behavior"], "deny");
+    let sends: i64 = sqlx::query_scalar("select count(*) from approvals where draft_id is not null").fetch_one(&h.pool).await.unwrap();
+    assert_eq!(sends, 0);
     h.finish().await;
 }

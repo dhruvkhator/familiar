@@ -201,6 +201,8 @@ pub struct ApprovalEvent {
     pub reason: Option<String>,
     /// The owner changed the input (or the draft) before approving.
     pub edited: bool,
+    /// Sent as this approved draft, without asking again (`approval_id` is the send's own record).
+    pub draft_id: Option<Uuid>,
 }
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ArtifactEvent {
@@ -276,6 +278,7 @@ impl Event {
                 decided_by: s(p, &["decided_by"]),
                 reason: s(p, &["reason"]),
                 edited: p.get("edited").and_then(Value::as_bool).unwrap_or(false),
+                draft_id: s(p, &["draft_id"]).and_then(|x| x.parse().ok()),
             }),
             EventKind::Artifact => match s(p, &["artifact_id", "id"]).and_then(|x| x.parse().ok()) {
                 Some(artifact_id) => TypedEvent::Artifact(ArtifactEvent {
@@ -324,12 +327,23 @@ pub struct Approval {
     pub edited_input: Option<Value>,
     /// A desktop step with a picture of the screen around its target (`/api/approvals/{id}/preview`, while waiting).
     pub has_preview: bool,
+    /// A draft whose follow-up run was given its approved text: that run may send it once, exactly as approved,
+    /// without asking again.
+    pub send_granted: bool,
+    /// For a call Familiar let through as an approved draft's one send ("Sent as approved (draft #…)", `decided_by`
+    /// rule): that draft's id.
+    pub draft_id: Option<Uuid>,
 }
 
 impl Approval {
     /// A teammate's draft (`propose_draft`): a post, reply, email, DM or comment waiting for the owner.
     pub fn is_draft(&self) -> bool {
         self.tool_name == "propose_draft"
+    }
+
+    /// The send of an approved draft that went through without asking again (see [`Approval::draft_id`]).
+    pub fn sent_as_approved(&self) -> bool {
+        self.draft_id.is_some()
     }
 }
 
