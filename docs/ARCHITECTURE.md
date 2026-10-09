@@ -363,7 +363,7 @@ stage?, tags?, company_id?, limit ≤ 50}`, `crm_get {kind, id}` (a company with
 activities; a contact with its deals; a deal with its timeline), `crm_pipeline` (per stage: count, value, newest 10),
 `crm_upsert_company`, `crm_upsert_contact`, `crm_upsert_deal` (each `{id?}` to change one record, else create or
 update the match: same domain / same email (else LinkedIn link, else name at the company) / same company + title),
-`crm_move_deal {deal_id, stage, note}` (logs a `stage_change`), `crm_log_activity` (any kind but `stage_change`;
+`crm_move_deal {deal_id, stage, note}` (with the note; every stage move, however made, logs a `stage_change`), `crm_log_activity` (any kind but `stage_change`;
 `draft` = the `#id` of one of the teammate's own drafts links the activity to it). No delete tool.
 
 **Trust model** (`crm::teammate`):
@@ -380,21 +380,30 @@ update the match: same domain / same email (else LinkedIn link, else name at the
   what a teammate set, maintain `fit_score` / `fit_reason` (companies) and `stage` / `next_step` / `next_step_at`
   (deals), except that a deal the owner closed (won/lost) stays closed; add tags and `source_urls` (merged, never
   removed, at most 20); set do-not-contact. To let a teammate change a held field, the owner makes the change.
-- *Do-not-contact.* Anyone sets it; only the owner clears it (a teammate gets an error). Records come back flagged
-  (`warning`; deals carry `contact_do_not_contact`). `propose_draft` refuses a draft whose `to` names a do-not-contact
-  contact by email (any case, inside `Name <addr>`, lists, `mailto:`), `@handle`/X profile link or LinkedIn profile
-  link (any subdomain, query, trailing slash); soft-deleted contacts still count. The check runs again in
-  `drafts::sweep` before an approved draft's follow-up is queued: if the recipient became do-not-contact meanwhile, the
-  follow-up says the draft was approved but must not be sent (and no text is passed on); if the check itself fails the
-  draft waits for the next tick.
+- *Do-not-contact.* Anyone sets it; only the owner clears it (a teammate gets an error; a CSV import only ever sets it,
+  so re-importing an old export never lifts one or its reason). Who a do-not-contact person is never changes through a
+  teammate: their email, X handle, LinkedIn link, name and company are kept (listed under `kept_owner_values`) whoever
+  set them, and a teammate adding them under a new address finds the same record (contacts match by email, else, when
+  no contact has that email, by LinkedIn link, else by name at the company). Records come back flagged (`warning`;
+  deals and board cards carry `contact_do_not_contact`).
+- *Drafts.* `propose_draft` needs a recipient (`to`) for every kind but a new post, and an email's `to` must be email
+  addresses. It refuses a draft whose `to`, subject, body or note reaches or names a do-not-contact contact: an email
+  address, `@handle`/X profile link or LinkedIn profile link the contact has or ever had (current values plus every
+  before/after in its change log; soft-deleted contacts count). Matching is canonical: case, `Name <addr>`, lists,
+  `mailto:` and `?…`, trailing dots, `+tags`, Gmail dots and `googlemail.com`, LinkedIn subdomains, queries, trailing
+  slashes and percent-escapes, and characters that don't show. The refusal names the contact by id only (a name in the
+  CRM may have come from a web page). The check runs again in `drafts::sweep` on the approved version (`to`, subject,
+  body) before its follow-up is queued: if it now reaches a do-not-contact contact, the follow-up says the draft was
+  approved but must not be sent, names the contact by id and passes no text on; if the check itself fails the draft
+  waits for the next tick.
 - *Limits.* Research-only runs (`proactive`, `dream`) may only search and read. A teammate's new company or contact
-  needs `source_urls`. One run makes at most `MAX_WRITES_PER_RUN` = 200 changes (counted in `crm_changes` by `run_id`,
+  needs `source_urls`. One run makes at most `MAX_WRITES_PER_RUN` = 200 changes (counted in `crm_changes` by `run_id`, indexed,
   with the run row locked so parallel calls count in order); past it every write fails with "stop changing the CRM,
   summarise, a later run can carry on".
 
 **Webhooks** (`crm::webhooks`, API `routes/crm_webhooks.rs`, owner only: teammates have no API access). `GET/POST
 /api/crm/webhooks`, `GET/PATCH/DELETE /api/crm/webhooks/{id}`, `POST /api/crm/webhooks/{id}/test` (a `ping`, sent at
-once, never retried, answers with its delivery), `GET /api/crm/webhooks/{id}/deliveries?limit` (newest first, with
+once, stored already settled, never retried; answers with its delivery), `GET /api/crm/webhooks/{id}/deliveries?limit` (newest first, with
 payloads). At most 20 per owner. The secret (`whsec_` + 64 hex) is made by the server, returned only in the create
 answer, stored sealed with `SecretBox` (needs `FAMILIAR_SECRET_KEY`; 503 otherwise). Turning a webhook off fails its
 waiting deliveries.
@@ -406,7 +415,8 @@ waiting deliveries.
 - Delivery: queued in the transaction of the change, sent by a daemon loop (woken by the delivery's notice, else every
   30 s; 20 per batch, 4 at a time, each claimed with a 10-minute lease first). POST with `Content-Type:
   application/json`, `Familiar-Event`, `Familiar-Delivery`, `Familiar-Signature`; 10 s timeout, redirects not followed,
-  no proxy, at most 256 KB. 2xx = delivered; anything else is retried after 1 m, 5 m, 30 m, 2 h and 6 h, then `failed`.
+  no proxy, at most 256 KB. 2xx = delivered; no answer, a 5xx, a redirect, 408 or 429 is retried after 1 m, 5 m, 30 m,
+  2 h and 6 h, then `failed`; any other 4xx, a payload over the limit or a secret the key can't open fails at once.
   Delivered and failed rows are pruned after 30 days.
 - **Verifying a delivery:** `Familiar-Signature: t=<unix seconds>,v1=<hex>` where `hex = HMAC-SHA256(key = the secret
   string exactly as shown, including "whsec_", message = "<t>.<raw request body>")`. Compute it over the raw bytes,
