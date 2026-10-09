@@ -34,6 +34,7 @@ use crate::sidebar::{self, Sidebar};
 use crate::bot_settings::{BotSettings, CreateEvent};
 use crate::chat::{BotPage, TAB_FILES, TAB_SETTINGS};
 use crate::integrations::IntegrationsPage;
+use crate::rules::RulesPage;
 use crate::schedules::SchedulesPage;
 use crate::settings::AppSettings;
 use crate::data::{AppData, DataEvent, Status, Teammate, ago, excerpt, run_status, tail, until};
@@ -52,6 +53,7 @@ pub enum Route {
     Crm,
     Teammate(SharedString),
     Integrations,
+    Rules,
     Settings,
     NewTeammate,
 }
@@ -86,6 +88,7 @@ pub struct Shell {
     integrations: Option<Entity<IntegrationsPage>>,
     /// `--open integrations/<preset>` before the page exists: open that preset's install form.
     install: Option<String>,
+    rules: Option<Entity<RulesPage>>,
     crm: Option<Entity<CrmPage>>,
     /// `--open crm/<tab>` before the CRM page exists: (tab, the deals as a list).
     crm_tab: Option<(Tab, bool)>,
@@ -200,6 +203,7 @@ impl Shell {
             schedules: None,
             integrations: None,
             install: None,
+            rules: None,
             crm: None,
             crm_tab: None,
             crew: None,
@@ -216,7 +220,7 @@ impl Shell {
     }
 
     /// Open a page by name: `today`, `needs`, `schedules`, `crm` (or `crm/contacts`, `crm/pipeline`, `crm/deals`,
-    /// `crm/activity`), `crew`, `integrations` (or `integrations/<preset>`: that connector's install form),
+    /// `crm/activity`), `crew`, `integrations` (or `integrations/<preset>`: that connector's install form), `rules`,
     /// `settings`, `first`, a teammate's name or `bot:<id>`, optionally with `/settings` or `/files` for that tab of
     /// its page. Returns whether it matched.
     pub fn open(&mut self, target: &str, cx: &mut Context<Self>) -> bool {
@@ -267,6 +271,7 @@ impl Shell {
             "today" => Some(Route::Today),
             "needs" => Some(Route::NeedsYou),
             "schedules" => Some(Route::Schedules),
+            "rules" => Some(Route::Rules),
             "settings" => Some(Route::Settings),
             "new" => Some(Route::NewTeammate),
             _ => {
@@ -310,6 +315,10 @@ impl Shell {
             let shown = route == Route::Integrations;
             p.update(cx, |p, cx| p.set_shown(shown, cx));
         }
+        if let Some(p) = self.rules.clone() {
+            let shown = route == Route::Rules;
+            p.update(cx, |p, cx| p.set_shown(shown, cx));
+        }
         // A teammate's page that leaves the screen wipes what it showed only once (a trigger's new address).
         if let Route::Teammate(id) = self.route.current().clone()
             && route != Route::Teammate(id.clone())
@@ -344,6 +353,11 @@ impl Shell {
     /// Integrations, if it was opened.
     pub fn integrations_page(&self) -> Option<Entity<IntegrationsPage>> {
         self.integrations.clone()
+    }
+
+    /// Rules, if it was opened.
+    pub fn rules_page(&self) -> Option<Entity<RulesPage>> {
+        self.rules.clone()
     }
 
     /// App Settings, if it was opened.
@@ -455,6 +469,11 @@ impl Shell {
                 } else {
                     page.into_any_element()
                 }
+            }
+            Route::Rules => {
+                let (data, toasts) = (self.data.clone(), self.toasts.clone());
+                let page = self.rules.get_or_insert_with(|| cx.new(|cx| RulesPage::new(data, toasts, cx))).clone();
+                self.scrolled(page.into_any_element())
             }
             Route::Settings => {
                 let (data, toasts) = (self.data.clone(), self.toasts.clone());

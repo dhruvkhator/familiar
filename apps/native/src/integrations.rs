@@ -1007,16 +1007,22 @@ impl Render for IntegrationsPage {
             .child(
                 div()
                     .flex()
-                    .items_start()
+                    .items_center()
                     .gap(px(10.0))
                     .px(px(14.0))
                     .py(px(10.0))
                     .rounded(px(RADIUS_CONTROL))
                     .bg(theme.sunken)
-                    .child(div().pt(px(1.0)).child(icon(icons::SHIELD).size(px(16.0)).text_color(theme.accent)))
+                    .child(icon(icons::SHIELD).size(px(16.0)).text_color(theme.accent))
                     .child(div().flex_1().min_w_0().text_size(px(text::SMALL)).text_color(theme.ink).child(
-                        "A teammate asks you before it uses a connector's tools, until you allow them: \"Always allow\" on an approval does that for tools that only read.",
-                    )),
+                        "A teammate asks you before it uses a connector's tools, until you allow them: from an approval (\"Always allow\", for tools that only read) or with a rule.",
+                    ))
+                    .child(
+                        Button::new("conn-rules", "Rules")
+                            .size(ButtonSize::Small)
+                            .icon(icons::SHIELD)
+                            .on_click(|_, _, cx| crate::shell::open_page("rules", cx)),
+                    ),
             )
             .child(
                 div()

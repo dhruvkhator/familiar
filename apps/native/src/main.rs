@@ -43,6 +43,7 @@ mod notify;
 mod perf;
 mod prefs;
 mod root;
+mod rules;
 mod schedules;
 mod settings;
 mod setup;

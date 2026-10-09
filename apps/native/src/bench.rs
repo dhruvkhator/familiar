@@ -280,7 +280,7 @@ impl Fixture {
             approvals,
             schedules,
             crm: crate::bench_crm::Crm::new(now, crew_ids(), empty_crm),
-            parity: crate::bench_parity::Parity::new(now, page, id(ADA), (id(0x301), id(0x303))),
+            parity: crate::bench_parity::Parity::new(now, page, id(ADA), (id(0x301), id(0x303)), (id(MILO), id(PIP))),
         }
     }
 
@@ -329,7 +329,7 @@ impl Fixture {
         let path = target.split('?').next().unwrap_or("/");
         let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
         if let ["api", rest @ ..] = segs.as_slice()
-            && let Some(v) = self.parity.get(rest).or_else(|| self.crm.get(rest, &crate::bench_crm::query(target)))
+            && let Some(v) = self.parity.get(rest, &crate::bench_crm::query(target)).or_else(|| self.crm.get(rest, &crate::bench_crm::query(target)))
         {
             return Some(v);
         }
@@ -616,6 +616,28 @@ async fn shot(page: &str, window: WindowHandle<BenchRoot>, shell: &Entity<Shell>
     }
     if page.starts_with("teammate-") {
         return teammate_shot(page, window, shell, cx).await;
+    }
+    // `rules` (every rule, by who it's for), `rules-add` (adding one that lets a teammate run anything: the warning),
+    // `rules-locked` (scrolled to the end).
+    if page.starts_with("rules") {
+        cx.update(|cx| shell.update(cx, |s, cx| s.navigate(Route::Rules, cx)));
+        until(cx, Duration::from_secs(5), |cx| shell.read(cx).rules_page().is_some()).await;
+        wait(cx, Duration::from_millis(600)).await;
+        match page {
+            "rules-add" => {
+                let _ = window.update(cx, |_, window, cx| {
+                    if let Some(p) = shell.read(cx).rules_page() {
+                        p.update(cx, |p, cx| p.fill("Bash", 0, window, cx));
+                    }
+                });
+            }
+            "rules-locked" => cx.update(|cx| shell.update(cx, |s, cx| {
+                s.scroll_page_to(5000.0);
+                cx.notify()
+            })),
+            _ => {}
+        }
+        return;
     }
     match page {
         "chat" => {

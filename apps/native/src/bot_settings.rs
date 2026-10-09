@@ -870,7 +870,16 @@ impl BotSettings {
     fn allowed_view(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
         let list = self.allowed.as_ref()?;
-        let mut col = div().flex().flex_col().gap(px(6.0)).child(label("Allowed without asking"));
+        let mut col = div().flex().flex_col().gap(px(6.0)).child(
+            div().flex().items_center().justify_between().child(label("Allowed without asking")).child(
+                Button::new("bs-all-rules", "All rules")
+                    .ghost()
+                    .size(ButtonSize::Small)
+                    .icon(icons::SHIELD)
+                    .tooltip("Every rule, for every teammate")
+                    .on_click(|_, _, cx| crate::shell::open_page("rules", cx)),
+            ),
+        );
         if list.is_empty() {
             col = col.child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(
                 "Nothing yet. \"Always allow\" on an approval adds a rule here; it takes effect at once and you can remove it.",

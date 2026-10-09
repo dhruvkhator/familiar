@@ -4,7 +4,9 @@
 //! answers their reads (and making a webhook); nothing here is ever written to a real Familiar.
 
 use chrono::{DateTime, Duration, Utc};
-use familiar_client::{Artifact, Channel, Connector, ConnectorPreset, Memory, SecretNames, Skill, Trigger};
+use std::collections::HashMap;
+
+use familiar_client::{Artifact, Channel, Connector, ConnectorPreset, Memory, Rule, RuleDecision, SecretNames, Skill, Trigger};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -28,13 +30,15 @@ pub struct Parity {
     pub memories: Vec<Memory>,
     /// A teammate's files, with their bytes (the Files tab).
     pub artifacts: Vec<(Artifact, Vec<u8>)>,
+    /// Every rule (the Rules page).
+    pub rules: Vec<Rule>,
     now: DateTime<Utc>,
 }
 
 impl Parity {
     /// `answers`: the teammate the channel and the per-teammate data belong to; `runs`: two of its runs (the files'
     /// sources: a short one and a long one).
-    pub fn new(now: DateTime<Utc>, page: &str, answers: Uuid, runs: (Uuid, Uuid)) -> Self {
+    pub fn new(now: DateTime<Utc>, page: &str, answers: Uuid, runs: (Uuid, Uuid), others: (Uuid, Uuid)) -> Self {
         let presets: Vec<ConnectorPreset> = serde_json::from_str(PRESETS).unwrap_or_default();
         let secrets = |env: &[&str], headers: &[&str]| SecretNames {
             env: env.iter().map(|s| (*s).to_owned()).collect(),
@@ -175,15 +179,39 @@ impl Parity {
             file(5, long_run, "launch-plan.pdf", "application/pdf", b"%PDF-1.4\n% a stand-in for the bench\n".repeat(900), 122),
             file(6, long_run, "weekly_active_teams.sql", "application/sql", b"select week, count(distinct team_id) from events group by week;\n".to_vec(), 123),
         ];
-        Self { presets, connectors, channels, triggers, skills, memories, artifacts, now }
+        // Rules: three for every teammate, a few of the teammates' own (one that lets Pip run anything).
+        let (milo, pip) = others;
+        let rule = |n: usize, bot: Option<Uuid>, pattern: &str, decision: RuleDecision, note: Option<&str>, days: i64| Rule {
+            id: pid(7, n),
+            bot_id: bot,
+            pattern: pattern.into(),
+            decision,
+            note: note.map(Into::into),
+            created_at: now - Duration::days(days),
+        };
+        let rules = vec![
+            rule(1, None, "Bash(git status*)", RuleDecision::Allow, Some("Only looks, never changes anything"), 30),
+            rule(2, None, "WebFetch", RuleDecision::Review, None, 28),
+            rule(3, None, "mcp__github__create_pull_request", RuleDecision::Ask, Some("I want to see every pull request first"), 20),
+            rule(4, Some(answers), "Edit(docs/*)", RuleDecision::Allow, None, 12),
+            rule(5, Some(answers), "mcp__github__list_issues", RuleDecision::Allow, None, 6),
+            rule(6, Some(milo), "Bash(npm run deploy*)", RuleDecision::Deny, Some("Deploys are mine"), 9),
+            rule(7, Some(pip), "Bash", RuleDecision::Allow, None, 2),
+        ];
+        Self { presets, connectors, channels, triggers, skills, memories, artifacts, rules, now }
     }
 
     /// The reads (`segs` is the path after `/api`).
-    pub fn get(&self, segs: &[&str]) -> Option<Value> {
+    pub fn get(&self, segs: &[&str], q: &HashMap<String, String>) -> Option<Value> {
         Some(match segs {
             ["connectors"] => json!(self.connectors),
             ["connectors", "presets"] => json!(self.presets),
             ["channels"] => json!(self.channels),
+            // The API's filter: `all` everything, `bot_id` that teammate's own, else the ones for every teammate.
+            ["rules"] => {
+                let bot = q.get("bot_id").and_then(|b| b.parse::<Uuid>().ok());
+                json!(self.rules.iter().filter(|r| q.contains_key("all") || r.bot_id == bot).collect::<Vec<_>>())
+            }
             // Every teammate may use GitHub and the docs server.
             ["bots", _, "connectors"] => json!(self.connectors.iter().filter(|c| c.name == "github" || c.name == "acme-docs").collect::<Vec<_>>()),
             ["bots", _, "triggers"] => json!(self.triggers),
