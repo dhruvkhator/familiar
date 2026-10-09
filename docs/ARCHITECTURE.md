@@ -359,6 +359,10 @@ webhook deliveries.
 
 **Owner API.** CRUD `/api/crm/{companies|contacts|deals}`, `/api/crm/activities`, `/api/crm/pipeline`,
 `/api/crm/changes` + `POST /api/crm/changes/{id}/undo`, `/api/crm/export.csv`, `/api/crm/import`, and the webhooks below.
+Write bodies have patch semantics: an absent field is left as it is, an empty text clears a text field, and `null`
+clears a number or date (`fit_score`, `value_cents`, `next_step_at`; `crm::Clearable<T>` = `Option<Option<T>>`). The
+Rust client mirrors it: `CompanyPatch.fit_score`, `DealPatch.value_cents` / `next_step_at` are `Option<Option<T>>`
+(`None` omitted, `Some(None)` sent as `null`). A CSV import never clears (an empty cell is no cell).
 
 **Teammate tools** (Familiar's MCP server, pre-allowed like every `mcp__familiar` tool): `crm_search {query?, kind?,
 stage?, tags?, company_id?, limit ≤ 50}`, `crm_get {kind, id}` (a company with its contacts, deals and last 20
@@ -366,7 +370,11 @@ activities; a contact with its deals; a deal with its timeline), `crm_pipeline` 
 `crm_upsert_company`, `crm_upsert_contact`, `crm_upsert_deal` (each `{id?}` to change one record, else create or
 update the match: same domain / same email (else LinkedIn link, else name at the company) / same company + title),
 `crm_move_deal {deal_id, stage, note}` (with the note; every stage move, however made, logs a `stage_change`), `crm_log_activity` (any kind but `stage_change`;
-`draft` = the `#id` of one of the teammate's own drafts links the activity to it). No delete tool.
+`draft` = the `#id` of one of the teammate's own drafts links the activity to it). No delete tool. A teammate empties
+a number or date only by naming it in `clear` (`crm_upsert_company`: `fit_score`; `crm_upsert_deal`: `value_cents`,
+`next_step_at`), never with a `null` (some models send `null` for every field they don't use, so `null` means "leave
+it" there); naming a field in `clear` and giving it a value is an error. Owner edits win as for any change: the fit
+score and the next step's date are the teammate's to keep up, a value the owner set stays.
 
 **Trust model** (`crm::teammate`):
 - *Fenced text.* CRM text is partly copied from web pages and emails, so a record can carry instructions aimed at the

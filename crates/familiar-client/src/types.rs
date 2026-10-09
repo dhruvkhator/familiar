@@ -993,10 +993,15 @@ body!(
         description: String, fit_score: i32, fit_reason: String, tags: Vec<String>, source_urls: Vec<String>, custom: Value,
     }
 );
-body!(CompanyPatch {
-    name: String, domain: String, website: String, industry: String, size: String, location: String,
-    description: String, fit_score: i32, fit_reason: String, tags: Vec<String>, source_urls: Vec<String>, custom: Value,
-});
+body!(
+    /// Change a company: unset fields stay as they are; an empty text clears a text field. `fit_score`: `Some(Some(n))`
+    /// sets it, `Some(None)` clears it (sent as `null`).
+    CompanyPatch {
+        name: String, domain: String, website: String, industry: String, size: String, location: String,
+        description: String, fit_score: Option<i32>, fit_reason: String, tags: Vec<String>, source_urls: Vec<String>,
+        custom: Value,
+    }
+);
 body!(
     /// Create a contact, or update the one with the same email (else LinkedIn link, else name at the company).
     NewContact {
@@ -1017,10 +1022,14 @@ body!(
         next_step: String, next_step_at: DateTime<Utc>,
     }
 );
-body!(DealPatch {
-    company_id: Uuid, contact_id: Uuid, title: String, stage: String, value_cents: i64, currency: String,
-    next_step: String, next_step_at: DateTime<Utc>,
-});
+body!(
+    /// Change a deal: unset fields stay as they are; an empty text clears a text field. `value_cents` and
+    /// `next_step_at`: `Some(Some(v))` sets, `Some(None)` clears (sent as `null`).
+    DealPatch {
+        company_id: Uuid, contact_id: Uuid, title: String, stage: String, value_cents: Option<i64>, currency: String,
+        next_step: String, next_step_at: Option<DateTime<Utc>>,
+    }
+);
 body!(
     /// A timeline entry; give at least one of `company_id`, `contact_id`, `deal_id`.
     NewActivity {

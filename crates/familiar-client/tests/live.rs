@@ -207,6 +207,22 @@ async fn crm_roundtrip() {
     assert_eq!(undo.op, "undo");
     assert_eq!(client.crm_deal(deal.id).await.unwrap().stage, DealStage::New);
 
+    // numbers and dates: Some(Some) sets, Some(None) clears (null), None leaves them
+    let at: chrono::DateTime<chrono::Utc> = "2026-11-01T10:00:00Z".parse().unwrap();
+    let scored = client.update_crm_company(acme.id, &CompanyPatch { fit_score: Some(Some(80)), ..Default::default() }).await.unwrap();
+    assert_eq!(scored.fit_score, Some(80));
+    let renamed = client.update_crm_company(acme.id, &CompanyPatch { industry: Some("SaaS".into()), ..Default::default() }).await.unwrap();
+    assert_eq!(renamed.fit_score, Some(80), "absent: untouched");
+    let cleared = client.update_crm_company(acme.id, &CompanyPatch { fit_score: Some(None), ..Default::default() }).await.unwrap();
+    assert_eq!((cleared.fit_score, cleared.industry.as_deref()), (None, Some("SaaS")));
+    let dated = client.update_crm_deal(deal.id, &DealPatch { next_step_at: Some(Some(at)), ..Default::default() }).await.unwrap();
+    assert_eq!((dated.next_step_at, dated.value_cents), (Some(at), Some(5000)));
+    let undated = client
+        .update_crm_deal(deal.id, &DealPatch { next_step_at: Some(None), value_cents: Some(None), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!((undated.next_step_at, undated.value_cents, undated.stage), (None, None, DealStage::New));
+
     // CSV: an export imports as a dry run that creates nothing
     let csv = client.crm_export_csv("contacts").await.unwrap();
     assert!(csv.starts_with("name,title,email,"), "{csv}");

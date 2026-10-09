@@ -584,10 +584,34 @@ pub struct CompanyArgs {
     pub tags: Option<Vec<String>>,
     /// The public pages the facts come from (http/https links). Required for a new company; added to the existing ones.
     pub source_urls: Option<Vec<String>>,
+    /// Numbers to empty: ["fit_score"] when no score fits any more. (Text fields are emptied with "".)
+    pub clear: Option<Vec<String>>,
+}
+
+/// The fields a write's `clear` list empties: only `allowed` ones (number and date fields; text is emptied with ""),
+/// and none that the same call also sets. Explicit, because some models fill every unused field with null.
+fn clear_arg(clear: &Option<Vec<String>>, allowed: &[&str], set: &[(&str, bool)]) -> std::result::Result<BTreeSet<String>, String> {
+    let mut out = BTreeSet::new();
+    for f in clear.iter().flatten().map(|f| f.trim()).filter(|f| !f.is_empty()) {
+        if !allowed.contains(&f) {
+            return Err(format!("clear can only name {}", allowed.join(", ")));
+        }
+        if set.iter().any(|(k, given)| *k == f && *given) {
+            return Err(format!("{f} is both set and cleared; leave one out"));
+        }
+        out.insert(f.to_string());
+    }
+    Ok(out)
+}
+
+/// A clearable field of a write: cleared (Some(None)), set (Some(Some)), or untouched.
+fn clearable<T>(name: &str, cleared: &BTreeSet<String>, v: Option<T>) -> Option<Option<T>> {
+    if cleared.contains(name) { Some(None) } else { v.map(Some) }
 }
 
 pub async fn upsert_company(db: &Db, actor: &Actor, a: CompanyArgs) -> std::result::Result<String, String> {
     let id = uuid_arg("id", &a.id)?;
+    let cleared = clear_arg(&a.clear, &["fit_score"], &[("fit_score", a.fit_score.is_some())])?;
     let i = CompanyInput {
         name: a.name,
         domain: a.domain,
@@ -596,7 +620,7 @@ pub async fn upsert_company(db: &Db, actor: &Actor, a: CompanyArgs) -> std::resu
         size: a.size,
         location: a.location,
         description: a.description,
-        fit_score: a.fit_score,
+        fit_score: clearable("fit_score", &cleared, a.fit_score),
         fit_reason: a.fit_reason,
         tags: a.tags,
         source_urls: a.source_urls,
@@ -679,10 +703,19 @@ pub struct DealArgs {
     pub next_step: Option<String>,
     /// When, as an RFC 3339 time (e.g. 2026-10-14T09:00:00Z).
     pub next_step_at: Option<String>,
+    /// Fields to empty: "value_cents" (no estimate any more), "next_step_at" (the step has no date any more). (Text
+    /// fields are emptied with "".)
+    pub clear: Option<Vec<String>>,
 }
 
 pub async fn upsert_deal(db: &Db, actor: &Actor, a: DealArgs) -> std::result::Result<String, String> {
     let id = uuid_arg("id", &a.id)?;
+    let given_at = a.next_step_at.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let cleared = clear_arg(
+        &a.clear,
+        &["value_cents", "next_step_at"],
+        &[("value_cents", a.value_cents.is_some()), ("next_step_at", given_at)],
+    )?;
     let next_step_at = match a.next_step_at.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         None => None,
         Some(t) => Some(
@@ -696,10 +729,10 @@ pub async fn upsert_deal(db: &Db, actor: &Actor, a: DealArgs) -> std::result::Re
         contact_id: uuid_arg("contact_id", &a.contact_id)?,
         title: a.title,
         stage: a.stage.map(|s| s.trim().to_lowercase()),
-        value_cents: a.value_cents,
+        value_cents: clearable("value_cents", &cleared, a.value_cents),
         currency: a.currency,
         next_step: a.next_step,
-        next_step_at,
+        next_step_at: clearable("next_step_at", &cleared, next_step_at),
     };
     let mut tx = begin(db).await?;
     let s = super::write_deal_in(&mut tx, db.owner, actor, id, &i).await;
@@ -1012,6 +1045,25 @@ mod tests {
         ok["do_not_contact"] = json!(false);
         let mut w = m(json!({ "email": "sam.new@acme.com" }));
         assert!(owner_edits_win(Kind::Contact, &ok, &mut w, &held(&[])).is_empty());
+    }
+
+    #[test]
+    fn teammates_clear_numbers_and_dates_explicitly() {
+        let none: Option<Vec<String>> = None;
+        assert!(clear_arg(&none, &["fit_score"], &[]).unwrap().is_empty());
+        let c = clear_arg(&Some(vec![" fit_score ".into(), "".into()]), &["fit_score"], &[("fit_score", false)]).unwrap();
+        assert_eq!(clearable("fit_score", &c, Some(5)), Some(None));
+        assert_eq!(clearable("fit_score", &BTreeSet::new(), Some(5)), Some(Some(5)));
+        assert_eq!(clearable::<i32>("fit_score", &BTreeSet::new(), None), None);
+        assert!(clear_arg(&Some(vec!["name".into()]), &["fit_score"], &[]).unwrap_err().contains("clear can only name fit_score"));
+        assert!(clear_arg(&Some(vec!["fit_score".into()]), &["fit_score"], &[("fit_score", true)]).unwrap_err().contains("both set and cleared"));
+        // a teammate may empty what it maintains (fit score, next step date), not a value the owner set
+        let deal = json!({ "value_cents": 5000, "next_step_at": "2026-10-14T09:00:00+00:00" });
+        let mut w = m(json!({ "value_cents": null, "next_step_at": null }));
+        assert_eq!(owner_edits_win(Kind::Deal, &deal, &mut w, &held(&["value_cents", "next_step_at"])), vec!["value_cents".to_string()]);
+        assert_eq!(w.get("next_step_at"), Some(&Value::Null));
+        let mut w = m(json!({ "fit_score": null }));
+        assert!(owner_edits_win(Kind::Company, &json!({ "fit_score": 40 }), &mut w, &held(&["fit_score"])).is_empty());
     }
 
     #[test]

@@ -162,6 +162,27 @@ fn drafts_offers_and_decisions() {
 }
 
 #[test]
+fn crm_patches_clear_numbers_and_dates_with_null() {
+    let at: chrono::DateTime<Utc> = "2026-11-01T10:00:00Z".parse().unwrap();
+    // None: left out (untouched); Some(None): null (clear); Some(Some(v)): the value
+    assert_eq!(serde_json::to_value(CompanyPatch::default()).unwrap(), json!({}));
+    assert_eq!(serde_json::to_value(CompanyPatch { fit_score: Some(None), ..Default::default() }).unwrap(), json!({"fit_score": null}));
+    assert_eq!(
+        serde_json::to_value(CompanyPatch { fit_score: Some(Some(80)), name: Some("Acme".into()), ..Default::default() }).unwrap(),
+        json!({"name": "Acme", "fit_score": 80})
+    );
+    assert_eq!(
+        serde_json::to_value(DealPatch { value_cents: Some(None), next_step_at: Some(None), ..Default::default() }).unwrap(),
+        json!({"value_cents": null, "next_step_at": null})
+    );
+    assert_eq!(
+        serde_json::to_value(DealPatch { value_cents: Some(Some(5000)), next_step_at: Some(Some(at)), ..Default::default() }).unwrap(),
+        json!({"value_cents": 5000, "next_step_at": "2026-11-01T10:00:00Z"})
+    );
+    assert_eq!(serde_json::to_value(DealPatch { stage: Some("won".into()), ..Default::default() }).unwrap(), json!({"stage": "won"}));
+}
+
+#[test]
 fn sends_of_approved_drafts() {
     let draft = "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10";
     let a: Approval = de(json!({
