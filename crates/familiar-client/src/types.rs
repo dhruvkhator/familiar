@@ -726,6 +726,62 @@ pub struct CrmImportError {
     pub message: String,
 }
 
+/// An outgoing CRM webhook: every change in `events` is POSTed to `url`, signed with the webhook's secret
+/// (`Familiar-Signature: t=<unix>,v1=<hex HMAC-SHA256 of "<t>.<body>">`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CrmWebhook {
+    pub id: Uuid,
+    pub url: String,
+    /// company.created | company.updated | contact.created | contact.updated | contact.do_not_contact | deal.created |
+    /// deal.updated | deal.stage_changed | activity.created
+    pub events: Vec<String>,
+    pub enabled: bool,
+    pub created_at: Option<DateTime<Utc>>,
+    /// The signing secret: only in the answer to create. Store it then; it is never shown again.
+    pub secret: Option<String>,
+    /// The newest delivery, if any.
+    pub last_delivery: Option<CrmWebhookDelivery>,
+}
+
+/// One delivery of an event to a webhook (a `ping` for the Test button).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CrmWebhookDelivery {
+    /// Also the `Familiar-Delivery` header and the payload's `id`.
+    pub id: Uuid,
+    pub webhook_id: Option<Uuid>,
+    pub event: String,
+    /// `{id, event, at, data, previous?, actor: {kind, bot_id?, bot_slug?}}` (not in a webhook's `last_delivery`).
+    pub payload: Option<Value>,
+    /// pending | delivered | failed
+    pub status: String,
+    pub attempts: i32,
+    pub next_attempt_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+/// Teammates hired together (`GET /api/templates/bundles`), from one set of shared `questions`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TemplateBundle {
+    pub id: String,
+    pub name: String,
+    pub summary: String,
+    /// Template ids, in hiring order.
+    pub templates: Vec<String>,
+    pub questions: Vec<TemplateQuestion>,
+}
+
+/// Response of `POST /api/templates/bundles/{id}/create`: every new teammate, in the bundle's order.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BundleHired {
+    pub hired: Vec<Hired>,
+}
+
 /// List filters for companies, contacts and deals; a filter that doesn't apply to the kind is ignored.
 #[derive(Debug, Clone, Default)]
 pub struct CrmListParams {
@@ -953,6 +1009,19 @@ body!(
         company_id: Uuid, contact_id: Uuid, deal_id: Uuid, kind: String, summary: String, body: String, url: String,
         approval_id: Uuid, occurred_at: DateTime<Utc>,
     }
+);
+
+body!(
+    /// A webhook: an `https` URL (or `http` to this computer) and the events it gets. `enabled` defaults to true.
+    NewCrmWebhook { url: String, events: Vec<String>, enabled: bool }
+);
+body!(
+    /// Turning a webhook off fails its deliveries still waiting.
+    CrmWebhookPatch { url: String, events: Vec<String>, enabled: bool }
+);
+body!(
+    /// Hire a bundle: the shared answers by question key.
+    FromBundle { answers: std::collections::BTreeMap<String, String> }
 );
 
 /// Secrets for a connector: env vars (stdio) and/or headers (http). Write-only.

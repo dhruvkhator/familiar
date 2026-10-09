@@ -329,6 +329,15 @@ impl Client {
         let id = url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>();
         self.mutate(Method::POST, &format!("/api/templates/{id}/create"), Some(body(b)), true).await
     }
+    /// Teammates hired together (the GTM crew).
+    pub async fn template_bundles(&self) -> Result<Vec<TemplateBundle>, ApiError> {
+        self.get("/api/templates/bundles").await
+    }
+    /// Hire every teammate of a bundle in one go (all or none), schedules off.
+    pub async fn create_bundle(&self, id: &str, b: &FromBundle) -> Result<BundleHired, ApiError> {
+        let id = url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>();
+        self.mutate(Method::POST, &format!("/api/templates/bundles/{id}/create"), Some(body(b)), true).await
+    }
 
     // ---- threads & messages ---------------------------------------------
 
@@ -654,6 +663,29 @@ impl Client {
         let (_, b) = self.send_once(&Method::POST, &format!("/api/crm/import{q}"), None, Some(csv), true).await?;
         self.0.cache.clear_inflight();
         Self::decode(Self::parse_value(&b))
+    }
+
+    pub async fn crm_webhooks(&self) -> Result<Vec<CrmWebhook>, ApiError> {
+        self.get("/api/crm/webhooks").await
+    }
+    /// The answer carries the signing `secret`: the only time it is shown.
+    pub async fn create_crm_webhook(&self, w: &NewCrmWebhook) -> Result<CrmWebhook, ApiError> {
+        self.mutate(Method::POST, "/api/crm/webhooks", Some(body(w)), true).await
+    }
+    pub async fn update_crm_webhook(&self, id: Uuid, p: &CrmWebhookPatch) -> Result<CrmWebhook, ApiError> {
+        self.mutate(Method::PATCH, &format!("/api/crm/webhooks/{id}"), Some(body(p)), true).await
+    }
+    pub async fn delete_crm_webhook(&self, id: Uuid) -> Result<(), ApiError> {
+        self.mutate::<Value>(Method::DELETE, &format!("/api/crm/webhooks/{id}"), None, true).await.map(|_| ())
+    }
+    /// Send a `ping` now; answers with its delivery (delivered or failed, never retried).
+    pub async fn test_crm_webhook(&self, id: Uuid) -> Result<CrmWebhookDelivery, ApiError> {
+        self.mutate(Method::POST, &format!("/api/crm/webhooks/{id}/test"), Some(json!({})), true).await
+    }
+    /// Newest first; `limit` at most 200 (default 50).
+    pub async fn crm_webhook_deliveries(&self, id: Uuid, limit: Option<u32>) -> Result<Vec<CrmWebhookDelivery>, ApiError> {
+        let q = qs(&[("limit", limit.map(|l| l.to_string()))]);
+        self.get(&format!("/api/crm/webhooks/{id}/deliveries{q}")).await
     }
 
     // ---- live browser view ----------------------------------------------

@@ -231,3 +231,77 @@ async fn crm_roundtrip() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let _ = sqlx::query(sqlx::AssertSqlSafe(format!("drop database if exists {db} with (force)"))).execute(&mut c).await;
 }
+
+/// Webhook settings and the GTM crew through the client: the secret comes back once, a Test to a closed port fails and
+/// is listed, a bundle hires its whole crew.
+#[tokio::test]
+async fn crm_webhooks_and_bundles() {
+    let Ok(admin) = std::env::var("TEST_DATABASE_URL") else {
+        eprintln!("SKIP: TEST_DATABASE_URL not set");
+        return;
+    };
+    let db = format!("c_{}", Uuid::new_v4().simple());
+    let mut c = PgConnection::connect(&admin).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("create database {db}"))).execute(&mut c).await.unwrap();
+    let mut u = url::Url::parse(&admin).unwrap();
+    u.set_path(&format!("/{db}"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let key = Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=".to_string());
+    let cfg = Config { database_url: u.to_string(), host: [127, 0, 0, 1], port: 0, secret_key: key, public_url: None, web_origins: vec![], bots_dir: None };
+    let (stop, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = serve_listener(listener, cfg, async {
+            let _ = rx.await;
+        })
+        .await;
+    });
+    let client = Client::new(&base, None);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            if client.auth_state().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("server up");
+    client.setup("owner@example.com", "correct horse battery").await.unwrap();
+
+    // a port nothing listens on, on this computer
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://127.0.0.1:{}/hook", closed.local_addr().unwrap().port());
+    drop(closed);
+    let w = client
+        .create_crm_webhook(&NewCrmWebhook { url: Some(url.clone()), events: Some(vec!["deal.stage_changed".into()]), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(w.secret.as_deref().is_some_and(|s| s.starts_with("whsec_")) && w.enabled);
+    let listed = client.crm_webhooks().await.unwrap();
+    assert_eq!((listed.len(), listed[0].secret.as_deref()), (1, None));
+    let bad = client.create_crm_webhook(&NewCrmWebhook { url: Some("http://8.8.8.8/x".into()), events: Some(vec!["deal.created".into()]), ..Default::default() }).await;
+    assert!(matches!(bad, Err(ApiError::Http { status: 400, .. })), "{bad:?}");
+
+    let d = client.test_crm_webhook(w.id).await.unwrap();
+    assert_eq!((d.event.as_str(), d.status.as_str(), d.attempts), ("ping", "failed", 1));
+    assert!(d.last_error.is_some());
+    let all = client.crm_webhook_deliveries(w.id, Some(10)).await.unwrap();
+    assert_eq!((all.len(), all[0].id), (1, d.id));
+    let off = client.update_crm_webhook(w.id, &CrmWebhookPatch { enabled: Some(false), ..Default::default() }).await.unwrap();
+    assert!(!off.enabled && off.secret.is_none());
+    client.delete_crm_webhook(w.id).await.unwrap();
+    assert!(client.crm_webhooks().await.unwrap().is_empty());
+
+    let bundles = client.template_bundles().await.unwrap();
+    let gtm = bundles.iter().find(|b| b.id == "gtm-crew").unwrap();
+    assert!(gtm.questions.iter().any(|q| q.key == "follow_up_days"));
+    let answers = [("product".to_owned(), "Familiar".to_owned())].into();
+    let hired = client.create_bundle("gtm-crew", &FromBundle { answers: Some(answers) }).await.unwrap();
+    assert_eq!(hired.hired.len(), gtm.templates.len());
+    assert!(hired.hired.iter().all(|h| h.bot.persona.as_deref().is_some_and(|p| !p.contains("{{"))));
+
+    let _ = stop.send(());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!("drop database if exists {db} with (force)"))).execute(&mut c).await;
+}

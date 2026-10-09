@@ -216,3 +216,36 @@ fn crm_rows() {
     assert_eq!(serde_json::to_value(DealPatch { stage: Some("won".into()), ..Default::default() }).unwrap(), json!({"stage": "won"}));
     assert_eq!(serde_json::to_value(ContactPatch { do_not_contact: Some(false), ..Default::default() }).unwrap(), json!({"do_not_contact": false}));
 }
+
+#[test]
+fn crm_webhooks_and_bundles() {
+    let w: CrmWebhook = de(json!({
+        "id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "url": "https://hooks.example.com/x", "events": ["deal.stage_changed"],
+        "enabled": true, "created_at": "2026-10-09T10:00:00Z", "secret": "whsec_abc",
+        "last_delivery": {"id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f11", "event": "ping", "status": "delivered", "attempts": 1,
+                          "last_error": null, "created_at": "2026-10-09T10:00:00Z", "delivered_at": "2026-10-09T10:00:01Z"}
+    }));
+    assert_eq!((w.events.len(), w.secret.as_deref()), (1, Some("whsec_abc")));
+    let last = w.last_delivery.unwrap();
+    assert_eq!((last.status.as_str(), last.attempts, last.payload), ("delivered", 1, None));
+    let none: CrmWebhook = de(json!({"id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "last_delivery": null}));
+    assert!(none.secret.is_none() && none.last_delivery.is_none());
+
+    let d: CrmWebhookDelivery = de(json!({"id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f12", "webhook_id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10",
+        "event": "company.created", "payload": {"id": "x", "data": {"name": "Acme"}}, "status": "pending", "attempts": 2,
+        "next_attempt_at": "2026-10-09T10:05:00Z", "last_error": "HTTP 500"}));
+    assert_eq!((d.payload.unwrap()["data"]["name"].as_str(), d.last_error.as_deref()), (Some("Acme"), Some("HTTP 500")));
+
+    let bundles: Vec<TemplateBundle> = de(json!([{"id": "gtm-crew", "name": "GTM crew", "summary": "s", "templates": ["lead-researcher"],
+        "questions": [{"key": "product", "label": "What do you sell?", "placeholder": "x", "multiline": true}]}]));
+    assert_eq!((bundles[0].templates.len(), bundles[0].questions[0].key.as_str()), (1, "product"));
+    let hired: BundleHired = de(json!({"hired": [{"bot": {"id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f13", "name": "Lead researcher"}, "first_task": "go"}]}));
+    assert_eq!(hired.hired[0].first_task.as_deref(), Some("go"));
+
+    assert_eq!(
+        serde_json::to_value(NewCrmWebhook { url: Some("https://x.io".into()), events: Some(vec!["deal.created".into()]), ..Default::default() }).unwrap(),
+        json!({"url": "https://x.io", "events": ["deal.created"]})
+    );
+    assert_eq!(serde_json::to_value(CrmWebhookPatch { enabled: Some(false), ..Default::default() }).unwrap(), json!({"enabled": false}));
+    assert_eq!(serde_json::to_value(FromBundle::default()).unwrap(), json!({}));
+}
