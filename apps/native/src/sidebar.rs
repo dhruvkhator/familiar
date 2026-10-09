@@ -10,9 +10,10 @@ use familiar_ui::icons;
 use familiar_ui::mascot::{Mascot, MascotState};
 use familiar_ui::theme::{SIDEBAR_WIDTH, Theme, text};
 use gpui::{
-    App, Context, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, ScrollHandle,
-    SharedString, StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, div, px,
+    App, Context, Div, Entity, FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    ScrollHandle, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, WeakEntity, Window, div, px,
 };
+use uuid::Uuid;
 
 use crate::data::{AppData, DataEvent, Part, Status};
 use crate::shell::{Route, Shell};
@@ -107,7 +108,7 @@ impl Render for Sidebar {
                 teammates = teammates.child(anim::stagger(
                     SharedString::from(format!("side-in-{}", t.id)),
                     i,
-                    div().child(
+                    hover_target(SharedString::from(format!("side-hover-{}", t.id)), t.uuid, &self.shell).child(
                         SidebarItem::new(SharedString::from(format!("side-{}", t.id)), t.name.clone())
                             .leading(Mascot::new(format!("side-{}", t.id), t.avatar, t.state, 30.0))
                             .sublabel(t.state.label(), color)
@@ -227,4 +228,18 @@ impl Render for Sidebar {
                     ),
             )
     }
+}
+
+/// A wrapper that tells the shell while the pointer rests on teammate `bot` (it warms that teammate's chat).
+pub fn hover_target(id: SharedString, bot: Uuid, shell: &WeakEntity<Shell>) -> Stateful<Div> {
+    let shell = shell.clone();
+    div().id(id).on_hover(move |hovered, _, cx| {
+        let _ = shell.update(cx, |s, cx| {
+            if *hovered {
+                s.hover_teammate(bot, cx)
+            } else {
+                s.unhover_teammate(bot, cx)
+            }
+        });
+    })
 }

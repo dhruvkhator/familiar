@@ -226,17 +226,11 @@ impl BotPage {
 
     fn reload_threads(&mut self, cx: &mut Context<Self>) {
         let client = self.client(cx);
-        swr(self, &client, format!("/api/bots/{}/threads", self.bot), cx, |this, threads: Vec<Thread>, cx| {
+        swr(self, &client, threads_path(self.bot), cx, |this, threads: Vec<Thread>, cx| {
             this.threads = threads;
             this.threads_loaded = true;
             if this.selected.is_none_or(|s| !this.threads.iter().any(|t| t.id == s)) {
-                // The newest conversation that isn't a scheduled/dream log, else the newest thread.
-                let pick = this
-                    .threads
-                    .iter()
-                    .find(|t| t.source.as_deref() != Some("schedule") && t.schedule_id.is_none())
-                    .or(this.threads.first())
-                    .map(|t| t.id);
+                let pick = default_thread(&this.threads);
                 if pick != this.selected {
                     this.selected = pick;
                     this.reset_thread(cx);
@@ -274,7 +268,7 @@ impl BotPage {
     fn reload_messages(&mut self, cx: &mut Context<Self>) {
         let Some(tid) = self.selected else { return };
         let client = self.client(cx);
-        swr(self, &client, format!("/api/threads/{tid}/messages?limit=200"), cx, move |this, mut list: Vec<Message>, _| {
+        swr(self, &client, messages_path(tid), cx, move |this, mut list: Vec<Message>, _| {
             if this.selected != Some(tid) {
                 return;
             }
@@ -300,7 +294,7 @@ impl BotPage {
     fn reload_runs(&mut self, cx: &mut Context<Self>) {
         let Some(tid) = self.selected else { return };
         let client = self.client(cx);
-        swr(self, &client, format!("/api/threads/{tid}/runs?limit=5"), cx, move |this, runs: Vec<Run>, cx| {
+        swr(self, &client, runs_path(tid), cx, move |this, runs: Vec<Run>, cx| {
             if this.selected != Some(tid) {
                 return;
             }
@@ -1152,6 +1146,37 @@ impl BotPage {
                     ),
             )
             .into_any_element()
+    }
+}
+
+/// What a teammate's chat loads first (the same requests warm the cache when you hover the teammate).
+fn threads_path(bot: Uuid) -> String {
+    format!("/api/bots/{bot}/threads")
+}
+
+fn messages_path(thread: Uuid) -> String {
+    format!("/api/threads/{thread}/messages?limit=200")
+}
+
+fn runs_path(thread: Uuid) -> String {
+    format!("/api/threads/{thread}/runs?limit=5")
+}
+
+/// The thread a teammate's chat opens on: the newest conversation that isn't a scheduled/dream log, else the newest.
+fn default_thread(threads: &[Thread]) -> Option<Uuid> {
+    threads
+        .iter()
+        .find(|t| t.source.as_deref() != Some("schedule") && t.schedule_id.is_none())
+        .or(threads.first())
+        .map(|t| t.id)
+}
+
+/// Fetch what `bot`'s chat shows first into the client's cache (failures are ignored): opening it then shows it at
+/// once, and refreshes it as usual.
+pub async fn prefetch(client: familiar_client::Client, bot: Uuid) {
+    let Ok(threads) = client.get::<Vec<Thread>>(&threads_path(bot)).await else { return };
+    if let Some(thread) = default_thread(&threads) {
+        client.prefetch(&[messages_path(thread), runs_path(thread)]).await;
     }
 }
 

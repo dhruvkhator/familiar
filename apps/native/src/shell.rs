@@ -22,8 +22,9 @@ use familiar_ui::toast::ToastStack;
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, ScrollHandle, SharedString, StatefulInteractiveElement as _, StyleRefinement,
-    Styled as _, Window, div, prelude::FluentBuilder as _, px,
+    Styled as _, Task, Window, div, prelude::FluentBuilder as _, px,
 };
+use gpui_tokio::Tokio;
 use uuid::Uuid;
 
 use crate::approval::ApprovalCards;
@@ -34,6 +35,9 @@ use crate::schedules::SchedulesPage;
 use crate::settings::AppSettings;
 use crate::data::{AppData, DataEvent, Status, Teammate, ago, excerpt, run_status, tail, until};
 use crate::templates::{Picked, TemplatePicker};
+
+/// Resting on a teammate this long (sidebar row, Today's cards) fetches their chat before the click.
+const PREFETCH_AFTER: Duration = Duration::from_millis(120);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Route {
@@ -68,6 +72,8 @@ pub struct Shell {
     open_tab: Option<Uuid>,
     /// No route crossfade is running: pages may be drawn cached.
     settled: bool,
+    /// The teammate under the pointer, and the wait before their chat is fetched (dropping it cancels the wait).
+    hovering: Option<(Uuid, Task<()>)>,
 }
 
 impl Shell {
@@ -145,6 +151,7 @@ impl Shell {
             form_gen: 0,
             open_tab: None,
             settled: true,
+            hovering: None,
         }
     }
 
@@ -206,8 +213,27 @@ impl Shell {
         self.pages.get(&bot).cloned()
     }
 
-    /// The pointer rests on a teammate (the sidebar, Today's strip): nothing yet.
-    pub fn hover_teammate(&mut self, _bot: Uuid, _cx: &mut Context<Self>) {}
+    /// The pointer rests on a teammate (a sidebar row, Today's cards): unless their page is already open, fetch their
+    /// chat into the cache after [`PREFETCH_AFTER`], so the click shows it at once (and refreshes it as usual).
+    pub fn hover_teammate(&mut self, bot: Uuid, cx: &mut Context<Self>) {
+        if self.pages.contains_key(&bot) || self.hovering.as_ref().is_some_and(|(b, _)| *b == bot) {
+            return;
+        }
+        let client = self.data.read(cx).client.clone();
+        let wait = cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(PREFETCH_AFTER).await;
+            // Once started, the fetch finishes even if the pointer moves on: it only warms the cache.
+            Tokio::spawn(cx, crate::chat::prefetch(client, bot)).detach();
+        });
+        self.hovering = Some((bot, wait));
+    }
+
+    /// The pointer left teammate `bot`: a fetch still waiting is cancelled.
+    pub fn unhover_teammate(&mut self, bot: Uuid, _cx: &mut Context<Self>) {
+        if self.hovering.as_ref().is_some_and(|(b, _)| *b == bot) {
+            self.hovering = None;
+        }
+    }
 
     fn loading(&self, cx: &App) -> bool {
         sidebar::loading(&self.data, cx)
@@ -308,6 +334,7 @@ impl Shell {
             (d.teammates(), d.pending.clone(), d.runs.clone(), d.schedules.clone(), failed, d.runs_loaded)
         };
         let this = cx.entity();
+        let weak = this.downgrade();
         let active: Vec<&Run> = runs.iter().filter(|r| r.status.is_active()).collect();
         let subtitle = if !pending.is_empty() {
             let n = pending.len();
@@ -407,7 +434,7 @@ impl Shell {
                 list = list.child(anim::stagger(
                     SharedString::from(format!("now-in-{}", r.id)),
                     i,
-                    div().child(
+                    sidebar::hover_target(SharedString::from(format!("now-hover-{}", r.id)), t.uuid, &weak).child(
                         HoverCard::new(SharedString::from(format!("now-{}", r.id)))
                             .on_click(move |_, _, cx| this.update(cx, |s, cx| s.navigate(route.clone(), cx)))
                             .child(
@@ -624,6 +651,7 @@ impl Shell {
     fn strip(&self, teammates: &[Teammate], cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let this = cx.entity();
+        let weak = this.downgrade();
         let mut strip = div().flex().gap(px(12.0)).flex_wrap();
         for (i, t) in teammates.iter().enumerate() {
             let route = Route::Teammate(t.id.clone());
@@ -632,7 +660,7 @@ impl Shell {
             strip = strip.child(anim::stagger(
                 SharedString::from(format!("strip-in-{}", t.id)),
                 i,
-                div().child(
+                sidebar::hover_target(SharedString::from(format!("strip-hover-{}", t.id)), t.uuid, &weak).child(
                     HoverCard::new(SharedString::from(format!("strip-{}", t.id)))
                         .flat()
                         .padding(10.0)
