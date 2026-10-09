@@ -212,6 +212,14 @@ pub fn domain(s: &str) -> Option<String> {
     let host = if had_scheme { host.rsplit('@').next()? } else { host };
     let host = host.split(':').next()?.trim_end_matches('.');
     let host = host.strip_prefix("www.").unwrap_or(host);
+    // an international name in its ASCII (punycode) form, as DNS and the unique key see it
+    let ascii;
+    let host = if host.is_ascii() {
+        host
+    } else {
+        ascii = url::Url::parse(&format!("http://{host}/")).ok()?.host_str()?.to_string();
+        ascii.as_str()
+    };
     valid_host(host).then(|| host.to_string())
 }
 
@@ -711,7 +719,22 @@ async fn budget(tx: &mut PgConnection, actor: &Actor) -> Result<()> {
 
 /// Create (`id` None) or change one company, contact or deal and log it. `m` holds only validated columns. A teammate's
 /// change goes through [`teammate::owner_edits_win`] first.
-async fn save(tx: &mut PgConnection, owner: Uuid, actor: &Actor, kind: Kind, id: Option<Uuid>, mut m: M) -> Result<Saved> {
+async fn save(tx: &mut PgConnection, owner: Uuid, actor: &Actor, kind: Kind, id: Option<Uuid>, m: M) -> Result<Saved> {
+    save_noted(tx, owner, actor, kind, id, m, None).await
+}
+
+/// [`save`]; a deal's stage move also goes on its timeline as a `stage_change` (with `note` as its body), whichever way
+/// the stage was changed.
+#[allow(clippy::too_many_arguments)]
+async fn save_noted(
+    tx: &mut PgConnection,
+    owner: Uuid,
+    actor: &Actor,
+    kind: Kind,
+    id: Option<Uuid>,
+    mut m: M,
+    note: Option<&str>,
+) -> Result<Saved> {
     budget(tx, actor).await?;
     check_refs(tx, owner, &m).await?;
     let name = kind.name();
@@ -784,6 +807,21 @@ async fn save(tx: &mut PgConnection, owner: Uuid, actor: &Actor, kind: Kind, id:
     }
     if stage_moved {
         emit(tx, owner, actor, "deal.stage_changed", &after, Some(&before)).await?;
+        let uuid = |k: &str| after[k].as_str().and_then(|s| s.parse::<Uuid>().ok());
+        let a = ActivityInput {
+            company_id: uuid("company_id"),
+            contact_id: uuid("contact_id"),
+            deal_id: Some(id),
+            kind: Some("stage_change".into()),
+            summary: Some(format!(
+                "Stage: {} -> {}",
+                before["stage"].as_str().unwrap_or("?"),
+                after["stage"].as_str().unwrap_or("?")
+            )),
+            body: note.map(str::to_string),
+            ..Default::default()
+        };
+        log_activity_in(tx, owner, actor, &a).await?;
     }
     Ok(Saved { row: after, outcome: Outcome::Updated, kept })
 }
@@ -849,8 +887,8 @@ pub async fn soft_delete_company(db: &Db, actor: &Actor, id: Uuid) -> Result<Val
 
 // ---- contacts -------------------------------------------------------------
 
-/// The live contact with this email, else this LinkedIn link, else this name at this company (`company` None = no
-/// company).
+/// The live contact with this email, else (no contact has that email) this LinkedIn link, else this name at this
+/// company (`company` None = no company).
 pub async fn find_contact_in(
     tx: &mut PgConnection,
     owner: Uuid,
@@ -860,7 +898,10 @@ pub async fn find_contact_in(
     company: Option<Uuid>,
 ) -> Result<Option<Uuid>> {
     if let Some(e) = email {
-        return find_one(tx, "select id from crm_contacts where owner_id = $1 and deleted_at is null and email = $2", owner, e).await;
+        let found = find_one(tx, "select id from crm_contacts where owner_id = $1 and deleted_at is null and email = $2", owner, e).await?;
+        if found.is_some() {
+            return Ok(found);
+        }
     }
     if let Some(l) = linkedin {
         let found = find_one(
@@ -984,23 +1025,7 @@ pub async fn move_deal(db: &Db, actor: &Actor, deal: Uuid, stage: &str, note: Op
 /// [`move_deal`] inside a transaction.
 pub async fn move_deal_in(tx: &mut PgConnection, owner: Uuid, actor: &Actor, deal: Uuid, stage: &str, note: Option<&str>) -> Result<Saved> {
     let m = clean_deal(&DealInput { stage: Some(stage.to_string()), ..Default::default() })?;
-    let before = fetch_locked(tx, Kind::Deal, owner, deal, true).await?.ok_or(CrmError::NotFound)?;
-    let saved = save(tx, owner, actor, Kind::Deal, Some(deal), m).await?;
-    let row = &saved.row;
-    if saved.outcome == Outcome::Updated {
-        let uuid = |k: &str| row[k].as_str().and_then(|s| s.parse::<Uuid>().ok());
-        let a = ActivityInput {
-            company_id: uuid("company_id"),
-            contact_id: uuid("contact_id"),
-            deal_id: Some(deal),
-            kind: Some("stage_change".into()),
-            summary: Some(format!("Stage: {} -> {stage}", before["stage"].as_str().unwrap_or("?"))),
-            body: note.map(str::to_string),
-            ..Default::default()
-        };
-        log_activity_in(tx, owner, actor, &a).await?;
-    }
-    Ok(saved)
+    save_noted(tx, owner, actor, Kind::Deal, Some(deal), m, note).await
 }
 
 // ---- generic patch / delete -----------------------------------------------
@@ -1298,6 +1323,7 @@ pub async fn pipeline(db: &Db) -> Result<Vec<Value>> {
     let deals: Vec<Json<Value>> = sqlx::query_scalar(
         "select to_jsonb(x) - 'rn' from (
            select d.id, d.stage, d.title, d.company_id, co.name as company_name, d.contact_id, ct.name as contact_name,
+                  coalesce(ct.do_not_contact, false) as contact_do_not_contact,
                   d.stage_changed_at, d.value_cents, d.currency, d.next_step, d.next_step_at,
                   row_number() over (partition by d.stage order by d.updated_at desc, d.id) as rn
            from crm_deals d join crm_companies co on co.id = d.company_id and co.deleted_at is null
@@ -1388,9 +1414,13 @@ mod tests {
         assert_eq!(domain("  ACME.com ").as_deref(), Some("acme.com"));
         assert_eq!(domain("http://user:pw@sub.acme.co.uk:8080/x?y#z").as_deref(), Some("sub.acme.co.uk"));
         assert_eq!(domain("www.acme.com.").as_deref(), Some("acme.com"));
+        // international names in their ASCII form
+        assert_eq!(domain("https://www.München.de/kontakt").as_deref(), Some("xn--mnchen-3ya.de"));
+        assert_eq!(domain("xn--mnchen-3ya.de").as_deref(), Some("xn--mnchen-3ya.de"));
+        assert_eq!(domain("münchen"), None);
         for bad in [
             "", "   ", "acme", "localhost", "not a domain", "sam@acme.com", "https://", "1.2.3.4", "-a.com", "a..com",
-            "acme.c", "ac me.com", "ex_ample.com", "https:///path", "münchen.de",
+            "acme.c", "ac me.com", "ex_ample.com", "https:///path",
         ] {
             assert_eq!(domain(bad), None, "{bad:?}");
         }

@@ -622,6 +622,8 @@ pub struct CrmDeal {
     pub company_domain: Option<String>,
     pub contact_name: Option<String>,
     pub contact_email: Option<String>,
+    /// The contact asked not to be contacted.
+    pub contact_do_not_contact: bool,
     pub title: String,
     pub stage: DealStage,
     pub stage_changed_at: DateTime<Utc>,
@@ -689,6 +691,8 @@ pub struct PipelineDeal {
     pub company_name: Option<String>,
     pub contact_id: Option<Uuid>,
     pub contact_name: Option<String>,
+    /// The contact asked not to be contacted.
+    pub contact_do_not_contact: bool,
     pub stage_changed_at: Option<DateTime<Utc>>,
     pub value_cents: Option<i64>,
     pub currency: String,

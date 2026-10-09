@@ -35,7 +35,7 @@ url = "2.5.8"
 hmac = "0.13.0"
 sha2 = "0.11.0"
 hex = "0.4.3"
-familiar-crypto ={ version = "0.1.0", path = "../familiar-crypto" }
+familiar-crypto = { version = "0.1.0", path = "../familiar-crypto" }
 # The approval card's small picture of the screen around a desktop step's target.
 png = "0.18.1"
 

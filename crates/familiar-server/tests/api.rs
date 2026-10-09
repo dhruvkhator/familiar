@@ -1555,8 +1555,9 @@ async fn crm_crud_and_dedupe() {
     // activities: a deal's timeline entry also shows on its company and contact
     let act = app.ok_post(t, "/api/crm/activities", json!({"deal_id": did, "kind": "note", "summary": "Called", "body": "went well", "url": "https://x.io/1"}), 201).await;
     assert_eq!((act["company_id"].as_str(), act["actor_kind"].as_str()), (Some(cid.as_str()), Some("user")));
-    assert_eq!(len(&app.get(t, &format!("/api/crm/activities?company_id={cid}")).await.1), 1);
-    assert_eq!(len(&app.get(t, &format!("/api/crm/activities?deal_id={did}")).await.1), 1);
+    // (with the stage_change the move to meeting above logged)
+    assert_eq!(len(&app.get(t, &format!("/api/crm/activities?company_id={cid}")).await.1), 2);
+    assert_eq!(len(&app.get(t, &format!("/api/crm/activities?deal_id={did}")).await.1), 2);
     assert_eq!(len(&app.get(t, &format!("/api/crm/activities?contact_id={}", Uuid::new_v4())).await.1), 0);
     for bad in [
         json!({"kind": "note", "summary": "x"}), json!({"deal_id": did, "kind": "sms", "summary": "x"}), json!({"deal_id": did, "kind": "note"}),
@@ -1994,11 +1995,11 @@ async fn crm_teammate_owner_edits_win_and_limits() {
     .await
     .unwrap();
     for to in ["Sam <SAM@acme.com>", "@SamAcme", "https://linkedin.com/in/sam-acme"] {
-        assert_eq!(crm::teammate::do_not_contact(&db, to).await.unwrap().as_deref(), Some("Sam"), "{to}");
+        assert_eq!(crm::teammate::do_not_contact(&db, to).await.unwrap(), Some(uid(&p)), "{to}");
     }
     assert_eq!(crm::teammate::do_not_contact(&db, "kim@acme.com").await.unwrap(), None);
     app.del(t, &format!("/api/crm/contacts/{}", id(&p))).await;
-    assert_eq!(crm::teammate::do_not_contact(&db, "sam@acme.com").await.unwrap().as_deref(), Some("Sam"));
+    assert_eq!(crm::teammate::do_not_contact(&db, "sam@acme.com").await.unwrap(), Some(uid(&p)));
     let stranger = Db { pool: app.pool.clone(), owner: Uuid::new_v4() };
     assert_eq!(crm::teammate::do_not_contact(&stranger, "sam@acme.com").await.unwrap(), None, "owner-scoped");
 
@@ -2031,7 +2032,7 @@ async fn crm_teammate_owner_edits_win_and_limits() {
 
 type Got = tokio::sync::mpsc::UnboundedReceiver<(String, axum::http::HeaderMap, Vec<u8>)>;
 
-/// A webhook receiver on this computer: answers 200, except 500 on /fail and a redirect on /moved; hands every request on.
+/// A webhook receiver on this computer: answers 200, except 500 on /fail, 410 on /gone and a redirect on /moved; hands every request on.
 async fn receiver() -> (String, Got) {
     use axum::{
         body::Bytes,
@@ -2046,6 +2047,7 @@ async fn receiver() -> (String, Got) {
             let _ = tx.send((path.clone(), h, body.to_vec()));
             match path.as_str() {
                 "/fail" => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                "/gone" => StatusCode::GONE.into_response(),
                 "/moved" => (StatusCode::FOUND, [(header::LOCATION, "http://127.0.0.1:1/elsewhere")]).into_response(),
                 _ => StatusCode::OK.into_response(),
             }
@@ -2333,4 +2335,104 @@ async fn gtm_crew_bundle() {
     assert!(slug.starts_with("lead-researcher-"), "{slug}");
     let b = app.second().await;
     assert_eq!(len(&app.get(&b.tok, "/api/bots").await.1), 0);
+}
+
+/// Do-not-contact survives the ways around it: an old address (from the change log) still counts after the owner
+/// changes it, a re-imported old export never lifts it, a teammate adding the person under a new address finds the same
+/// record (and can't change who they are), and the board shows the flag. Any stage move goes on the timeline.
+#[tokio::test(flavor = "multi_thread")]
+async fn crm_do_not_contact_survives_edits_and_imports() {
+    use familiar_core::{
+        crm::{self, Actor, ContactInput, teammate},
+        db::Db,
+    };
+    let app = app!();
+    let a = app.owner().await;
+    let t = &a.tok;
+    let db = Db { pool: app.pool.clone(), owner: a.id };
+    let co = app.ok_post(t, "/api/crm/companies", json!({"name": "Acme", "domain": "acme.com"}), 201).await;
+    let p = app.ok_post(t, "/api/crm/contacts", json!({"name": "Sam", "email": "sam@acme.com", "company_id": id(&co)}), 201).await;
+    let pid = id(&p);
+    // an export taken before the opt-out
+    let old_export = csv_get(&app, t, "contacts").await;
+    app.patch(t, &format!("/api/crm/contacts/{pid}"), json!({"do_not_contact": true, "dnc_reason": "asked to stop"})).await;
+    let deal = app.ok_post(t, "/api/crm/deals", json!({"company_id": id(&co), "contact_id": pid, "title": "Pilot"}), 201).await;
+
+    // re-importing the old export (do_not_contact = false, no reason) changes nothing about it
+    let (s, r) = csv_post(&app, t, "/api/crm/import?kind=contacts&dry_run=false", old_export.into_bytes()).await;
+    assert_eq!(s, 200, "{r}");
+    let now = app.get(t, &format!("/api/crm/contacts/{pid}")).await.1;
+    assert_eq!((now["do_not_contact"].clone(), now["dnc_reason"].as_str()), (json!(true), Some("asked to stop")));
+    assert!(now["dnc_at"].is_string());
+    // an import can still add one
+    let (s, r) = csv_post(&app, t, "/api/crm/import?kind=contacts&dry_run=false", b"name,email,do_not_contact\r\nKim,kim@acme.com,true\r\n".to_vec()).await;
+    assert_eq!((s, r["created"].as_i64()), (200, Some(1)), "{r}");
+    assert!(teammate::do_not_contact(&db, "kim@acme.com").await.unwrap().is_some());
+
+    // the owner corrects Sam's address: the old one still counts (the change log keeps it)
+    app.patch(t, &format!("/api/crm/contacts/{pid}"), json!({"email": "samuel@acme.com"})).await;
+    for addr in ["samuel@acme.com", "sam@acme.com", "SAM+x@acme.com"] {
+        assert_eq!(teammate::do_not_contact(&db, addr).await.unwrap(), Some(uid(&p)), "{addr}");
+    }
+
+    // a teammate adding "Sam at Acme" under a new address finds Sam, and can't change who Sam is
+    let bot = app.bot(t, "Scout").await;
+    let who = Actor::Bot { bot: bot.parse().unwrap(), run: None };
+    let mut tx = app.pool.begin().await.unwrap();
+    let s = crm::write_contact_in(&mut tx, a.id, &who, None, &ContactInput {
+        name: Some("Sam".into()), email: Some("sam.other@acme.com".into()), company_id: Some(uid(&co)),
+        source_urls: Some(vec!["https://acme.com/team".into()]), ..Default::default()
+    })
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!((s.row["id"].as_str(), s.kept.clone()), (Some(pid.as_str()), vec!["email".to_string()]));
+    assert_eq!(app.get(t, &format!("/api/crm/contacts/{pid}")).await.1["email"], "samuel@acme.com");
+
+    // the board shows the flag on the deal
+    let board = app.get(t, "/api/crm/pipeline").await.1;
+    let new = board.as_array().unwrap().iter().find(|s| s["stage"] == "new").unwrap();
+    assert_eq!(new["deals"][0]["contact_do_not_contact"], true);
+    assert_eq!(app.get(t, &format!("/api/crm/deals/{}", id(&deal))).await.1["contact_do_not_contact"], true);
+
+    // a stage move through a plain update goes on the timeline too (once)
+    app.patch(t, &format!("/api/crm/deals/{}", id(&deal)), json!({"stage": "lost"})).await;
+    app.patch(t, &format!("/api/crm/deals/{}", id(&deal)), json!({"stage": "lost", "next_step": "none"})).await;
+    let acts = app.get(t, &format!("/api/crm/activities?deal_id={}", id(&deal))).await.1;
+    assert_eq!(len(&acts), 1);
+    assert_eq!((acts[0]["kind"].as_str(), acts[0]["summary"].as_str()), (Some("stage_change"), Some("Stage: new -> lost")));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crm_webhook_refusals_are_not_retried() {
+    use familiar_core::{
+        crm::{self, Actor, CompanyInput, webhooks},
+        db::Db,
+    };
+    let app = app!(true);
+    let a = app.owner().await;
+    let t = &a.tok;
+    let db = Db { pool: app.pool.clone(), owner: a.id };
+    let sb = familiar_crypto::SecretBox::from_base64(KEY).unwrap();
+    let (base, mut got) = receiver().await;
+    let gone = app.ok_post(t, "/api/crm/webhooks", json!({"url": format!("{base}/gone"), "events": ["company.created"]}), 201).await;
+    crm::upsert_company(&db, &Actor::User, &CompanyInput { name: Some("Acme".into()), ..Default::default() }).await.unwrap();
+    assert_eq!(webhooks::deliver_due(&db, &sb).await.unwrap(), 1);
+    assert_eq!(got.recv().await.unwrap().0, "/gone");
+    let (_, d) = app.get(t, &format!("/api/crm/webhooks/{}/deliveries", id(&gone))).await;
+    assert_eq!((d[0]["status"].as_str(), d[0]["attempts"].as_i64()), (Some("failed"), Some(1)), "{d}");
+    assert!(d[0]["last_error"].as_str().unwrap().contains("HTTP 410 (not retried"), "{d}");
+    // a secret this key can't open fails at once too
+    let other = app.ok_post(t, "/api/crm/webhooks", json!({"url": format!("{base}/hook"), "events": ["company.created"]}), 201).await;
+    sqlx::query("update crm_webhooks set secret_enc = 'v1:AAAA' where id = $1").bind(uid(&other)).execute(&app.pool).await.unwrap();
+    crm::upsert_company(&db, &Actor::User, &CompanyInput { name: Some("Beta".into()), ..Default::default() }).await.unwrap();
+    assert_eq!(webhooks::deliver_due(&db, &sb).await.unwrap(), 2);
+    let (_, d) = app.get(t, &format!("/api/crm/webhooks/{}/deliveries", id(&other))).await;
+    assert_eq!((d[0]["status"].as_str(), d[0]["attempts"].as_i64()), (Some("failed"), Some(1)), "{d}");
+    assert!(d[0]["last_error"].as_str().unwrap().contains("secret"), "{d}");
+    // a Test is stored already settled: never pending, never picked up later
+    let ping = app.ok_post(t, &format!("/api/crm/webhooks/{}/test", id(&gone)), json!({}), 200).await;
+    assert_eq!((ping["status"].as_str(), ping["attempts"].as_i64()), (Some("failed"), Some(1)));
+    sqlx::query("update crm_webhook_deliveries set next_attempt_at = now() - interval '1 day'").execute(&app.pool).await.unwrap();
+    assert_eq!(webhooks::deliver_due(&db, &sb).await.unwrap(), 0);
 }

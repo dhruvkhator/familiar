@@ -9,9 +9,11 @@
 //!   set, change what teammates set, add tags and `source_urls` (never remove them), maintain `fit_score` / `fit_reason`
 //!   (companies) and `stage` / `next_step` / `next_step_at` (deals; but a deal the owner closed as won or lost stays
 //!   closed), and set do-not-contact (only the owner clears it). The tool answer names the fields it kept.
-//! - **Do-not-contact.** Records come back flagged. `propose_draft` refuses a draft whose `to` is a do-not-contact
-//!   contact's email, X handle or LinkedIn link ([`do_not_contact`]), and the approved draft's follow-up is checked again
-//!   ([`crate::drafts`]). A soft-deleted contact still counts: deleting a record doesn't lift a do-not-contact.
+//! - **Do-not-contact.** Records come back flagged, and a teammate never changes who a do-not-contact person is
+//!   ([`DNC_IDENTITY`]). `propose_draft` refuses a draft whose `to`, subject, body or note reaches or names a
+//!   do-not-contact contact by an email, X handle or LinkedIn link it has or ever had ([`draft_dnc`], canonical forms),
+//!   and the approved version is checked again before its follow-up ([`crate::drafts`]). Soft-deleted contacts and old
+//!   addresses still count: neither a delete nor an edit lifts a do-not-contact. Refusals name the contact by id only.
 //! - **Limits.** No delete tool; research-only runs only read; a new company or contact needs `source_urls`; one run
 //!   makes at most [`super::MAX_WRITES_PER_RUN`] changes.
 
@@ -184,7 +186,7 @@ pub(super) async fn owner_held(
     type Row = (String, Option<sqlx::types::Json<Value>>, Option<sqlx::types::Json<Value>>, String);
     let rows: Vec<Row> = sqlx::query_as(
         "select op, before, after, actor_kind from crm_changes where owner_id = $1 and entity = $2 and entity_id = $3
-         order by at desc, id desc limit 1000",
+         order by at desc, id desc",
     )
     .bind(owner)
     .bind(kind.name())
@@ -195,9 +197,19 @@ pub(super) async fn owner_held(
     Ok(held_fields(&changes, fields))
 }
 
+/// Equal values, timestamps compared as instants (`2026-10-14T09:00:00Z` = `2026-10-14T09:00:00+00:00`).
+fn same(a: Option<&Value>, b: Option<&Value>) -> bool {
+    let at = |v: Option<&Value>| v.and_then(Value::as_str).and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+    a == b || at(a).is_some_and(|x| at(b) == Some(x))
+}
+
+/// What identifies a contact: a teammate never changes these on a do-not-contact contact, whoever set them.
+const DNC_IDENTITY: [&str; 5] = ["email", "x_handle", "linkedin_url", "name", "company_id"];
+
 /// A teammate's change to an existing record, filtered by the owner-edits-win rule (see the module docs): drops the
-/// fields the owner holds (`held`), turns tags and `source_urls` into additions, and returns the dropped field names.
-/// do-not-contact is left to [`super::save`] (a teammate may set it, never clear it).
+/// fields the owner holds (`held`) and the identity of a do-not-contact contact ([`DNC_IDENTITY`]), turns tags and
+/// `source_urls` into additions, and returns the dropped field names. do-not-contact itself is left to [`super::save`]
+/// (a teammate may set it, never clear it).
 pub fn owner_edits_win(kind: Kind, before: &Value, m: &mut M, held: &BTreeSet<String>) -> Vec<String> {
     let mut kept = Vec::new();
     let setting_dnc = m.get("do_not_contact") == Some(&json!(true)) && before["do_not_contact"] != json!(true);
@@ -221,7 +233,7 @@ pub fn owner_edits_win(kind: Kind, before: &Value, m: &mut M, held: &BTreeSet<St
             }
             _ => {}
         }
-        if m.get(&k) == before.get(&k) {
+        if same(m.get(&k), before.get(&k)) {
             continue;
         }
         // a deal the owner closed stays closed
@@ -229,7 +241,11 @@ pub fn owner_edits_win(kind: Kind, before: &Value, m: &mut M, held: &BTreeSet<St
             && k == "stage"
             && held.contains("stage")
             && matches!(before["stage"].as_str(), Some("won" | "lost"));
-        if (bot_maintained(kind, &k) && !closed_by_owner) || !held.contains(&k) {
+        // who a do-not-contact contact is stays as it is: a changed address would slip past the draft check
+        let dnc_identity = kind == Kind::Contact
+            && before["do_not_contact"] == json!(true)
+            && DNC_IDENTITY.contains(&k.as_str());
+        if !dnc_identity && ((bot_maintained(kind, &k) && !closed_by_owner) || !held.contains(&k)) {
             continue;
         }
         m.remove(&k);
@@ -241,23 +257,74 @@ pub fn owner_edits_win(kind: Kind, before: &Value, m: &mut M, held: &BTreeSet<St
 
 // ---- do-not-contact -------------------------------------------------------------
 
-/// A contact marked do-not-contact, as `propose_draft` checks it.
+/// A way to reach a contact marked do-not-contact: its current email, X handle or LinkedIn link, or one it had before
+/// (from the change log), as `propose_draft` checks it.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DncContact {
-    pub name: String,
+    pub id: Uuid,
     pub email: Option<String>,
     pub x_handle: Option<String>,
     pub linkedin_url: Option<String>,
 }
 
+/// Lowercase, without characters that don't show (zero-width, bidi, format), trimmed.
+fn visible(s: &str) -> String {
+    s.chars().filter(|c| !crate::text::hidden_char(*c, false)).collect::<String>().trim().to_lowercase()
+}
+
+/// `%41` → `A` (invalid escapes stay as they are).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// One canonical form per mailbox: lowercase, hidden characters, `mailto:` and `?…` dropped, trailing dots of the
+/// domain trimmed, `+tag` dropped, and for Gmail the dots of the name dropped (`googlemail.com` = `gmail.com`).
+pub fn email_key(s: &str) -> Option<String> {
+    let s = visible(s);
+    let s = s.strip_prefix("mailto:").unwrap_or(&s);
+    let s = s.split('?').next().unwrap_or_default().trim_end_matches('.');
+    let e = super::email(s)?;
+    let (local, host) = e.split_once('@')?;
+    let local = local.split('+').next().unwrap_or_default();
+    let (local, host) = match host {
+        "gmail.com" | "googlemail.com" => (local.replace('.', ""), "gmail.com"),
+        _ => (local.to_string(), host),
+    };
+    (!local.is_empty()).then(|| format!("{local}@{host}"))
+}
+
+/// `x:sam` for `@Sam`, `sam` or `SAM` (hidden characters dropped).
+fn handle_key(s: &str) -> Option<String> {
+    let h = visible(s);
+    let h = h.trim_start_matches('@');
+    (!h.is_empty() && !h.contains(char::is_whitespace)).then(|| format!("x:{h}"))
+}
+
 /// `linkedin.com/in/sam` for any form of a LinkedIn profile link (scheme, `www.`/country subdomain, query, trailing
-/// slash, case); `x:sam` for an X / Twitter profile link. None for anything else.
+/// slash, case, percent-escapes); `x:sam` for an X / Twitter profile link. None for anything else.
 fn profile_key(s: &str) -> Option<String> {
-    let s = s.trim().to_lowercase();
+    let s = visible(s);
     let with_scheme = if s.contains("://") { s.clone() } else { format!("https://{s}") };
     let u = url::Url::parse(&with_scheme).ok()?;
     let host = u.host_str()?;
-    let path = u.path().trim_end_matches('/');
+    let path = percent_decode(u.path()).to_lowercase();
+    let path = path.trim_end_matches('/');
     if host == "linkedin.com" || host.ends_with(".linkedin.com") {
         return (!path.is_empty()).then(|| format!("linkedin.com{path}"));
     }
@@ -268,51 +335,73 @@ fn profile_key(s: &str) -> Option<String> {
     None
 }
 
-/// The do-not-contact contact a draft's `to` points at: one of its email addresses, an `@handle`, an X profile link or
-/// a LinkedIn profile link (several recipients may be listed, with names and brackets around them).
-pub fn dnc_hit<'a>(to: &str, list: &'a [DncContact]) -> Option<&'a DncContact> {
+/// The do-not-contact contact `text` reaches or names: one of its email addresses, an `@handle`, an X profile link or
+/// a LinkedIn profile link anywhere in it (a draft's `to` with names, brackets and several recipients; a subject; a
+/// body), or the whole text as a bare handle.
+pub fn dnc_hit<'a>(text: &str, list: &'a [DncContact]) -> Option<&'a DncContact> {
     let mut keys: BTreeSet<String> = BTreeSet::new();
-    let whole = to.trim().trim_start_matches('@').to_lowercase();
-    if !whole.is_empty() && !whole.contains(char::is_whitespace) {
-        keys.insert(format!("x:{whole}"));
-    }
-    for token in to.split([',', ';', ' ', '<', '>', '(', ')', '"', '\'', '\n', '\r', '\t', '[', ']']) {
-        let t = token.trim().trim_start_matches("mailto:");
+    keys.extend(handle_key(text));
+    let tokens = text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '<' | '>' | '(' | ')' | '"' | '\'' | '[' | ']'));
+    for token in tokens {
+        let t = token.trim_end_matches(['.', ',', ':', ';', '!', '?']);
         if t.is_empty() {
             continue;
         }
-        if let Some(e) = super::email(t) {
+        if let Some(e) = email_key(t) {
             keys.insert(format!("e:{e}"));
-        } else if let Some(h) = t.strip_prefix('@') {
-            keys.insert(format!("x:{}", h.to_lowercase()));
+        } else if t.starts_with('@') {
+            keys.extend(handle_key(t));
         } else if let Some(p) = profile_key(t) {
             keys.insert(p);
         }
     }
     list.iter().find(|c| {
-        c.email.as_deref().is_some_and(|e| keys.contains(&format!("e:{}", e.to_lowercase())))
-            || c.x_handle.as_deref().is_some_and(|h| keys.contains(&format!("x:{}", h.trim_start_matches('@').to_lowercase())))
+        c.email.as_deref().and_then(email_key).is_some_and(|e| keys.contains(&format!("e:{e}")))
+            || c.x_handle.as_deref().and_then(handle_key).is_some_and(|h| keys.contains(&h))
             || c.linkedin_url.as_deref().and_then(profile_key).is_some_and(|p| keys.contains(&p))
     })
 }
 
-/// The name of the do-not-contact contact `to` points at, if any (soft-deleted contacts included).
-pub async fn do_not_contact(db: &Db, to: &str) -> Result<Option<String>> {
+/// The id of the do-not-contact contact `text` reaches, if any. Every address, handle and link such a contact has or
+/// ever had (its change log) counts, and soft-deleted contacts too: changing or deleting a record never lifts a
+/// do-not-contact.
+pub async fn do_not_contact(db: &Db, text: &str) -> Result<Option<Uuid>> {
     let list: Vec<DncContact> = sqlx::query_as(
-        "select name, email, x_handle, linkedin_url from crm_contacts where owner_id = $1 and do_not_contact",
+        "select c.id, x.email, x.x_handle, x.linkedin_url
+         from crm_contacts c
+         cross join lateral (
+           select c.email, c.x_handle, c.linkedin_url
+           union
+           select v ->> 'email', v ->> 'x_handle', v ->> 'linkedin_url'
+           from crm_changes ch cross join lateral (values (ch.before), (ch.after)) s(v)
+           where ch.owner_id = c.owner_id and ch.entity = 'contact' and ch.entity_id = c.id and v is not null
+         ) x
+         where c.owner_id = $1 and c.do_not_contact",
     )
     .bind(db.owner)
     .fetch_all(&db.pool)
     .await?;
-    Ok(dnc_hit(to, &list).map(|c| c.name.clone()))
+    Ok(dnc_hit(text, &list).map(|c| c.id))
 }
 
-/// What `propose_draft` answers for a draft to a do-not-contact contact.
-pub fn dnc_refusal(to: &str, name: &str) -> String {
+/// The do-not-contact contact a draft (`{to, subject, body}`, plus the teammate's `note`) reaches or names, if any.
+pub async fn draft_dnc(db: &Db, draft: &Value, note: Option<&str>) -> Result<Option<Uuid>> {
+    let texts = ["to", "subject", "body"].iter().filter_map(|k| draft[*k].as_str()).chain(note);
+    for t in texts {
+        if let Some(id) = do_not_contact(db, t).await? {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+/// What `propose_draft` answers for a draft that reaches or names a do-not-contact contact (by id: a name in the CRM
+/// may have come from a web page).
+pub fn dnc_refusal(contact: Uuid) -> String {
     format!(
-        "Not proposed: {to} is {name}, marked do-not-contact in the CRM (they asked not to be contacted). Don't draft, \
-         send or connect to them in any other way. Only your owner can lift this; if you think it's a mistake, say so \
-         in your summary."
+        "Not proposed: the draft reaches or names a person marked do-not-contact in the CRM (contact {contact}): they \
+         asked not to be contacted. Don't draft, send or connect to them in any other way. Only your owner can lift \
+         this; if you think it's a mistake, say so in your summary."
     )
 }
 
@@ -454,8 +543,8 @@ fn written(kind: Kind, s: Saved) -> String {
     let mut text = format!("{}\n{}", fence.reminder(), fence.apply(&Value::Object(out)));
     if !s.kept.is_empty() {
         text.push_str(&format!(
-            "\nYour owner set {} themselves, so their values stay. If you think they are out of date, say so in your \
-             summary instead of changing them.",
+            "\nKept as they are: {}. Your owner set them themselves, or this person asked not to be contacted (then who \
+             they are never changes). If you think a value is out of date, say so in your summary instead of changing it.",
             s.kept.join(", ")
         ));
     }
@@ -856,30 +945,81 @@ mod tests {
         assert_eq!(w["do_not_contact"], json!(false));
     }
 
-    fn dnc(name: &str, email: Option<&str>, x: Option<&str>, li: Option<&str>) -> DncContact {
-        DncContact { name: name.into(), email: email.map(Into::into), x_handle: x.map(Into::into), linkedin_url: li.map(Into::into) }
+    const SAM: Uuid = Uuid::from_u128(1);
+    const KIM: Uuid = Uuid::from_u128(2);
+    const GIL: Uuid = Uuid::from_u128(3);
+
+    fn dnc(id: Uuid, email: Option<&str>, x: Option<&str>, li: Option<&str>) -> DncContact {
+        DncContact { id, email: email.map(Into::into), x_handle: x.map(Into::into), linkedin_url: li.map(Into::into) }
     }
 
     #[test]
     fn drafts_to_do_not_contact_people_are_caught() {
         let list = vec![
-            dnc("Sam", Some("sam@acme.com"), Some("SamAcme"), Some("https://www.linkedin.com/in/sam-acme/")),
-            dnc("Kim", None, None, Some("linkedin.com/in/kim")),
+            dnc(SAM, Some("sam@acme.com"), Some("SamAcme"), Some("https://www.linkedin.com/in/sam-acme/")),
+            dnc(KIM, None, None, Some("linkedin.com/in/kim")),
+            dnc(GIL, Some("Gil.Bert+news@GoogleMail.com."), None, Some("https://www.linkedin.com/in/j%C3%BCrgen")),
         ];
-        let hit = |to: &str| dnc_hit(to, &list).map(|c| c.name.clone());
+        let hit = |to: &str| dnc_hit(to, &list).map(|c| c.id);
         for to in [
             "sam@acme.com", " SAM@ACME.COM ", "Sam Lee <sam@acme.com>", "a@b.com, sam@acme.com", "mailto:sam@acme.com",
-            "@samacme", "samacme", "https://x.com/SamAcme", "https://twitter.com/samacme/status/1", "x.com/samacme",
+            "mailto:sam@acme.com?subject=hi", "sam+sales@acme.com", "sam@acme.com.", "s\u{200B}am@acme.com", "sam@acme.com\u{2060}",
+            "@samacme", "samacme", "@sam\u{200D}acme", "https://x.com/SamAcme", "https://twitter.com/samacme/status/1", "x.com/samacme",
             "https://linkedin.com/in/sam-acme", "https://uk.linkedin.com/in/Sam-Acme?trk=x", "(https://www.linkedin.com/in/sam-acme)",
+            "https://www.linkedin.com/in/sam%2Dacme/", "Hi, write to sam@acme.com today.", "Ping @SamAcme!",
         ] {
-            assert_eq!(hit(to).as_deref(), Some("Sam"), "{to}");
+            assert_eq!(hit(to), Some(SAM), "{to:?}");
         }
-        assert_eq!(hit("https://www.linkedin.com/in/kim/").as_deref(), Some("Kim"));
+        assert_eq!(hit("https://www.linkedin.com/in/kim/"), Some(KIM));
+        // Gmail ignores dots and +tags; googlemail.com is gmail.com; an escaped LinkedIn path is the same profile
+        for to in ["gilbert@gmail.com", "g.i.l.bert+x@gmail.com", "GilBert@googlemail.com", "https://linkedin.com/in/jürgen"] {
+            assert_eq!(hit(to), Some(GIL), "{to:?}");
+        }
         for to in [
             "", "sam@acme.co", "someone@acme.com", "@sam", "https://x.com/someoneelse", "https://linkedin.com/in/sam",
-            "https://reddit.com/r/x/1", "Sam", "https://acme.com/samacme",
+            "https://reddit.com/r/x/1", "Sam", "https://acme.com/samacme", "sa.m@acme.com", "gilbert@gmail.co",
+            "a post about the weather",
         ] {
-            assert_eq!(hit(to), None, "{to}");
+            assert_eq!(hit(to), None, "{to:?}");
         }
+    }
+
+    #[test]
+    fn email_keys() {
+        assert_eq!(email_key(" Mailto:A.B+x@Example.COM.?subject=1 ").as_deref(), Some("a.b@example.com"));
+        assert_eq!(email_key("a.b+x@gmail.com").as_deref(), Some("ab@gmail.com"));
+        assert_eq!(email_key("+x@acme.com"), None);
+        assert_eq!(email_key("not an email"), None);
+        assert_eq!(email_key("a\u{202E}b@acme.com").as_deref(), Some("ab@acme.com"));
+    }
+
+    #[test]
+    fn a_do_not_contact_contact_keeps_who_they_are() {
+        let before = json!({ "do_not_contact": true, "email": "sam@acme.com", "name": "Sam", "x_handle": null,
+                             "linkedin_url": null, "company_id": null, "notes": "x", "title": null });
+        let mut w = m(json!({ "email": "sam.new@acme.com", "name": "Samuel", "x_handle": "sam2",
+                              "linkedin_url": "https://linkedin.com/in/s", "company_id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10",
+                              "notes": "bot notes", "title": "CTO" }));
+        // nothing held by the owner: still, the identity stays
+        let kept = owner_edits_win(Kind::Contact, &before, &mut w, &held(&[]));
+        assert_eq!(kept, ["company_id", "email", "linkedin_url", "name", "x_handle"].map(String::from).to_vec());
+        assert_eq!((w["notes"].as_str(), w["title"].as_str()), (Some("bot notes"), Some("CTO")));
+        // clearing an address is a change too
+        let mut w = m(json!({ "email": null }));
+        assert_eq!(owner_edits_win(Kind::Contact, &before, &mut w, &held(&[])), vec!["email".to_string()]);
+        // a contact who is not do-not-contact can be corrected as usual
+        let mut ok = before.clone();
+        ok["do_not_contact"] = json!(false);
+        let mut w = m(json!({ "email": "sam.new@acme.com" }));
+        assert!(owner_edits_win(Kind::Contact, &ok, &mut w, &held(&[])).is_empty());
+    }
+
+    #[test]
+    fn timestamps_compare_as_instants() {
+        let a = json!("2026-10-14T09:00:00Z");
+        assert!(same(Some(&a), Some(&json!("2026-10-14T09:00:00+00:00"))));
+        assert!(same(Some(&a), Some(&json!("2026-10-14T11:00:00+02:00"))));
+        assert!(!same(Some(&a), Some(&json!("2026-10-14T09:00:01Z"))));
+        assert!(same(None, None) && !same(Some(&a), None) && !same(Some(&json!("x")), Some(&json!("y"))));
     }
 }

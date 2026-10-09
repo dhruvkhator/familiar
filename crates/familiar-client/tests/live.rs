@@ -197,7 +197,7 @@ async fn crm_roundtrip() {
         .await
         .unwrap();
     assert_eq!((note.kind, note.company_id, note.actor_kind.as_str()), (ActivityKind::Call, Some(acme.id), "user"));
-    assert_eq!(client.crm_activities(&CrmActivityParams { company_id: Some(acme.id), ..Default::default() }).await.unwrap().len(), 1);
+    assert_eq!(client.crm_activities(&CrmActivityParams { company_id: Some(acme.id), ..Default::default() }).await.unwrap().len(), 2, "the call and the stage_change of the move to meeting");
 
     // the change log, and undo (only the newest change of a record)
     let changes = client.crm_changes(&CrmChangeParams { entity: Some("deal".into()), entity_id: Some(deal.id), ..Default::default() }).await.unwrap();

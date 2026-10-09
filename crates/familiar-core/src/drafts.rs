@@ -36,8 +36,8 @@ pub fn queued_message(id: Uuid) -> String {
 }
 
 /// The follow-up message for a decided draft: `status` approved | revise | denied, `note` the owner's note, `proposed`
-/// the draft as the teammate proposed it, `edited` the owner's version when they changed it, `dnc` the name of the
-/// do-not-contact contact its recipient turned out to be (the CRM is checked again after approval). None for any other
+/// the draft as the teammate proposed it, `edited` the owner's version when they changed it, `dnc` the do-not-contact
+/// contact it turned out to reach (the CRM is checked again after approval; named by id only). None for any other
 /// status (expired drafts get no follow-up).
 pub fn decision_message(
     id: Uuid,
@@ -45,7 +45,7 @@ pub fn decision_message(
     note: Option<&str>,
     proposed: &Value,
     edited: Option<&Value>,
-    dnc: Option<&str>,
+    dnc: Option<Uuid>,
 ) -> Option<String> {
     let id = short_id(id);
     let note = note.map(str::trim).filter(|n| !n.is_empty());
@@ -54,12 +54,11 @@ pub fn decision_message(
     let msg = match status {
         "approved" => {
             let final_ = edited.unwrap_or(proposed);
-            if let Some(name) = dnc {
+            if let Some(contact) = dnc {
                 return Some(format!(
-                    "[Familiar] Draft #{id} ({}) was approved, but {name} is marked do-not-contact in the CRM now (they \
-                     asked not to be contacted), so it is not passed on. Don't send it, and don't contact them in any \
-                     other way. Only your owner can lift a do-not-contact.",
-                    summary(final_)
+                    "[Familiar] Draft #{id} was approved, but it reaches or names a person marked do-not-contact in the \
+                     CRM now (contact {contact}): they asked not to be contacted, so the draft is not passed on. Don't \
+                     send it, and don't contact them in any other way. Only your owner can lift a do-not-contact."
                 ));
             }
             if hidden(final_) {
@@ -167,9 +166,9 @@ pub async fn sweep(ctx: &Ctx) -> Result<usize> {
     for d in ctx.db.decided_drafts().await? {
         let final_ = d.edited.as_ref().map_or(&d.input.0, |e| &e.0);
         // The recipient may have asked not to be contacted since the draft was proposed (or the owner's edit changed it).
-        let dnc = match final_["to"].as_str().filter(|_| d.status == "approved") {
-            Some(to) => match crate::crm::teammate::do_not_contact(&ctx.db, to).await {
-                Ok(name) => name,
+        let dnc = match (d.status == "approved").then_some(final_) {
+            Some(draft) => match crate::crm::teammate::draft_dnc(&ctx.db, draft, None).await {
+                Ok(contact) => contact,
                 Err(e) => {
                     // not passed on unchecked: tried again on the next tick
                     warn!(draft = %d.id, "checking the do-not-contact list failed: {e}");
@@ -184,7 +183,7 @@ pub async fn sweep(ctx: &Ctx) -> Result<usize> {
             d.response.as_deref(),
             &d.input.0,
             d.edited.as_ref().map(|e| &e.0),
-            dnc.as_deref(),
+            dnc,
         );
         match ctx.db.queue_draft_followup(&d, msg.as_deref()).await {
             Ok(Some(run)) => {
@@ -264,11 +263,13 @@ mod tests {
     #[test]
     fn approved_drafts_to_do_not_contact_people_are_not_passed_on() {
         let proposed = json!({ "kind": "email", "channel": "Gmail", "to": "sam@acme.com", "subject": "Hi", "body": "Hello Sam" });
-        let m = decision_message(id(), "approved", Some("go"), &proposed, None, Some("Sam Lee")).unwrap();
-        assert!(m.starts_with("[Familiar] Draft #1a2b3c4d (email on Gmail to sam@acme.com) was approved, but Sam Lee is marked do-not-contact"), "{m}");
+        let contact: Uuid = "99887766-0000-4000-8000-000000000000".parse().unwrap();
+        let m = decision_message(id(), "approved", Some("go"), &proposed, None, Some(contact)).unwrap();
+        assert!(m.starts_with("[Familiar] Draft #1a2b3c4d was approved, but it reaches or names a person marked do-not-contact"), "{m}");
+        assert!(m.contains("(contact 99887766-0000-4000-8000-000000000000)"), "named by id only: {m}");
         assert!(m.contains("Don't send it") && !m.contains("BEGIN APPROVED") && !m.contains("Hello Sam"), "{m}");
         // the other decisions don't send anything anyway
-        let m = decision_message(id(), "denied", None, &proposed, None, Some("Sam Lee")).unwrap();
+        let m = decision_message(id(), "denied", None, &proposed, None, Some(contact)).unwrap();
         assert!(m.contains("rejected"), "{m}");
     }
 

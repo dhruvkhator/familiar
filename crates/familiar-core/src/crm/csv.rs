@@ -232,8 +232,9 @@ async fn import_row(tx: &mut PgConnection, owner: Uuid, kind: Kind, f: &Fields) 
                 tags: tag_cell(f),
                 source_urls: url_cell(f),
                 custom: None,
-                do_not_contact: bool_cell(f, "do_not_contact")?,
-                dnc_reason: g("dnc_reason"),
+                // An import only ever adds a do-not-contact: an old export re-imported must not lift one (or its reason).
+                do_not_contact: bool_cell(f, "do_not_contact")?.filter(|dnc| *dnc),
+                dnc_reason: g("dnc_reason").filter(|r| !r.trim().is_empty()),
             };
             Ok(super::upsert_contact_in(tx, owner, &Actor::User, &i).await?.1)
         }

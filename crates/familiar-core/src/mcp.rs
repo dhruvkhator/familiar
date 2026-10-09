@@ -130,7 +130,8 @@ struct ProposeDraft {
     kind: String,
     /// Where it goes: X, Instagram, LinkedIn, Gmail, Reddit, Hacker News...
     channel: String,
-    /// Who or what it answers: a handle, an email address, a thread or post URL. Leave out for a new post.
+    /// Who or what it goes to: an email address (or several) for an email, a handle or profile link for a DM, the thread
+    /// or post URL for a reply or comment. Required for everything but a new post.
     to: Option<String>,
     /// Email subject (emails only).
     subject: Option<String>,
@@ -296,13 +297,11 @@ impl Tools {
             Ok(v) => v,
             Err(e) => return fail(e),
         };
-        // Never to someone who asked not to be contacted (checked again before an approved draft is passed on).
-        if let Some(to) = input["to"].as_str() {
-            match crm::teammate::do_not_contact(&self.ctx.db, to).await {
-                Ok(Some(name)) => return fail(crm::teammate::dnc_refusal(to, &name)),
-                Ok(None) => {}
-                Err(e) => return fail(format!("could not check the do-not-contact list, so not proposed: {e}")),
-            }
+        // Never to, or about, someone who asked not to be contacted (checked again before an approved draft is passed on).
+        match crm::teammate::draft_dnc(&self.ctx.db, &input, p.note.as_deref()).await {
+            Ok(Some(contact)) => return fail(crm::teammate::dnc_refusal(contact)),
+            Ok(None) => {}
+            Err(e) => return fail(format!("could not check the do-not-contact list, so not proposed: {e}")),
         }
         // Images and files of the draft go into the conversation, so the owner can open them before deciding.
         for m in input["media"].as_array().into_iter().flatten().filter_map(Value::as_str) {
@@ -572,6 +571,24 @@ fn draft_input(p: &ProposeDraft, workspace: &Path) -> Result<Value, String> {
     let channel = field(Some(&p.channel), "channel", 40)?.ok_or("channel must not be empty (X, Gmail, LinkedIn...)")?;
     let body = field(Some(&p.body), "body", 20_000)?.ok_or("body must not be empty: give the exact text")?;
     let to = field(p.to.as_deref(), "to", 500)?;
+    // Only a new post goes to nobody in particular; everything else names who it reaches (the do-not-contact check
+    // depends on it), and an email names addresses.
+    match (&to, kind.as_str()) {
+        (None, "post") => {}
+        (None, _) => return Err(format!("to is required for kind {kind}: who or what it goes to")),
+        (Some(to), "email") => {
+            for r in to.split([',', ';']).map(str::trim).filter(|r| !r.is_empty()) {
+                let addr = match (r.find('<'), r.rfind('>')) {
+                    (Some(a), Some(b)) if a < b => &r[a + 1..b],
+                    _ => r,
+                };
+                if crm::email(addr.trim()).is_none() {
+                    return Err(format!("to must be email addresses for an email (got {r:?})"));
+                }
+            }
+        }
+        _ => {}
+    }
     let subject = field(p.subject.as_deref(), "subject", 300)?;
     field(p.note.as_deref(), "note", 2000)?;
     let media = p.media.as_deref().unwrap_or_default();
@@ -660,6 +677,25 @@ mod tests {
         let mut d = draft("post", "X", "hi");
         d.note = Some("n".repeat(2001));
         assert!(draft_input(&d, &ws).unwrap_err().contains("note is too long"));
+
+        // only a new post may leave out who it goes to
+        for kind in ["reply", "email", "dm", "comment", "other"] {
+            let e = draft_input(&draft(kind, "X", "hi"), &ws).unwrap_err();
+            assert!(e.contains("to is required"), "{kind}: {e}");
+        }
+        let mut d = draft("dm", "LinkedIn", "hi");
+        d.to = Some("https://www.linkedin.com/in/sam".into());
+        assert!(draft_input(&d, &ws).is_ok());
+        // an email goes to addresses
+        let mut d = draft("email", "Gmail", "hi");
+        for good in ["sam@acme.com", "Sam Lee <sam@acme.com>", "a@b.io, Sam <sam@acme.com>; c@d.io"] {
+            d.to = Some(good.into());
+            assert!(draft_input(&d, &ws).is_ok(), "{good}");
+        }
+        for bad in ["Sam", "sam at acme", "@sam", "https://acme.com", "a@b.io, Sam"] {
+            d.to = Some(bad.into());
+            assert!(draft_input(&d, &ws).unwrap_err().contains("email addresses"), "{bad}");
+        }
         let _ = std::fs::remove_dir_all(ws);
     }
 }

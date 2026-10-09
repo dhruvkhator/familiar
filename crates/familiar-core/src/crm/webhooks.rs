@@ -4,7 +4,8 @@
 //! - The daemon ([`run`]) delivers them: POST, [`TIMEOUT`], no redirects, at most [`MAX_BODY`], headers
 //!   `Familiar-Event`, `Familiar-Delivery` (the delivery id; the same on every retry) and
 //!   `Familiar-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<body>" keyed with the secret>` ([`signature`]).
-//!   A non-2xx answer or no answer is retried after [`RETRIES`] (1 m, 5 m, 30 m, 2 h, 6 h), then the delivery is `failed`.
+//!   No answer, a 5xx, a redirect, 408 or 429 is retried after [`RETRIES`] (1 m, 5 m, 30 m, 2 h, 6 h), then the delivery
+//!   is `failed`; another 4xx, a payload over the limit or a secret that can't be read fails at once ([`Failure`]).
 //! - Where a webhook may point ([`refused`]), checked when it is saved and again after DNS at every delivery, with the
 //!   connection pinned to the addresses that were checked (no DNS rebinding in between): `https` to public addresses;
 //!   this computer (loopback) over `http` or `https`; never private LAN, link-local (cloud metadata), multicast,
@@ -222,14 +223,39 @@ pub async fn enqueue(tx: &mut PgConnection, owner: Uuid, event: &str, payload: &
 
 // ---- delivery ------------------------------------------------------------------------
 
-/// POST one delivery. Ok(HTTP status) for a 2xx answer; Err(why) otherwise. The address rules are checked again here,
-/// after DNS, and the connection goes only to the addresses checked.
-pub async fn send(url: &str, secret: &str, delivery: Uuid, event: &str, body: &[u8]) -> std::result::Result<u16, String> {
-    if body.len() > MAX_BODY {
-        return Err(format!("the payload is larger than {} KB", MAX_BODY / 1024));
+/// Why a delivery attempt failed, and whether trying again later could help.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub why: String,
+    /// False for what another attempt can't change: a payload too large, a secret that can't be read, a 4xx answer
+    /// other than 408 or 429.
+    pub retry: bool,
+}
+
+impl Failure {
+    fn again(why: impl Into<String>) -> Self {
+        Failure { why: why.into(), retry: true }
     }
-    let u = check_url(url)?;
-    let addrs = resolve(&u).await?;
+    fn last(why: impl Into<String>) -> Self {
+        Failure { why: why.into(), retry: false }
+    }
+}
+
+/// Whether an answer with this status is worth another attempt: server errors, redirects (the URL may be fixed), 408
+/// and 429; not other client errors.
+pub fn retryable(status: u16) -> bool {
+    !(400..500).contains(&status) || status == 408 || status == 429
+}
+
+/// POST one delivery. Ok(HTTP status) for a 2xx answer. The address rules are checked again here, after DNS, and the
+/// connection goes only to the addresses checked.
+pub async fn send(url: &str, secret: &str, delivery: Uuid, event: &str, body: &[u8]) -> std::result::Result<u16, Failure> {
+    if body.len() > MAX_BODY {
+        return Err(Failure::last(format!("the payload is larger than {} KB", MAX_BODY / 1024)));
+    }
+    // The address may be fine again later (DNS changes): retried.
+    let u = check_url(url).map_err(Failure::again)?;
+    let addrs = resolve(&u).await.map_err(Failure::again)?;
     let mut b = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(TIMEOUT)
@@ -239,7 +265,7 @@ pub async fn send(url: &str, secret: &str, delivery: Uuid, event: &str, body: &[
     if let Some(url::Host::Domain(d)) = u.host() {
         b = b.resolve_to_addrs(d, &addrs);
     }
-    let client = b.build().map_err(|e| format!("could not build the request: {e}"))?;
+    let client = b.build().map_err(|e| Failure::again(format!("could not build the request: {e}")))?;
     let t = Utc::now().timestamp();
     let resp = client
         .post(u)
@@ -251,28 +277,43 @@ pub async fn send(url: &str, secret: &str, delivery: Uuid, event: &str, body: &[
         .send()
         .await
         .map_err(|e| {
-            if e.is_timeout() {
+            Failure::again(if e.is_timeout() {
                 format!("no answer within {} s", TIMEOUT.as_secs())
             } else if e.is_connect() {
                 "could not connect".to_string()
             } else {
                 e.without_url().to_string()
-            }
+            })
         })?;
-    let status = resp.status();
-    if status.is_success() {
-        Ok(status.as_u16())
-    } else if status.is_redirection() {
-        Err(format!("HTTP {} (redirects aren't followed)", status.as_u16()))
-    } else {
-        Err(format!("HTTP {}", status.as_u16()))
+    let status = resp.status().as_u16();
+    match status {
+        200..=299 => Ok(status),
+        300..=399 => Err(Failure::again(format!("HTTP {status} (redirects aren't followed)"))),
+        _ if retryable(status) => Err(Failure::again(format!("HTTP {status}"))),
+        _ => Err(Failure::last(format!("HTTP {status} (not retried: the receiver refused it)"))),
     }
+}
+
+/// The body and the secret of a delivery, then [`send`]. A secret this key can't open is final.
+async fn send_sealed(
+    secrets: &familiar_crypto::SecretBox,
+    secret_enc: &str,
+    url: &str,
+    id: Uuid,
+    event: &str,
+    payload: &Value,
+) -> std::result::Result<u16, Failure> {
+    let Ok(secret) = secrets.decrypt(secret_enc) else {
+        return Err(Failure::last("the webhook's secret can't be read with this secret key"));
+    };
+    let body = serde_json::to_vec(payload).map_err(|e| Failure::last(format!("could not encode the payload: {e}")))?;
+    send(url, &secret, id, event, &body).await
 }
 
 type Claimed = (Uuid, Uuid, String, Json<Value>, i32, String, String);
 
-/// Record what one attempt did: delivered, or failed (retried later per [`backoff`], else `failed`).
-async fn settle(db: &Db, id: Uuid, attempts: i32, result: std::result::Result<u16, String>) -> Result<()> {
+/// Record what one attempt did: delivered, or failed (retried later per [`backoff`] when it may help, else `failed`).
+async fn settle(db: &Db, id: Uuid, attempts: i32, result: std::result::Result<u16, Failure>) -> Result<()> {
     match result {
         Ok(_) => {
             sqlx::query(
@@ -284,9 +325,9 @@ async fn settle(db: &Db, id: Uuid, attempts: i32, result: std::result::Result<u1
             .execute(&db.pool)
             .await?;
         }
-        Err(why) => {
-            let why: String = why.chars().take(500).collect();
-            let wait = backoff(attempts).map(|d| d.as_secs_f64());
+        Err(f) => {
+            let why: String = f.why.chars().take(500).collect();
+            let wait = backoff(attempts).filter(|_| f.retry).map(|d| d.as_secs_f64());
             sqlx::query(
                 "update crm_webhook_deliveries set last_error = $3,
                         status = case when $4::float8 is null then 'failed' else 'pending' end,
@@ -323,15 +364,9 @@ pub async fn deliver_due(db: &Db, secrets: &familiar_crypto::SecretBox) -> Resul
     let n = due.len();
     futures_util::stream::iter(due)
         .for_each_concurrent(4, |(id, webhook, event, payload, attempts, url, secret_enc)| async move {
-            let result = match secrets.decrypt(&secret_enc) {
-                Ok(secret) => match serde_json::to_vec(&payload.0) {
-                    Ok(body) => send(&url, &secret, id, &event, &body).await,
-                    Err(e) => Err(format!("could not encode the payload: {e}")),
-                },
-                Err(_) => Err("the webhook's secret can't be read with this secret key".into()),
-            };
-            if let Err(why) = &result {
-                info!(delivery = %id, %webhook, attempts, "webhook delivery failed: {why}");
+            let result = send_sealed(secrets, &secret_enc, &url, id, &event, &payload.0).await;
+            if let Err(f) = &result {
+                info!(delivery = %id, %webhook, attempts, retry = f.retry, "webhook delivery failed: {}", f.why);
             }
             if let Err(e) = settle(db, id, attempts, result).await {
                 warn!(delivery = %id, "recording a webhook delivery failed: {e}");
@@ -341,8 +376,8 @@ pub async fn deliver_due(db: &Db, secrets: &familiar_crypto::SecretBox) -> Resul
     Ok(n)
 }
 
-/// Send a `ping` to one webhook right now (the owner's Test button): recorded as a delivery, never retried. Returns the
-/// delivery row.
+/// Send a `ping` to one webhook right now (the owner's Test button), then record it as a settled delivery (delivered
+/// or failed; never retried, never picked up by the daemon). Returns the delivery row.
 pub async fn test(db: &Db, secrets: &familiar_crypto::SecretBox, webhook: Uuid) -> Result<Value> {
     let (url, secret_enc): (String, String) =
         sqlx::query_as("select url, secret_enc from crm_webhooks where id = $1 and owner_id = $2")
@@ -357,27 +392,25 @@ pub async fn test(db: &Db, secrets: &familiar_crypto::SecretBox, webhook: Uuid) 
         "data": { "message": "A test delivery from Familiar. Check the Familiar-Signature header with your secret." },
         "actor": { "kind": "user" },
     });
-    sqlx::query(
-        "insert into crm_webhook_deliveries (id, owner_id, webhook_id, event, payload, attempts, next_attempt_at)
-         values ($1, $2, $3, 'ping', $4, 1, now() + interval '1 day')",
+    let result = send_sealed(secrets, &secret_enc, &url, id, "ping", &payload).await;
+    let (status, error) = match result {
+        Ok(_) => ("delivered", None),
+        Err(f) => ("failed", Some(f.why.chars().take(500).collect::<String>())),
+    };
+    let row: Json<Value> = sqlx::query_scalar(
+        "insert into crm_webhook_deliveries (id, owner_id, webhook_id, event, payload, status, attempts, last_error,
+                                             delivered_at)
+         values ($1, $2, $3, 'ping', $4, $5, 1, $6, case when $5 = 'delivered' then now() end)
+         returning to_jsonb(crm_webhook_deliveries) - 'owner_id'",
     )
     .bind(id)
     .bind(db.owner)
     .bind(webhook)
     .bind(Json(&payload))
-    .execute(&db.pool)
+    .bind(status)
+    .bind(error)
+    .fetch_one(&db.pool)
     .await?;
-    let result = match secrets.decrypt(&secret_enc) {
-        Ok(secret) => send(&url, &secret, id, "ping", &serde_json::to_vec(&payload).unwrap_or_default()).await,
-        Err(_) => Err("the webhook's secret can't be read with this secret key".into()),
-    };
-    // never retried (attempts past the schedule); the daemon never picks it up meanwhile (not due for a day)
-    settle(db, id, RETRIES.len() as i32 + 1, result).await?;
-    let row: Json<Value> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("{DELIVERY_VIEW} where d.id = $1 and d.owner_id = $2")))
-        .bind(id)
-        .bind(db.owner)
-        .fetch_one(&db.pool)
-        .await?;
     Ok(row.0)
 }
 
@@ -474,6 +507,16 @@ mod tests {
         let secret = new_secret();
         assert!(secret.starts_with("whsec_") && secret.len() == 70 && secret[6..].bytes().all(|b| b.is_ascii_hexdigit()));
         assert_ne!(new_secret(), secret);
+    }
+
+    #[test]
+    fn which_answers_are_retried() {
+        for s in [500, 502, 503, 301, 302, 408, 429] {
+            assert!(retryable(s), "{s}");
+        }
+        for s in [400, 401, 403, 404, 410, 413, 422] {
+            assert!(!retryable(s), "{s}");
+        }
     }
 
     #[test]
