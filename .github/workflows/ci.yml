@@ -62,6 +62,34 @@ jobs:
       - run: cargo test --workspace
         working-directory: apps/native
 
+  # The native app on macOS (Apple Silicon runner): build, test, then launch it. There is no Mac on the team, so this
+  # job is the macOS check: the bench smoke and a first start on a clean account (built-in database download, the
+  # data folder, `--quit`), each with a screenshot in the job's artifacts.
+  native-macos:
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            apps/native -> target
+            . -> target
+      - run: cargo test --workspace
+        working-directory: apps/native
+      # The core's macOS paths (protected folders, the login-shell PATH); the root workspace's own toolchain.
+      - run: cargo test -p familiar-core -p familiar-host --lib
+      - run: cargo build
+        working-directory: apps/native
+      - name: Smoke test (bench window, then a first start)
+        run: bash apps/native/dist/macos/smoke.sh apps/native/target/debug/familiar-native smoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-smoke
+          path: smoke/
+          if-no-files-found: ignore
+
   # The legacy Tauri app, kept compiling until it is removed.
   desktop:
     runs-on: windows-latest

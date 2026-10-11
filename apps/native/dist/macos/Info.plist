@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Familiar.app's Info.plist. bundle.sh fills in @VERSION@ (numbers only) and @FULL_VERSION@. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Familiar</string>
+	<key>CFBundleName</key>
+	<string>Familiar</string>
+	<key>CFBundleExecutable</key>
+	<string>familiar-native</string>
+	<key>CFBundleIconFile</key>
+	<string>Familiar</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.familiar.desktop</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>FamiliarVersion</key>
+	<string>@FULL_VERSION@</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<!-- A normal app: in the Dock and the app switcher, with the menu bar item beside it. -->
+	<key>LSUIElement</key>
+	<false/>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Familiar contributors. MIT licence.</string>
+	<!-- Settings opens Terminal (through osascript) to install or sign in to Claude Code and Codex. -->
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Familiar opens Terminal to install or sign in to Claude Code and Codex when you ask it to.</string>
+</dict>
+</plist>
