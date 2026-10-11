@@ -141,6 +141,23 @@ jobs:
           (cd out && shasum -a 256 *.dmg *.tar.gz > SHA256SUMS-macos.txt)
           cat out/SHA256SUMS-macos.txt
 
+      # What the user gets: the disk image mounts, holds the signed app and the Applications link, and the app runs
+      # (both slices) and knows its version.
+      - name: Check the disk image
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          mnt=$(mktemp -d)
+          hdiutil attach "out/Familiar-$VERSION.dmg" -nobrowse -readonly -mountpoint "$mnt"
+          test -L "$mnt/Applications"
+          codesign --verify --deep --strict "$mnt/Familiar.app"
+          for arch in arm64 x86_64; do
+            out=$(arch -$arch "$mnt/Familiar.app/Contents/MacOS/familiar-native" --version)
+            echo "$arch: $out"
+            [ "$out" = "familiar-native $VERSION" ]
+          done
+          hdiutil detach "$mnt"
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: macos-app
