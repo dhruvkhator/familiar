@@ -73,16 +73,12 @@ fn build() -> Result<Tray, String> {
     let autostart = CheckMenuItem::with_id("autostart", "Start at login", true, desktop::autostart_enabled(), None);
     let quit = MenuItem::with_id("quit", "Quit Familiar", true, None);
     let stop_desktop = MenuItem::with_id("stop_desktop", "Stop desktop control", false, None);
-    let menu = Menu::with_items(&[
-        &open,
-        &PredefinedMenuItem::separator(),
-        &stop_desktop,
-        &pause,
-        &autostart,
-        &PredefinedMenuItem::separator(),
-        &quit,
-    ])
-    .map_err(|e| e.to_string())?;
+    let menu = Menu::with_items(&[&open, &PredefinedMenuItem::separator()]).map_err(|e| e.to_string())?;
+    // Desktop control is Windows only.
+    if cfg!(windows) {
+        menu.append(&stop_desktop).map_err(|e| e.to_string())?;
+    }
+    menu.append_items(&[&pause, &autostart, &PredefinedMenuItem::separator(), &quit]).map_err(|e| e.to_string())?;
     let icon = app_icon()?;
     // macOS: a menu bar item opens its menu on a click and draws a template icon in the menu bar's own colours.
     let icon = TrayIconBuilder::new()

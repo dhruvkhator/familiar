@@ -55,10 +55,16 @@ fi
 
 echo "== first start (Familiar.app via open)"
 rm -rf "$HOME/.familiar"
-bash "$here/bundle.sh" "$bin" 0.0.0-smoke "$out/app" >"$out/bundle.log" 2>&1 || fail "bundle.sh (see bundle.log)"
-app="$out/app/Familiar.app"
+# Outside the output folder: the artifact keeps the screenshots and logs, not a debug build.
+appdir=$(mktemp -d)
+bash "$here/bundle.sh" "$bin" 0.0.0-smoke "$appdir" >"$out/bundle.log" 2>&1 || fail "bundle.sh (see bundle.log)"
+app="$appdir/Familiar.app"
+codesign -dv "$app" >>"$out/bundle.log" 2>&1
 exe="$app/Contents/MacOS/familiar-native"
-open --env RUST_LOG=info --stdout "$out/app.log" --stderr "$out/app.log" "$app" || fail "open"
+# `open` starts it through launchd, with launchd's environment plus these (the token only lifts the GitHub API limit).
+envs=(--env RUST_LOG=info)
+[ -n "${GITHUB_TOKEN:-}" ] && envs+=(--env "GITHUB_TOKEN=$GITHUB_TOKEN")
+open "${envs[@]}" --stdout "$out/app.log" --stderr "$out/app.log" "$app" || fail "open"
 pid=""
 for _ in $(seq 1 30); do
   pid=$(pgrep -f "$exe" | head -n 1)
@@ -91,6 +97,9 @@ if pgrep -f "$HOME/.familiar/pgdata" >/dev/null; then
   pgrep -fl "$HOME/.familiar/pgdata"
 fi
 cp "$HOME/.familiar/logs/"*.log "$out/" 2>/dev/null || true
+# Opened by launchd with its bare PATH: the login shell's PATH must have been taken (see login_path.rs).
+grep "PATH from" "$out/app.log" || fail "the app did not read the login shell's PATH"
+grep -E "claude(:| is not)" "$out/app.log" || true
 
 if [ "$failed" -ne 0 ]; then
   echo "smoke test failed"
