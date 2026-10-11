@@ -11,8 +11,12 @@
 // The secret key is minisign's unencrypted format (`minisign -G -W`); it is read from the environment (or
 // --secret-file, for test fixtures), never printed, and must match --pubkey (the key compiled into the app), so a wrong
 // or rotated secret fails here instead of shipping updates nobody can install.
+//
+// Dry runs: `--throwaway-key <file>` instead of the secret and --pubkey makes a fresh key pair in memory (it never
+// leaves the process, apart from its public half written to <file>), and signs with it through the same code path.
+// Nothing signed that way is trusted by any app.
 
-import { createHash, createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomBytes, sign, verify } from "node:crypto";
 import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -78,12 +82,39 @@ function signature(secret, data, trusted) {
   return `untrusted comment: signature from the Familiar release key\n${block.toString("base64")}\ntrusted comment: ${trusted}\n${global.toString("base64")}\n`;
 }
 
+/** A fresh key pair as minisign key files (the secret's BLAKE2b checksum left zero: it is parsed here, never by
+ * minisign). */
+function throwawayKeys() {
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const jwk = privateKey.export({ format: "jwk" });
+  const seed = Buffer.from(jwk.d, "base64url");
+  const pk = Buffer.from(jwk.x, "base64url");
+  const keynum = randomBytes(8);
+  const secret = Buffer.concat([
+    Buffer.from("Ed"), Buffer.from([0, 0]), Buffer.from("B2"), randomBytes(32), Buffer.alloc(16), keynum, seed, pk, Buffer.alloc(32),
+  ]);
+  const id = Buffer.from(keynum).reverse().toString("hex").toUpperCase();
+  return {
+    secretText: `untrusted comment: throwaway secret key ${id}\n${secret.toString("base64")}\n`,
+    publicText: `untrusted comment: throwaway public key ${id} (dry run; trusted by nothing)\n${Buffer.concat([Buffer.from("Ed"), keynum, pk]).toString("base64")}\n`,
+  };
+}
+
 const a = args();
 const version = a.version ?? fail("--version is required");
 if (!VERSION.test(version)) fail(`bad version '${version}'`);
 const dir = a.dir ?? fail("--dir is required");
-const trustedKey = publicKey(readFileSync(a.pubkey ?? fail("--pubkey is required"), "utf8"));
-const secretText = a["secret-file"] ? readFileSync(a["secret-file"], "utf8") : process.env.FAMILIAR_UPDATE_KEY;
+let publicText;
+let secretText;
+if (a["throwaway-key"]) {
+  ({ publicText, secretText } = throwawayKeys());
+  writeFileSync(a["throwaway-key"], publicText);
+  console.log(`dry run: signing with a throwaway key (public half in ${a["throwaway-key"]})`);
+} else {
+  publicText = readFileSync(a.pubkey ?? fail("--pubkey is required"), "utf8");
+  secretText = a["secret-file"] ? readFileSync(a["secret-file"], "utf8") : process.env.FAMILIAR_UPDATE_KEY;
+}
+const trustedKey = publicKey(publicText);
 if (!secretText || !secretText.trim()) fail("FAMILIAR_UPDATE_KEY is not set: refusing to publish an unsigned release");
 const secret = secretKey(secretText);
 if (!secret.keynum.equals(trustedKey.keynum) || !secret.pk.equals(trustedKey.pk)) {

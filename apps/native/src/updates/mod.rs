@@ -34,6 +34,36 @@ pub const VERSION: &str = match option_env!("FAMILIAR_VERSION") {
 };
 /// A release build from CI (it has a real version to update from).
 pub const OFFICIAL: bool = option_env!("FAMILIAR_VERSION").is_some();
+/// When this build's source was committed (Unix seconds; CI sets `FAMILIAR_BUILT_AT`): a newer release can't have been
+/// signed before it, so an older signed manifest is refused even if its version number is higher.
+pub const BUILT_AT: Option<u64> = match option_env!("FAMILIAR_BUILT_AT") {
+    Some(s) => parse_secs(s),
+    None => None,
+};
+
+const fn parse_secs(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.is_empty() || b.len() > 12 {
+        return None;
+    }
+    let mut n = 0u64;
+    let mut i = 0;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            return None;
+        }
+        n = n * 10 + (b[i] - b'0') as u64;
+        i += 1;
+    }
+    Some(n)
+}
+
+/// A Unix time as a local date ("12 Oct 2026").
+pub fn date_of(secs: u64) -> String {
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|t| t.with_timezone(&chrono::Local).format("%-d %b %Y").to_string())
+        .unwrap_or_default()
+}
 
 const FIRST_CHECK: Duration = Duration::from_secs(20);
 const EVERY: Duration = Duration::from_secs(6 * 3600);
@@ -190,8 +220,8 @@ impl Updates {
             let progress = move |v: &semver::Version, done: u64, total: u64| {
                 let _ = tx.unbounded_send((v.to_string(), done, total));
             };
-            source::check(&source, &http, &cache, &verify::release_key(), &current, early, platform, &updates_dir(), &progress)
-                .await
+            let trust = source::Trust { keys: verify::release_keys(), not_before: BUILT_AT };
+            source::check(&source, &http, &cache, &trust, &current, early, platform, &updates_dir(), &progress).await
         });
         self.checking = Some(cx.spawn(async move |this, cx| {
             let mut pump_cx = cx.clone();
@@ -278,13 +308,18 @@ impl Updates {
                 let pct = if *total > 0 { done * 100 / total } else { 0 };
                 format!("Downloading {version}… {pct}%")
             }
-            Status::UpToDate => match self.checked_at {
-                Some(t) => format!("Up to date. Checked {}.", crate::data::ago(Some(t))),
-                None => "Up to date.".into(),
+            Status::UpToDate => "Up to date.".into(),
+            Status::Ready(s) => match s.released_at {
+                Some(t) => format!("Version {} (released {}) is ready.", s.version, date_of(t)),
+                None => format!("Version {} is ready.", s.version),
             },
-            Status::Ready(s) => format!("Version {} is ready.", s.version),
             Status::Failed(e) => format!("Couldn't check for updates: {e}"),
         }
+    }
+
+    /// "Last checked 5m ago" once a check has run.
+    pub fn last_checked(&self) -> Option<String> {
+        self.checked_at.map(|t| format!("Last checked {}.", crate::data::ago(Some(t))))
     }
 }
 

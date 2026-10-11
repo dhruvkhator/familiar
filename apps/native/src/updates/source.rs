@@ -53,10 +53,20 @@ impl Source {
     }
 
     /// The HTTP client: rustls, short connect/read timeouts (no overall one: a big download on a slow line is fine
-    /// while bytes flow), at most 5 redirects, each to an allowed URL.
+    /// while bytes flow), at most 5 redirects, each to an allowed URL, through the system's proxy if there is one
+    /// (`HTTPS_PROXY` and friends always; see [`system_proxy`]). A proxy only carries the TLS tunnel: GitHub's
+    /// certificate, the allowed hosts and the signatures are checked the same.
     pub fn client(&self) -> Result<reqwest::Client, String> {
         let allow = self.allow;
-        reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder();
+        let env_proxy = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"].iter().any(|k| std::env::var_os(k).is_some());
+        if self.https_only
+            && !env_proxy
+            && let Some(proxy) = system_proxy()
+        {
+            builder = builder.proxy(reqwest::Proxy::https(&proxy).map_err(|e| format!("bad system proxy {proxy}: {e}"))?);
+        }
+        builder
             .user_agent(format!("Familiar/{} (+https://github.com/{REPO})", super::VERSION))
             .connect_timeout(Duration::from_secs(15))
             .read_timeout(Duration::from_secs(60))
@@ -77,6 +87,66 @@ impl Source {
     fn file_url(&self, version: &Version, file: &str) -> String {
         format!("{}/v{version}/{file}", self.download)
     }
+}
+
+/// The system's https proxy: Windows' Internet Settings, macOS' network settings. Read here for this client alone:
+/// reqwest's `system-proxy` feature would turn it on for every client in the app (they share one reqwest build),
+/// including the ones talking to the engine on 127.0.0.1, which its matcher doesn't exempt.
+fn system_proxy() -> Option<String> {
+    #[cfg(windows)]
+    {
+        let key = windows_registry::CURRENT_USER.open(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings").ok()?;
+        if key.get_u32("ProxyEnable").unwrap_or(0) == 0 {
+            return None;
+        }
+        windows_proxy(&key.get_string("ProxyServer").ok()?)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("/usr/sbin/scutil").arg("--proxy").output().ok()?;
+        scutil_proxy(&String::from_utf8_lossy(&out.stdout))
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    None
+}
+
+/// Windows' `ProxyServer`: `host:port` for everything, or `http=h:p;https=h:p;…` per scheme.
+#[cfg(any(windows, test))]
+fn windows_proxy(server: &str) -> Option<String> {
+    let server = server.trim();
+    let pick = if server.contains('=') {
+        let parts: Vec<(&str, &str)> = server.split(';').filter_map(|p| p.split_once('=')).collect();
+        let find = |k: &str| parts.iter().find(|(s, _)| s.trim().eq_ignore_ascii_case(k)).map(|(_, v)| v.trim());
+        find("https").or_else(|| find("http"))?
+    } else {
+        server
+    };
+    proxy_url(pick)
+}
+
+/// `scutil --proxy`'s HTTPS proxy, when enabled.
+#[cfg(any(target_os = "macos", test))]
+fn scutil_proxy(out: &str) -> Option<String> {
+    let field = |k: &str| out.lines().filter_map(|l| l.split_once(" : ")).find(|(n, _)| n.trim() == k).map(|(_, v)| v.trim());
+    if field("HTTPSEnable") != Some("1") {
+        return None;
+    }
+    let host = field("HTTPSProxy")?;
+    match field("HTTPSPort") {
+        Some(port) => proxy_url(&format!("{host}:{port}")),
+        None => proxy_url(host),
+    }
+}
+
+/// `host:port` as a proxy URL (`http://` unless it names its scheme); `None` for an empty or odd one.
+#[cfg(any(windows, target_os = "macos", test))]
+fn proxy_url(hostport: &str) -> Option<String> {
+    let hp = hostport.trim();
+    if hp.is_empty() || hp.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    let url = if hp.contains("://") { hp.to_owned() } else { format!("http://{hp}") };
+    url.parse::<reqwest::Url>().ok().map(|_| url)
 }
 
 /// A release as GitHub's API lists it (the fields used).
@@ -123,6 +193,16 @@ pub struct Staged {
     pub notes: String,
     /// The verified artifact; its signature and the signed manifest sit beside it.
     pub artifact: PathBuf,
+    /// When CI signed the release (Unix seconds).
+    pub released_at: Option<u64>,
+}
+
+/// What a release must be signed with, and how fresh it must be.
+pub struct Trust {
+    /// Any of these (the compiled-in [`verify::RELEASE_KEYS`] in the app).
+    pub keys: Vec<PublicKey>,
+    /// This build's own build time: a newer release can't have been signed before it.
+    pub not_before: Option<u64>,
 }
 
 pub enum Found {
@@ -236,7 +316,7 @@ pub async fn check(
     source: &Source,
     http: &reqwest::Client,
     cache: &Mutex<ListCache>,
-    key: &PublicKey,
+    trust: &Trust,
     current: &Version,
     early: bool,
     platform: Platform,
@@ -246,7 +326,7 @@ pub async fn check(
     let releases = list(http, source, cache).await?;
     let mut last_err = None;
     for version in candidates(&releases, current, early, platform) {
-        match stage(source, http, key, &version, platform, dir, progress).await {
+        match stage(source, http, trust, &version, platform, dir, progress).await {
             Ok(staged) => {
                 prune(dir, Some(&staged.version));
                 return Ok(Found::Ready(staged));
@@ -270,7 +350,7 @@ pub async fn check(
 async fn stage(
     source: &Source,
     http: &reqwest::Client,
-    key: &PublicKey,
+    trust: &Trust,
     version: &Version,
     platform: Platform,
     dir: &Path,
@@ -279,7 +359,7 @@ async fn stage(
     let manifest_bytes = fetch(http, source, &source.file_url(version, MANIFEST), verify::MAX_MANIFEST).await?;
     let manifest_sig =
         fetch(http, source, &source.file_url(version, &format!("{MANIFEST}{SIG_EXT}")), verify::MAX_SIGNATURE).await?;
-    let manifest = verify::verify_manifest(&manifest_bytes, &manifest_sig, key, version)?;
+    let manifest = verify::verify_manifest(&manifest_bytes, &manifest_sig, &trust.keys, version, trust.not_before)?;
     let name = platform.artifact(version);
     let entry = manifest.files.get(&name).ok_or_else(|| format!("the release has no {name}"))?.clone();
     let stage = dir.join(version.to_string());
@@ -291,24 +371,24 @@ async fn stage(
     // Already here from an earlier check (or an earlier run): verify it again rather than trust the folder.
     if let Ok(sig) = tokio::fs::read(&sig_path).await
         && artifact.is_file()
-        && verify_file(&artifact, &sig, key, &name, version, &manifest).await.is_ok()
+        && verify_file(&artifact, &sig, &trust.keys, &name, version, &manifest).await.is_ok()
     {
         write_manifest(&stage, &manifest_bytes, &manifest_sig).await?;
-        return Ok(Staged { version: version.clone(), notes, artifact });
+        return Ok(Staged { version: version.clone(), notes, artifact, released_at: manifest.signed_at });
     }
     let _ = tokio::fs::remove_file(&artifact).await;
 
     let sig = fetch(http, source, &source.file_url(version, &format!("{name}{SIG_EXT}")), verify::MAX_SIGNATURE).await?;
     let part = stage.join(format!("{name}.part"));
     download(http, source, &source.file_url(version, &name), &part, entry.size, &|d, t| progress(version, d, t)).await?;
-    if let Err(e) = verify_file(&part, &sig, key, &name, version, &manifest).await {
+    if let Err(e) = verify_file(&part, &sig, &trust.keys, &name, version, &manifest).await {
         let _ = tokio::fs::remove_file(&part).await;
         return Err(e);
     }
     tokio::fs::write(&sig_path, &sig).await.map_err(|e| format!("couldn't save the signature: {e}"))?;
     write_manifest(&stage, &manifest_bytes, &manifest_sig).await?;
     tokio::fs::rename(&part, &artifact).await.map_err(|e| format!("couldn't move the update into place: {e}"))?;
-    Ok(Staged { version: version.clone(), notes, artifact })
+    Ok(Staged { version: version.clone(), notes, artifact, released_at: manifest.signed_at })
 }
 
 /// The signed manifest beside the artifact: the helper verifies the artifact against it again before applying it.
@@ -318,12 +398,12 @@ async fn write_manifest(stage: &Path, bytes: &[u8], sig: &[u8]) -> Result<(), St
 }
 
 /// Verify a file on disk against the manifest and its signature (off the async threads: it reads the whole file).
-async fn verify_file(path: &Path, sig: &[u8], key: &PublicKey, name: &str, version: &Version, manifest: &Manifest) -> Result<(), String> {
+async fn verify_file(path: &Path, sig: &[u8], keys: &[PublicKey], name: &str, version: &Version, manifest: &Manifest) -> Result<(), String> {
     let entry = manifest.files.get(name).ok_or_else(|| format!("the release has no {name}"))?.clone();
-    let (path, sig, key, name, version) = (path.to_owned(), sig.to_vec(), key.clone(), name.to_owned(), version.clone());
+    let (path, sig, keys, name, version) = (path.to_owned(), sig.to_vec(), keys.to_vec(), name.to_owned(), version.clone());
     tokio::task::spawn_blocking(move || {
         let file = std::fs::File::open(&path).map_err(|e| format!("couldn't read {name}: {e}"))?;
-        verify::verify_artifact(std::io::BufReader::new(file), &sig, &key, &name, &version, &entry)
+        verify::verify_artifact(std::io::BufReader::new(file), &sig, &keys, &name, &version, &entry)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -377,7 +457,7 @@ pub fn prune(dir: &Path, keep: Option<&Version>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == super::apply::RESULT || keep.is_some_and(|k| k.to_string() == name) {
+        if name == super::apply::RESULT || name == super::apply::INSTALL_LOG || keep.is_some_and(|k| k.to_string() == name) {
             continue;
         }
         let path = entry.path();
@@ -461,6 +541,18 @@ mod tests {
         let http = s.client().unwrap();
         let Ok(releases) = list(&http, &s, &Mutex::default()).await else { panic!("couldn't list releases") };
         assert!(releases.iter().any(|r| verify::tag_version(&r.tag_name).is_some()));
+    }
+
+    #[test]
+    fn system_proxies_are_read() {
+        assert_eq!(windows_proxy("proxy.corp:8080").as_deref(), Some("http://proxy.corp:8080"));
+        assert_eq!(windows_proxy("http=h1:80;https=h2:8443;ftp=h3:21").as_deref(), Some("http://h2:8443"));
+        assert_eq!(windows_proxy("http=h1:80").as_deref(), Some("http://h1:80"));
+        assert_eq!(windows_proxy("ftp=h3:21"), None);
+        assert_eq!(windows_proxy(""), None);
+        let scutil = "<dictionary> {\n  HTTPEnable : 0\n  HTTPSEnable : 1\n  HTTPSPort : 3128\n  HTTPSProxy : 10.0.0.2\n}\n";
+        assert_eq!(scutil_proxy(scutil).as_deref(), Some("http://10.0.0.2:3128"));
+        assert_eq!(scutil_proxy("<dictionary> {\n  HTTPSEnable : 0\n  HTTPSProxy : x\n}"), None);
     }
 
     #[test]

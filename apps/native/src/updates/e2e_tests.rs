@@ -106,8 +106,9 @@ async fn run(base: &str, cache: &Mutex<ListCache>, current: &str, dir: &Path) ->
     let source = Source::local(base);
     let http = source.client().unwrap();
     let key = verify::public_key(&std::fs::read_to_string(Path::new(FIXTURES).join("test.pub")).unwrap()).unwrap();
+    let trust = source::Trust { keys: vec![key], not_before: Some(1_700_000_000) };
     let current = verify::parse_version(current).unwrap();
-    source::check(&source, &http, cache, &key, &current, true, Platform::Windows, dir, &|_, _, _| {}).await
+    source::check(&source, &http, cache, &trust, &current, true, Platform::Windows, dir, &|_, _, _| {}).await
 }
 
 fn failed(r: Result<Found, CheckError>) -> String {

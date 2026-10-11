@@ -563,7 +563,11 @@ impl AppSettings {
             return card(cx).child(setting_row(format!("Familiar {VERSION}"), "", div().into_any_element(), &theme)).into_any_element();
         };
         let u = entity.read(cx);
-        let (summary, early, busy, restarting) = (u.summary(), u.early(), u.busy(), u.restarting);
+        let summary = match u.last_checked() {
+            Some(checked) if !u.busy() => format!("{} {checked}", u.summary()),
+            _ => u.summary(),
+        };
+        let (early, busy, restarting) = (u.early(), u.busy(), u.restarting);
         let off = matches!(u.status, Status::Off(_));
         let ready = u.ready().cloned();
         let (last, apply_error) = (u.last.clone(), u.apply_error.clone());

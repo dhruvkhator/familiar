@@ -520,15 +520,20 @@ hand after the first install.
   flag or a `-pre` version) only with **Early versions** on (default: on while the running build is a pre-release).
   Release files are fetched from URLs the app builds itself (`…/releases/download/v<version>/<file>`, checked names),
   never from the API's answer; every request and redirect must be https to `github.com`, `api.github.com`,
-  `objects.githubusercontent.com` or `release-assets.githubusercontent.com` (no credentials, default port).
+  `objects.githubusercontent.com` or `release-assets.githubusercontent.com` (no credentials, default port). The
+  update client goes through the system's https proxy (`HTTPS_PROXY`, else Windows' Internet Settings or macOS'
+  `scutil --proxy`), read for this client only: reqwest's `system-proxy` feature would apply to every client in the
+  app (one reqwest build), including the engine's on 127.0.0.1, which its matcher doesn't exempt.
 - **Trust.** Each release carries `familiar-update.json` (schema 1: version, what's new, each file's size and SHA-256)
   and a minisign signature (Ed25519 over BLAKE2b-512, "ED") for it and for every artifact. CI signs with
-  `scripts/sign-release.mjs` (Node, no dependencies) using the `FAMILIAR_UPDATE_KEY` Actions secret (minisign's
-  unencrypted secret-key format) and refuses to publish when the secret is missing or doesn't match the public key in
-  the repo. The app compiles in that public key (`apps/native/dist/familiar-update.pub`) and accepts a release only
-  when: the manifest's signature verifies and its signed (trusted) comment names `familiar-update.json` and the tag's
-  version; the manifest's version is the tag's and newer than the running one (never a downgrade or reinstall: a
-  genuine old manifest replayed under a newer tag fails); the artifact's own signature verifies and its trusted
+  `scripts/sign-release.mjs` (Node, no dependencies) using `FAMILIAR_UPDATE_KEY` (minisign's unencrypted
+  secret-key format) and refuses to publish when the secret is missing or doesn't match the public key in the repo.
+  The app compiles in a short list of trusted keys (`RELEASE_KEYS` in `updates/verify.rs`; today just
+  `apps/native/dist/familiar-update.pub`) and accepts a release only when: the manifest's signature verifies with one
+  of them and its signed (trusted) comment names `familiar-update.json` and the tag's version; it was signed after this
+  build's commit (`FAMILIAR_BUILT_AT`, set by CI: a newer release can't predate the running one; this assumes one
+  release line); the manifest's version is the tag's and newer than the running one (never a downgrade or reinstall:
+  a genuine old manifest replayed under a newer tag fails); the artifact's own signature verifies and its trusted
   comment names that file and version; and its size and SHA-256 match the signed manifest. Downloads are capped (the
   list at 4 MB, the manifest 256 KB, signatures 4 KB, the artifact at its signed size, at most 512 MB), written as
   `<file>.part`, verified from disk and only then renamed to their real name in `~/.familiar/updates/<version>/`. A
@@ -548,21 +553,28 @@ hand after the first install.
   until the install is over, runs it `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL /SP- /LOG=…` (same AppId:
   an in-place per-user upgrade, no admin), and starts `familiar-native.exe` from the install folder the installer
   registered (else the exe that ran). If the installer fails, the old version starts. Either way the helper writes
-  `updates/result.json`, which the next start reads once and shows in Settings. The helper running from a copy means
+  `updates/result.json` (and keeps the installer's log as `updates/install.log`), which the next start reads once and
+  shows in Settings, treated like outside data: at most 64 KB, a release version, the message as plain text and
+  short. The helper running from a copy means
   it holds no file the installer replaces, so the installer's Restart Manager has nothing to close.
 - **Applying (macOS).** The update is `Familiar-<v>-macos.tar.gz` (the signed `Familiar.app`). Before quitting, the app
   checks it runs from a `.app` bundle in a folder it can write to. The helper (the app's own binary) waits for the
   app to exit, verifies the archive again, unpacks it next to the bundle (`.Familiar.app.new-<pid>`, same volume),
   checks the new bundle has `Info.plist` and the app's binary, swaps the bundles with two renames (the old one put
-  back if the second fails), removes the old one and `open`s the bundle. Downloaded by Familiar itself, the files carry
+  back if the second fails), removes the old one and opens the bundle with `open -n` (to be checked on a real Mac). Downloaded by Familiar itself, the files carry
   no quarantine flag, so there is no Gatekeeper prompt on update. (The swap follows zeron's `apply_mac_app`, MIT.)
 - **Data from a newer version.** Migrations only move forward. Before serving, the host compares the database's
   applied migrations with the ones this build embeds (`familiar_server::MIGRATOR`); one newer than all of them stops
   the boot with `familiar_host::NEWER_DATA`, and the app shows "This data is from a newer Familiar" with the update
   (checked at once) instead of "couldn't start".
-- **Key handling.** The public key is in the repo; the secret is the `FAMILIAR_UPDATE_KEY` Actions secret plus the
-  owner's offline backup. If it leaks: make a new pair, put the new public key in the repo and the new secret in CI,
-  and ship one release signed with the old key that carries the new public key.
+- **Release pipeline and key handling.** Only a pushed `v*` tag publishes: the publish job runs in the `release`
+  environment (the owner as required reviewer, v* tags only), whose `FAMILIAR_UPDATE_KEY` secret is the only copy in
+  GitHub; there is no repository-level secret, so no branch and no run started by hand can read it. A run started by
+  hand is always a dry run: the same signing step with a throwaway key made inside the run (`--throwaway-key`;
+  trusted by no app), its files kept for a day. The public key is in the repo; the owner keeps the secret's offline
+  backup. Rotating: add the next public key to `RELEASE_KEYS` and ship a release (signed with the current key); then
+  switch the environment's secret. If a key leaks, also drop it from `RELEASE_KEYS` in the next release. The first key
+  (BD1467CB6DFD4D5F) was retired before any release used it.
 
 ## Privacy model (local-first)
 Familiar has no hosted service of its own. The desktop app runs the engine, the API (127.0.0.1 only) and a private

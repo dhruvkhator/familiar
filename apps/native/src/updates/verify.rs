@@ -29,16 +29,18 @@ pub const MAX_ARTIFACT: u64 = 512 * 1024 * 1024;
 /// Release notes past this are cut (they are shown as plain text in Settings).
 const MAX_NOTES: usize = 6_000;
 
-/// The public half of Familiar's release key (minisign format). Its secret half signs releases in CI.
-pub const RELEASE_KEY: &str = include_str!("../../dist/familiar-update.pub");
+/// The release keys this build trusts (minisign public keys). The first is the one CI signs with now (its secret is
+/// the `release` environment's `FAMILIAR_UPDATE_KEY`); a release may add the next key here before CI switches to it,
+/// so apps already trust the new key when its first release arrives. A signature from any listed key is accepted.
+pub const RELEASE_KEYS: &[&str] = &[include_str!("../../dist/familiar-update.pub")];
 
 /// Where requests may go. `github.com` serves release files by redirecting to one of GitHub's asset hosts.
 pub const ALLOWED_HOSTS: &[&str] =
     &["github.com", "api.github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"];
 
-/// The compiled-in release key.
-pub fn release_key() -> PublicKey {
-    public_key(RELEASE_KEY).expect("the compiled-in release key is a minisign public key")
+/// The compiled-in release keys.
+pub fn release_keys() -> Vec<PublicKey> {
+    RELEASE_KEYS.iter().map(|k| public_key(k).expect("a compiled-in release key is a minisign public key")).collect()
 }
 
 /// A minisign public key file (`untrusted comment: …` then the key).
@@ -92,6 +94,9 @@ pub struct Manifest {
     #[serde(default)]
     pub notes: String,
     pub files: BTreeMap<String, FileEntry>,
+    /// When CI signed it (the signature's trusted `timestamp`, Unix seconds).
+    #[serde(skip)]
+    pub signed_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -130,15 +135,32 @@ fn check_trusted(sig: &Signature, file: &str, version: &Version) -> Result<(), S
     Ok(())
 }
 
-/// Check a release's manifest: signed by `key`, for `version` (the release tag's), well formed.
-pub fn verify_manifest(bytes: &[u8], sig: &[u8], key: &PublicKey, version: &Version) -> Result<Manifest, String> {
+/// Check a release's manifest: signed by one of `keys`, for `version` (the release tag's), well formed, and (when
+/// `not_before` is given: this build's own build time) signed after this build was made: a newer version can't have
+/// been released before the running one was built.
+pub fn verify_manifest(
+    bytes: &[u8],
+    sig: &[u8],
+    keys: &[PublicKey],
+    version: &Version,
+    not_before: Option<u64>,
+) -> Result<Manifest, String> {
     if bytes.len() > MAX_MANIFEST {
         return Err("the update manifest is too large".into());
     }
     let sig = signature(sig)?;
-    key.verify(bytes, &sig, false).map_err(|_| "the update manifest isn't signed by Familiar's release key".to_owned())?;
+    if !keys.iter().any(|k| k.verify(bytes, &sig, false).is_ok()) {
+        return Err("the update manifest isn't signed by Familiar's release key".into());
+    }
     check_trusted(&sig, MANIFEST, version)?;
-    let m: Manifest = serde_json::from_slice(bytes).map_err(|e| format!("the update manifest is malformed ({e})"))?;
+    let signed_at = trusted_field(&sig, "timestamp").and_then(|t| t.parse::<u64>().ok());
+    if let Some(built) = not_before
+        && signed_at.is_none_or(|t| t < built)
+    {
+        return Err(format!("the update manifest for {version} was signed before this Familiar was built"));
+    }
+    let mut m: Manifest = serde_json::from_slice(bytes).map_err(|e| format!("the update manifest is malformed ({e})"))?;
+    m.signed_at = signed_at;
     if m.schema != 1 {
         return Err(format!("the update manifest's format ({}) is newer than this Familiar understands", m.schema));
     }
@@ -164,14 +186,18 @@ pub fn verify_manifest(bytes: &[u8], sig: &[u8], key: &PublicKey, version: &Vers
 pub fn verify_artifact(
     reader: impl Read,
     sig: &[u8],
-    key: &PublicKey,
+    keys: &[PublicKey],
     name: &str,
     version: &Version,
     entry: &FileEntry,
 ) -> Result<(), String> {
     let sig = signature(sig)?;
     check_trusted(&sig, name, version)?;
-    let mut stream = key.verify_stream(&sig).map_err(|_| format!("{name} isn't signed by Familiar's release key"))?;
+    // The key the signature names (by key id); the others refuse to start.
+    let mut stream = keys
+        .iter()
+        .find_map(|k| k.verify_stream(&sig).ok())
+        .ok_or_else(|| format!("{name} isn't signed by Familiar's release key"))?;
     let mut sha = Sha256::new();
     let mut total = 0u64;
     let mut buf = vec![0u8; 64 * 1024];
@@ -248,12 +274,12 @@ mod tests {
         parse_version(s).unwrap()
     }
 
-    fn test_key() -> PublicKey {
-        public_key(TEST_KEY).unwrap()
+    fn test_key() -> Vec<PublicKey> {
+        vec![public_key(TEST_KEY).unwrap()]
     }
 
     fn good() -> Manifest {
-        verify_manifest(GOOD_MANIFEST, GOOD_MANIFEST_SIG, &test_key(), &v("9.9.9")).unwrap()
+        verify_manifest(GOOD_MANIFEST, GOOD_MANIFEST_SIG, &test_key(), &v("9.9.9"), None).unwrap()
     }
 
     #[test]
@@ -273,7 +299,7 @@ mod tests {
 
     #[test]
     fn the_compiled_in_release_key_parses_and_verifies_a_release_signed_in_its_name() {
-        let key = release_key();
+        let key = release_keys();
         let entry = FileEntry {
             size: 2,
             sha256: hex(&Sha256::digest(include_bytes!("fixtures/prodkey/Familiar-0.0.0-setup.exe"))),
@@ -294,23 +320,50 @@ mod tests {
     }
 
     /// `FAMILIAR_VERIFY_DIR=<a downloaded release's files> cargo test verify_release_dir -- --ignored --nocapture`:
-    /// check a real release with the compiled-in key, as the app does.
+    /// check a real release with the compiled-in keys, as the app does (or, for a dry run signed with a throwaway key,
+    /// with the key file in `FAMILIAR_VERIFY_PUBKEY`).
     #[test]
     #[ignore = "checks the release in FAMILIAR_VERIFY_DIR"]
     fn verify_release_dir() {
         let dir = std::path::PathBuf::from(std::env::var_os("FAMILIAR_VERIFY_DIR").expect("set FAMILIAR_VERIFY_DIR"));
+        let keys = match std::env::var_os("FAMILIAR_VERIFY_PUBKEY") {
+            Some(path) => vec![public_key(&std::fs::read_to_string(path).unwrap()).unwrap()],
+            None => release_keys(),
+        };
         let bytes = std::fs::read(dir.join(MANIFEST)).unwrap();
         let sig = std::fs::read(dir.join(format!("{MANIFEST}{SIG_EXT}"))).unwrap();
         let claimed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let version = parse_version(claimed["version"].as_str().unwrap()).unwrap();
-        let m = verify_manifest(&bytes, &sig, &release_key(), &version).unwrap();
+        let m = verify_manifest(&bytes, &sig, &keys, &version, None).unwrap();
         println!("manifest {version} ok; notes:\n{}", plain_notes(&m.notes));
         for (name, entry) in &m.files {
             let file = std::fs::File::open(dir.join(name)).unwrap();
             let sig = std::fs::read(dir.join(format!("{name}{SIG_EXT}"))).unwrap();
-            verify_artifact(std::io::BufReader::new(file), &sig, &release_key(), name, &version, entry).unwrap();
+            verify_artifact(std::io::BufReader::new(file), &sig, &keys, name, &version, entry).unwrap();
             println!("{name} ok");
         }
+    }
+
+    #[test]
+    fn any_listed_key_is_trusted_and_no_key_trusts_nothing() {
+        let both = vec![public_key(OTHER_KEY).unwrap(), public_key(TEST_KEY).unwrap()];
+        let m = verify_manifest(GOOD_MANIFEST, GOOD_MANIFEST_SIG, &both, &v("9.9.9"), None).unwrap();
+        verify_manifest(OTHER_MANIFEST, OTHER_MANIFEST_SIG, &both, &v("9.9.9"), None).unwrap();
+        let name = "Familiar-9.9.9-setup.exe";
+        verify_artifact(GOOD_EXE, GOOD_EXE_SIG, &both, name, &v("9.9.9"), &m.files[name]).unwrap();
+        assert!(verify_manifest(GOOD_MANIFEST, GOOD_MANIFEST_SIG, &[], &v("9.9.9"), None).is_err());
+        assert!(verify_artifact(GOOD_EXE, GOOD_EXE_SIG, &[], name, &v("9.9.9"), &m.files[name]).is_err());
+        assert!(!RELEASE_KEYS.is_empty() && release_keys().len() == RELEASE_KEYS.len());
+    }
+
+    #[test]
+    fn a_manifest_signed_before_this_build_is_refused() {
+        // The fixtures were signed at 1760000000.
+        let key = test_key();
+        let m = verify_manifest(GOOD_MANIFEST, GOOD_MANIFEST_SIG, &key, &v("9.9.9"), Some(1_760_000_000)).unwrap();
+        assert_eq!(m.signed_at, Some(1_760_000_000));
+        let e = verify_manifest(GOOD_MANIFEST, GOOD_MANIFEST_SIG, &key, &v("9.9.9"), Some(1_760_000_001)).unwrap_err();
+        assert!(e.contains("before this Familiar was built"), "{e}");
     }
 
     #[test]
@@ -331,21 +384,21 @@ mod tests {
         let mut tampered = GOOD_MANIFEST.to_vec();
         let at = tampered.iter().position(|b| *b == b'9').unwrap();
         tampered[at] = b'8';
-        assert!(verify_manifest(&tampered, GOOD_MANIFEST_SIG, &key, &v("9.9.9")).unwrap_err().contains("isn't signed"));
+        assert!(verify_manifest(&tampered, GOOD_MANIFEST_SIG, &key, &v("9.9.9"), None).unwrap_err().contains("isn't signed"));
         // Signed with a key the app doesn't trust.
-        assert!(verify_manifest(OTHER_MANIFEST, OTHER_MANIFEST_SIG, &key, &v("9.9.9")).is_err());
+        assert!(verify_manifest(OTHER_MANIFEST, OTHER_MANIFEST_SIG, &key, &v("9.9.9"), None).is_err());
         // ...and that key verifies its own (the fixture is sound).
-        verify_manifest(OTHER_MANIFEST, OTHER_MANIFEST_SIG, &public_key(OTHER_KEY).unwrap(), &v("9.9.9")).unwrap();
+        verify_manifest(OTHER_MANIFEST, OTHER_MANIFEST_SIG, &[public_key(OTHER_KEY).unwrap()], &v("9.9.9"), None).unwrap();
         // A genuine manifest served under another release's tag (replaying 0.0.1 as 9.9.9, or 9.9.9 as 10.0.0).
-        assert!(verify_manifest(OLD_MANIFEST, OLD_MANIFEST_SIG, &key, &v("9.9.9")).unwrap_err().contains("another file"));
-        assert!(verify_manifest(GOOD_MANIFEST, GOOD_MANIFEST_SIG, &key, &v("10.0.0")).is_err());
+        assert!(verify_manifest(OLD_MANIFEST, OLD_MANIFEST_SIG, &key, &v("9.9.9"), None).unwrap_err().contains("another file"));
+        assert!(verify_manifest(GOOD_MANIFEST, GOOD_MANIFEST_SIG, &key, &v("10.0.0"), None).is_err());
         // The manifest's signature on another file (the installer's), and garbage signatures.
-        assert!(verify_manifest(GOOD_MANIFEST, GOOD_EXE_SIG, &key, &v("9.9.9")).is_err());
-        assert!(verify_manifest(GOOD_MANIFEST, b"", &key, &v("9.9.9")).is_err());
-        assert!(verify_manifest(GOOD_MANIFEST, &[b'a'; MAX_SIGNATURE + 1], &key, &v("9.9.9")).is_err());
+        assert!(verify_manifest(GOOD_MANIFEST, GOOD_EXE_SIG, &key, &v("9.9.9"), None).is_err());
+        assert!(verify_manifest(GOOD_MANIFEST, b"", &key, &v("9.9.9"), None).is_err());
+        assert!(verify_manifest(GOOD_MANIFEST, &[b'a'; MAX_SIGNATURE + 1], &key, &v("9.9.9"), None).is_err());
         // A tampered trusted comment.
         let sig = String::from_utf8(GOOD_MANIFEST_SIG.to_vec()).unwrap().replace("version:9.9.9", "version:9.9.8");
-        assert!(verify_manifest(GOOD_MANIFEST, sig.as_bytes(), &key, &v("9.9.8")).is_err());
+        assert!(verify_manifest(GOOD_MANIFEST, sig.as_bytes(), &key, &v("9.9.8"), None).is_err());
     }
 
     #[test]
@@ -368,7 +421,7 @@ mod tests {
         assert!(verify_artifact(&longer[..], GOOD_EXE_SIG, &key, name, &ver, entry).is_err());
         // The macOS archive's (valid) signature isn't the installer's.
         assert!(verify_artifact(GOOD_EXE, GOOD_TAR_SIG, &key, name, &ver, entry).unwrap_err().contains("another file"));
-        assert!(verify_artifact(GOOD_EXE, GOOD_EXE_SIG, &public_key(OTHER_KEY).unwrap(), name, &ver, entry).is_err());
+        assert!(verify_artifact(GOOD_EXE, GOOD_EXE_SIG, &[public_key(OTHER_KEY).unwrap()], name, &ver, entry).is_err());
         let other_sig = include_bytes!("fixtures/otherkey/Familiar-9.9.9-setup.exe.minisig");
         assert!(verify_artifact(GOOD_EXE, other_sig, &key, name, &ver, entry).is_err());
     }

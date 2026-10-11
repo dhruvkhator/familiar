@@ -1,10 +1,13 @@
 name: Release
 
-# Push a tag like v0.1.0 (or run manually) and GitHub builds the Windows installer and the macOS app and attaches them
-# to a release. Users download Familiar-<version>-setup.exe or Familiar-<version>.dmg; nobody has to compile anything.
+# Push a tag like v0.1.0 and GitHub builds the Windows installer and the macOS app, signs them for in-app updates and
+# attaches them to a release. Users download Familiar-<version>-setup.exe or Familiar-<version>.dmg; nobody has to
+# compile anything. Running it by hand (workflow_dispatch) is always a dry run: everything is built and signed with a
+# throwaway key, nothing is published, and the production key is never touched.
 #
-# Supply chain: every action is pinned to a full commit SHA (version in the comment), and only the small publish job
-# can write to the repository; the build jobs are read-only.
+# Supply chain: every action is pinned to a full commit SHA (version in the comment). Only the publish job can write
+# to the repository or read the signing key, and only for a pushed v* tag: the key lives in the `release` environment
+# (required reviewer, v* tags only), not in the repository's secrets. The build jobs are read-only.
 on:
   push:
     tags: ["v*"]
@@ -14,9 +17,9 @@ on:
         description: "Version without the leading v (e.g. 0.1.0)"
         required: true
       dry_run:
-        description: "Build only: keep the artifacts in the run, publish no release"
+        description: "Ignored: a run started by hand never publishes (only a pushed v* tag does)"
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
@@ -43,6 +46,8 @@ jobs:
           $v = if ($env:EVENT -eq "push") { $env:REF_NAME.TrimStart("v") } else { $env:INPUT_VERSION }
           if ($v -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$') { throw "bad version '$v'" }
           "value=$v" >> $env:GITHUB_OUTPUT
+          # The commit's time: updates signed before it are refused (see updates/mod.rs, BUILT_AT).
+          "built_at=$(git log -1 --format=%ct)" >> $env:GITHUB_OUTPUT
 
       # apps/native pins its toolchain in rust-toolchain.toml; rustup installs it on the first cargo call.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -54,6 +59,7 @@ jobs:
         env:
           # The app's version (Settings, and what in-app updates compare against); see updates/mod.rs.
           FAMILIAR_VERSION: ${{ steps.version.outputs.value }}
+          FAMILIAR_BUILT_AT: ${{ steps.version.outputs.built_at }}
         run: cargo build --release --locked
 
       - name: Stage package
@@ -82,6 +88,8 @@ jobs:
           name: windows-installer
           path: out/
           if-no-files-found: error
+          # Only for the publish (or dry-run) job of this run.
+          retention-days: 1
 
   # macOS: one universal binary (Apple Silicon + Intel) in Familiar.app, signed ad hoc (no Apple Developer account
   # yet, so not notarized: the release notes say how to open it the first time). Familiar-<v>.dmg installs it;
@@ -104,6 +112,7 @@ jobs:
           if [ "$EVENT" = "push" ]; then v="${REF_NAME#v}"; else v="$INPUT_VERSION"; fi
           if ! [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then echo "bad version '$v'"; exit 1; fi
           echo "value=$v" >> "$GITHUB_OUTPUT"
+          echo "built_at=$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -118,6 +127,7 @@ jobs:
         working-directory: apps/native
         env:
           FAMILIAR_VERSION: ${{ steps.version.outputs.value }}
+          FAMILIAR_BUILT_AT: ${{ steps.version.outputs.built_at }}
           MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           cargo build --release --locked --target aarch64-apple-darwin
@@ -180,13 +190,18 @@ jobs:
           name: macos-app
           path: out/
           if-no-files-found: error
+          # Only for the publish (or dry-run) job of this run.
+          retention-days: 1
 
-  # Signs every artifact for in-app updates (scripts/sign-release.mjs, the key in the FAMILIAR_UPDATE_KEY secret; the
-  # app only installs files signed by it), writes the signed manifest (familiar-update.json: version, what's new, each
-  # file's size and SHA-256) and the checksum list, and publishes. Every build job's artifacts are picked up. A dry run
-  # signs too (so the key and the script are checked) and keeps the signed files in the run instead of publishing.
+  # A pushed v* tag only: signs every artifact for in-app updates (scripts/sign-release.mjs with the release key, which
+  # the app trusts), writes the signed manifest (familiar-update.json: version, what's new, each file's size and
+  # SHA-256) and the checksum list, and publishes. The key is the `release` environment's FAMILIAR_UPDATE_KEY: that
+  # environment has the owner as required reviewer and admits v* tags only, so a branch or a run started by hand can
+  # never read it. Every build job's artifacts are picked up.
   publish:
     needs: [build-windows, build-macos]
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    environment: release
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -240,15 +255,7 @@ jobs:
           node scripts/sign-release.mjs --version "$VERSION" --dir release --pubkey apps/native/dist/familiar-update.pub --notes whats-new.md
           cat release/SHA256SUMS.txt
 
-      - if: ${{ inputs.dry_run }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: signed-release
-          path: release/
-          if-no-files-found: error
-
-      - if: ${{ !inputs.dry_run }}
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: v${{ needs.build-windows.outputs.version }}
           name: Familiar ${{ needs.build-windows.outputs.version }}
@@ -257,3 +264,52 @@ jobs:
           body_path: apps/native/dist/release-notes.md
           generate_release_notes: true
           files: release/*
+
+  # A run started by hand: the same signing step with a throwaway key made inside the run (its public half is kept
+  # next to the files), so the script and the release layout are checked without the release key. No environment, no
+  # write access; nothing it signs is trusted by any app, and the files are kept for a day.
+  dry-run:
+    needs: [build-windows, build-macos]
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/sign-release.mjs
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Collect the release files
+        env:
+          VERSION: ${{ needs.build-windows.outputs.version }}
+        run: |
+          mkdir release
+          shopt -s nullglob
+          for f in artifacts/*.exe artifacts/*.dmg artifacts/*.tar.gz; do mv "$f" release/; done
+          ls -l release
+          test -f "release/Familiar-$VERSION-setup.exe"
+          test -f "release/Familiar-$VERSION.dmg"
+          test -f "release/Familiar-$VERSION-macos.tar.gz"
+
+      - name: Sign with a throwaway key
+        env:
+          VERSION: ${{ needs.build-windows.outputs.version }}
+        run: |
+          echo "Dry run of Familiar $VERSION (not a release)." > whats-new.md
+          node scripts/sign-release.mjs --version "$VERSION" --dir release --throwaway-key throwaway.pub --notes whats-new.md
+          mv throwaway.pub release/
+          cat release/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dry-run-signed-with-throwaway-key
+          path: release/
+          if-no-files-found: error
+          retention-days: 1

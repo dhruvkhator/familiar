@@ -25,6 +25,12 @@ use super::verify::{self, MANIFEST, Platform, SIG_EXT};
 pub const FLAG: &str = "--apply-update";
 /// The helper's report for the next start, in the updates folder.
 pub const RESULT: &str = "result.json";
+/// The last installer run's log, kept beside [`RESULT`] (the update's own folder is pruned later).
+pub const INSTALL_LOG: &str = "install.log";
+/// The report is small; anything bigger isn't ours.
+const MAX_RESULT: u64 = 64 * 1024;
+/// A report's message is cut to this (Settings shows it).
+const MAX_MESSAGE: usize = 1_000;
 /// How long the helper waits for the app to finish quitting (its engine drains runs for up to ~45 s).
 const WAIT_FOR_EXIT: Duration = Duration::from_secs(5 * 60);
 
@@ -36,12 +42,24 @@ pub struct Outcome {
     pub message: String,
 }
 
-/// The last attempt's outcome, read once (the file is removed).
+/// The last attempt's outcome, read once (the file is removed). It is only data for Settings, and checked like data
+/// from outside: at most 64 KB, a release version, the message as plain text and short.
 pub fn take_outcome(updates: &Path) -> Option<Outcome> {
+    use std::io::Read as _;
     let path = updates.join(RESULT);
-    let bytes = std::fs::read(&path).ok()?;
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(&path).ok()?.take(MAX_RESULT + 1).read_to_end(&mut bytes);
     let _ = std::fs::remove_file(&path);
-    serde_json::from_slice(&bytes).ok()
+    if read.is_err() || bytes.len() as u64 > MAX_RESULT {
+        return None;
+    }
+    let o: Outcome = serde_json::from_slice(&bytes).ok()?;
+    verify::parse_version(&o.version)?;
+    let mut message = verify::plain_notes(&o.message);
+    if message.chars().count() > MAX_MESSAGE {
+        message = format!("{}…", message.chars().take(MAX_MESSAGE).collect::<String>().trim_end());
+    }
+    Some(Outcome { version: o.version, ok: o.ok, message })
 }
 
 // ---- in the app ---------------------------------------------------------------------------------------------------
@@ -195,7 +213,7 @@ fn reverify_manifest(artifact: &Path, platform: Platform) -> Result<(semver::Ver
     }
     let claim: Claim = serde_json::from_slice(&bytes).map_err(|_| "the update's manifest is malformed".to_owned())?;
     let version = verify::parse_version(&claim.version).ok_or("the update's version is malformed")?;
-    let manifest = verify::verify_manifest(&bytes, &sig, &verify::release_key(), &version)?;
+    let manifest = verify::verify_manifest(&bytes, &sig, &verify::release_keys(), &version, super::BUILT_AT)?;
     let current = verify::parse_version(super::VERSION).ok_or("this build's version is malformed")?;
     if version <= current {
         return Err(format!("{version} isn't newer than {current}"));
@@ -222,7 +240,7 @@ fn install(artifact: &Path, _relaunch: &Path) -> Result<(), String> {
         .share_mode(FILE_SHARE_READ)
         .open(artifact)
         .map_err(|e| format!("couldn't open the installer: {e}"))?;
-    verify::verify_artifact(std::io::BufReader::new(&file), &sig, &verify::release_key(), &name, &version, &entry)?;
+    verify::verify_artifact(std::io::BufReader::new(&file), &sig, &verify::release_keys(), &name, &version, &entry)?;
     let log = artifact.with_file_name("install.log");
     let status = std::process::Command::new(artifact)
         .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOCANCEL", "/SP-"])
@@ -231,6 +249,9 @@ fn install(artifact: &Path, _relaunch: &Path) -> Result<(), String> {
         .status()
         .map_err(|e| format!("couldn't run the installer: {e}"))?;
     drop(file);
+    // Kept beside the report: the update's folder goes at the next check.
+    let kept = artifact.parent().and_then(Path::parent).map(|u| u.join(INSTALL_LOG)).unwrap_or_else(|| log.clone());
+    let log = if std::fs::copy(&log, &kept).is_ok() { kept } else { log };
     match status.code() {
         Some(0) => Ok(()),
         Some(code) => Err(format!("{} (installer exit code {code}; its log is {}).", inno_failure(code), log.display())),
@@ -262,7 +283,7 @@ fn install(artifact: &Path, bundle: &Path) -> Result<(), String> {
     let (version, entry, sig) = reverify_manifest(artifact, Platform::MacOs)?;
     let name = Platform::MacOs.artifact(&version);
     let file = std::fs::File::open(artifact).map_err(|e| format!("couldn't open the update: {e}"))?;
-    verify::verify_artifact(std::io::BufReader::new(file), &sig, &verify::release_key(), &name, &version, &entry)?;
+    verify::verify_artifact(std::io::BufReader::new(file), &sig, &verify::release_keys(), &name, &version, &entry)?;
     mac::swap_in(artifact, bundle)
 }
 
@@ -289,7 +310,9 @@ fn relaunch(target: &Path, installed: bool) {
     #[cfg(target_os = "macos")]
     {
         let _ = installed;
-        if let Err(e) = std::process::Command::new("/usr/bin/open").arg(target).status() {
+        // A new instance of the bundle just swapped in (the old app has exited; `-n` so Launch Services doesn't
+        // hand the request to a stale record of it). Needs checking on a real Mac.
+        if let Err(e) = std::process::Command::new("/usr/bin/open").arg("-n").arg(target).status() {
             tracing::error!("updater: couldn't open {}: {e}", target.display());
         }
     }
@@ -435,6 +458,24 @@ mod tests {
         let o = take_outcome(dir.path()).unwrap();
         assert_eq!(o, Outcome { version: "1.2.3".into(), ok: false, message: "The installation failed".into() });
         assert!(take_outcome(dir.path()).is_none(), "read once");
+    }
+
+    #[test]
+    fn outcomes_are_read_like_outside_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |json: &serde_json::Value| std::fs::write(dir.path().join(RESULT), serde_json::to_vec(json).unwrap()).unwrap();
+        // Hidden characters go, long messages are cut.
+        write(&serde_json::json!({"version": "1.2.3", "ok": false, "message": format!("bad\u{202E}gnp.exe {}", "x".repeat(5000))}));
+        let o = take_outcome(dir.path()).unwrap();
+        assert!(o.message.starts_with("badgnp.exe x"));
+        assert_eq!(o.message.chars().count(), MAX_MESSAGE + 1);
+        // Not a release version.
+        write(&serde_json::json!({"version": "../../evil", "ok": true, "message": "Updated"}));
+        assert!(take_outcome(dir.path()).is_none());
+        // Too big to be ours (and removed all the same).
+        std::fs::write(dir.path().join(RESULT), vec![b' '; MAX_RESULT as usize + 1]).unwrap();
+        assert!(take_outcome(dir.path()).is_none());
+        assert!(!dir.path().join(RESULT).exists());
     }
 
     #[test]
