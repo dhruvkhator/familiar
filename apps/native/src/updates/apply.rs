@@ -413,7 +413,13 @@ mod tests {
 
     #[test]
     fn helper_arguments_parse_strictly() {
-        let a = parse(&os(&["familiar", FLAG, r"C:\u\Familiar-1.0.0-setup.exe", "--wait", "42", "--relaunch", r"C:\p\familiar-native.exe"])).unwrap();
+        // A path of this system: on macOS a Windows path is one file name, so `ends_with` below wouldn't match.
+        let (artifact, exe) = if cfg!(windows) {
+            (r"C:\u\Familiar-1.0.0-setup.exe", r"C:\p\familiar-native.exe")
+        } else {
+            ("/u/Familiar-1.0.0-setup.exe", "/p/familiar-native")
+        };
+        let a = parse(&os(&["familiar", FLAG, artifact, "--wait", "42", "--relaunch", exe])).unwrap();
         assert_eq!(a.pid, 42);
         assert!(a.artifact.ends_with("Familiar-1.0.0-setup.exe"));
         assert!(parse(&os(&["familiar", "--hidden"])).is_none());
