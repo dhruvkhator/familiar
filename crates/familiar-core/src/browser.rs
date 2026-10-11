@@ -426,6 +426,12 @@ impl Manager {
         let _ = std::fs::create_dir_all(&profile);
         // A Chrome left over from a crash still holds this profile; a new one would just hand off to it and exit.
         kill_leftover(&profile).await;
+        // Still held (the owner's sign-in window from a relaunched process, say): never share a profile between two
+        // browsers. The run goes on without its browser (the runner's fallback) rather than risk the profile.
+        if profile_in_use(&profile) {
+            warn!(bot = %slug, "its browser profile is still in use; not starting a second browser on it");
+            return None;
+        }
         let mut cmd = tokio::process::Command::new(&exe);
         cmd.arg("--headless=new");
         // Headless Chrome says "HeadlessChrome" in its user agent, and sites such as x.com refuse it outright (HTTP 403),
@@ -670,8 +676,12 @@ impl Manager {
             if pid.is_some_and(|p| std::fs::read_to_string(profile.join(PID_FILE)).is_ok_and(|s| s.trim() == p.to_string())) {
                 let _ = std::fs::remove_file(profile.join(PID_FILE));
             }
-            // Chrome lets go of the profile as its last process ends; the next headless start checks again anyway.
-            let _ = wait_until_free(&profile).await;
+            // The launched process can end while another Chrome process keeps the profile (a relaunch to drop admin
+            // rights or to update, a crash restart): the window counts as open until nothing holds the profile, however
+            // long that takes, so a headless start can never share it.
+            while profile_in_use(&profile) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             me.gate.lock().unwrap().window_closed(bot);
             info!(%bot, "sign-in window closed");
             notify_window(&db, bot).await;
@@ -765,7 +775,8 @@ async fn notify_window(db: &Db, bot: Uuid) {
     }
 }
 
-/// Close a sign-in window the way a person would (Chrome saves cookies and the session), then for sure after 5 s.
+/// Close a sign-in window the way a person would (Chrome saves cookies and the session), then for sure after 30 s:
+/// Chrome commits its cookie store on shutdown, and a hurried kill could lose the sign-in the window was opened for.
 async fn close_window(pid: u32) {
     #[cfg(windows)]
     {
@@ -777,7 +788,7 @@ async fn close_window(pid: u32) {
     {
         let _ = tokio::process::Command::new("kill").args(["-TERM", &pid.to_string()]).output().await;
     }
-    for _ in 0..50 {
+    for _ in 0..300 {
         if !pid_alive(pid).await {
             return;
         }

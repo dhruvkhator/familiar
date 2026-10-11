@@ -80,6 +80,8 @@ pub struct ComputerPanel {
     streaming: bool,
     /// Don't try the stream again before this (it failed, or this API has none).
     stream_after: Option<Instant>,
+    /// The wait before reconnecting a stream that ended (its own task: the stream's task ends with it).
+    stream_retry: Option<Task<()>>,
     /// The page's viewport in CSS pixels, from the newest streamed frame (input coordinates use it).
     view: Option<(u32, u32)>,
     /// The sign-in window (a real Chrome on this computer).
@@ -151,6 +153,7 @@ impl ComputerPanel {
             stream_size: (0, 0),
             streaming: false,
             stream_after: None,
+            stream_retry: None,
             view: None,
             window: LiveWindow::default(),
             window_busy: false,
@@ -226,16 +229,20 @@ impl ComputerPanel {
                 }
                 _ => STREAM_RETRY,
             };
-            let _ = this.update(cx, |p, _| {
-                p.stream = None;
+            // The retry runs as its own task: clearing `p.stream` drops this one (a gpui Task is cancelled on drop).
+            let _ = this.update(cx, |p, cx| {
                 p.streaming = false;
                 p.stream_after = Some(Instant::now() + ended);
-            });
-            cx.background_executor().timer(ended).await;
-            let _ = this.update(cx, |p, cx| {
-                p.stream_after = None;
-                p.start_stream(cx);
-                p.refresh(cx);
+                p.stream_retry = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(ended).await;
+                    let _ = this.update(cx, |p, cx| {
+                        p.stream_retry = None;
+                        p.stream_after = None;
+                        p.start_stream(cx);
+                        p.refresh(cx);
+                    });
+                }));
+                p.stream = None;
             });
         }));
     }

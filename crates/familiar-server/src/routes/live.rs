@@ -211,12 +211,10 @@ pub struct Size {
 
 /// The daemon in this process, for a request from this computer by the owner of `bot`.
 async fn local_for(st: &S, a: &Auth, bot: Uuid, peer: SocketAddr) -> R<familiar_core::browser::Local> {
-    if !peer.ip().is_loopback() {
-        return Err(ApiError::NotFound);
-    }
     owned(&st.pool, "bots", bot, a.user).await?;
-    familiar_core::browser::local(a.user)
-        .ok_or_else(|| ApiError::Unavailable("this works in the Familiar desktop app only".into()))
+    // From another computer (a hosted API) these are simply not offered: the app falls back to polling and take over.
+    let local = peer.ip().is_loopback().then(|| familiar_core::browser::local(a.user)).flatten();
+    local.ok_or_else(|| ApiError::Unavailable("this works in the Familiar desktop app only".into()))
 }
 
 /// One frame (or a ping) in the stream's format.
