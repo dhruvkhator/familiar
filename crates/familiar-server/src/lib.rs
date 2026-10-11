@@ -7,6 +7,10 @@ mod routes;
 
 pub use auth::mint_owner_session;
 
+/// The database migrations this build knows (embedded at compile time). The desktop host compares them with the
+/// database's before starting, to tell "a newer Familiar ran on this data" apart from other failures.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
+
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -256,7 +260,7 @@ pub async fn serve_listener(
         })
         .connect(&database_url)
         .await?;
-    sqlx::migrate!("../../migrations").run(&pool).await?;
+    MIGRATOR.run(&pool).await?;
 
     let (tx, _) = broadcast::channel(1024);
     stream::spawn_listener(pool.clone(), tx.clone());

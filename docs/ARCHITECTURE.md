@@ -507,10 +507,68 @@ lists, do-not-contact, owner edits win, fenced text). `GET /api/templates/bundle
 /api/templates/bundles/gtm-crew/create {answers}` hires the whole crew in one transaction (all or none) from shared
 questions (product, ideal customer, ask, sender, voice, follow-up days) with every schedule off.
 
+## Updates (`apps/native/src/updates/`)
+The desktop app finds, verifies, installs and restarts into its new versions itself; nobody downloads from GitHub by
+hand after the first install.
+
+- **Version.** Release builds get `FAMILIAR_VERSION` from the tag (`release.yml` sets it for every build job; read with
+  `option_env!`, else `CARGO_PKG_VERSION`); Settings and `--version` show it. Only such builds update themselves: a
+  developer build says so and never checks. Versions compare as semver with pre-releases (`0.1.0-alpha.3 <
+  0.1.0-alpha.10 < 0.1.0`); build metadata is refused.
+- **Source.** GitHub's public releases API for `dhruvkhator/familiar` (no token, `If-None-Match`, a rate-limited answer
+  sets when to come back): 20 s after start, then every 6 h, or "Check now". Drafts never count; pre-releases (GitHub's
+  flag or a `-pre` version) only with **Early versions** on (default: on while the running build is a pre-release).
+  Release files are fetched from URLs the app builds itself (`…/releases/download/v<version>/<file>`, checked names),
+  never from the API's answer; every request and redirect must be https to `github.com`, `api.github.com`,
+  `objects.githubusercontent.com` or `release-assets.githubusercontent.com` (no credentials, default port).
+- **Trust.** Each release carries `familiar-update.json` (schema 1: version, what's new, each file's size and SHA-256)
+  and a minisign signature (Ed25519 over BLAKE2b-512, "ED") for it and for every artifact. CI signs with
+  `scripts/sign-release.mjs` (Node, no dependencies) using the `FAMILIAR_UPDATE_KEY` Actions secret (minisign's
+  unencrypted secret-key format) and refuses to publish when the secret is missing or doesn't match the public key in
+  the repo. The app compiles in that public key (`apps/native/dist/familiar-update.pub`) and accepts a release only
+  when: the manifest's signature verifies and its signed (trusted) comment names `familiar-update.json` and the tag's
+  version; the manifest's version is the tag's and newer than the running one (never a downgrade or reinstall: a
+  genuine old manifest replayed under a newer tag fails); the artifact's own signature verifies and its trusted
+  comment names that file and version; and its size and SHA-256 match the signed manifest. Downloads are capped (the
+  list at 4 MB, the manifest 256 KB, signatures 4 KB, the artifact at its signed size, at most 512 MB), written as
+  `<file>.part`, verified from disk and only then renamed to their real name in `~/.familiar/updates/<version>/`. A
+  staged update is verified again on every check and once more by the helper right before it runs. Release notes are
+  the signed manifest's (not the release page's), shown as plain text with hidden characters removed. Minisign
+  verification is `minisign-verify` (pure Rust, no dependencies); `minisign -Vm <file> -p familiar-update.pub` checks
+  the same files by hand.
+- **Experience.** Settings → Updates: the version, where updates stand (checking, downloading n %, up to date,
+  ready), Check now, Early versions, what the last attempt did, and when one is ready its notes and **Restart to
+  update**, held back (with the reason) while a teammate is running or an approval waits. A quiet dot on Settings in
+  the sidebar while one is ready or the last one failed. Downloading is automatic; restarting is always the owner's
+  click.
+- **Applying (Windows).** "Restart to update" copies the running exe into the update's folder and starts that copy
+  detached (`--apply-update <installer> --wait <pid> --relaunch <exe>`, out of the app's job when allowed), then quits
+  the app the normal way (the engine drains). The helper waits for the app's process to end (5 min at most; if it
+  hasn't, nothing is touched), verifies the installer again from a handle that denies writes, renames and deletes
+  until the install is over, runs it `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /NOCANCEL /SP- /LOG=…` (same AppId:
+  an in-place per-user upgrade, no admin), and starts `familiar-native.exe` from the install folder the installer
+  registered (else the exe that ran). If the installer fails, the old version starts. Either way the helper writes
+  `updates/result.json`, which the next start reads once and shows in Settings. The helper running from a copy means
+  it holds no file the installer replaces, so the installer's Restart Manager has nothing to close.
+- **Applying (macOS).** The update is `Familiar-<v>-macos.tar.gz` (the signed `Familiar.app`). Before quitting, the app
+  checks it runs from a `.app` bundle in a folder it can write to. The helper (the app's own binary) waits for the
+  app to exit, verifies the archive again, unpacks it next to the bundle (`.Familiar.app.new-<pid>`, same volume),
+  checks the new bundle has `Info.plist` and the app's binary, swaps the bundles with two renames (the old one put
+  back if the second fails), removes the old one and `open`s the bundle. Downloaded by Familiar itself, the files carry
+  no quarantine flag, so there is no Gatekeeper prompt on update. (The swap follows zeron's `apply_mac_app`, MIT.)
+- **Data from a newer version.** Migrations only move forward. Before serving, the host compares the database's
+  applied migrations with the ones this build embeds (`familiar_server::MIGRATOR`); one newer than all of them stops
+  the boot with `familiar_host::NEWER_DATA`, and the app shows "This data is from a newer Familiar" with the update
+  (checked at once) instead of "couldn't start".
+- **Key handling.** The public key is in the repo; the secret is the `FAMILIAR_UPDATE_KEY` Actions secret plus the
+  owner's offline backup. If it leaks: make a new pair, put the new public key in the repo and the new secret in CI,
+  and ship one release signed with the old key that carries the new public key.
+
 ## Privacy model (local-first)
 Familiar has no hosted service of its own. The desktop app runs the engine, the API (127.0.0.1 only) and a private
 built-in PostgreSQL on the owner's machine; all data lives in `~/.familiar`. The only outbound traffic is the owner's
-own LLM requests (their Claude/Codex subscription) and whatever sites/apps their teammates use. Remote access is the
+own LLM requests (their Claude/Codex subscription), whatever sites/apps their teammates use, and the desktop app's
+update check (GitHub's public release list and release files; it sends nothing but a User-Agent with the version). Remote access is the
 owner's choice and never goes through infrastructure we run: (1) a private network such as Tailscale/WireGuard to the
 owner's own PC, (2) self-hosting `familiar-server` + Postgres inside an organisation's own infrastructure, or (3) a
 future optional end-to-end-encrypted relay that only forwards ciphertext. Chat channels (Telegram, WhatsApp) are

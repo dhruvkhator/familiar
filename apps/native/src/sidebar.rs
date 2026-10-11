@@ -25,6 +25,8 @@ pub struct Sidebar {
     /// The shell's page, for the selected row.
     route: Route,
     scroll: ScrollHandle,
+    /// The dot on Settings (see [`crate::updates::Updates::attention`]).
+    update_dot: bool,
 }
 
 impl Sidebar {
@@ -36,7 +38,19 @@ impl Sidebar {
             }
         })
         .detach();
-        Self { data, shell, route: Route::Today, scroll: ScrollHandle::new() }
+        // The dot on Settings: an update is ready (or the last one failed).
+        if let Some(updates) = crate::updates::entity(cx) {
+            cx.observe(&updates, |this: &mut Self, u, cx| {
+                let dot = u.read(cx).attention();
+                if dot != this.update_dot {
+                    this.update_dot = dot;
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
+        let update_dot = crate::updates::entity(cx).is_some_and(|u| u.read(cx).attention());
+        Self { data, shell, route: Route::Today, scroll: ScrollHandle::new(), update_dot }
     }
 
     pub fn set_route(&mut self, route: Route, cx: &mut Context<Self>) {
@@ -65,6 +79,7 @@ impl Render for Sidebar {
         let current = self.route.clone();
         let dark = theme.is_dark();
         let pending = self.data.read(cx).pending.len();
+        let update_dot = self.update_dot;
         let nav = |id: &'static str, label: &'static str, glyph: &'static str, route: Route, badge: usize| {
             let shell = shell.clone();
             let selected = current == route;
@@ -217,7 +232,7 @@ impl Render for Sidebar {
                     .border_color(theme.line)
                     .child(nav("nav-integrations", "Integrations", icons::PLUG, Route::Integrations, 0))
                     .child(nav("nav-rules", "Rules", icons::SHIELD, Route::Rules, 0))
-                    .child(nav("nav-settings", "Settings", icons::SETTINGS, Route::Settings, 0))
+                    .child(nav("nav-settings", "Settings", icons::SETTINGS, Route::Settings, 0).dot(update_dot))
                     .child(
                         div()
                             .flex()

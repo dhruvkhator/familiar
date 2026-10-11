@@ -9,7 +9,8 @@
 //! `--open needs|schedules|new|<teammate name>|first` (opens that page once the data is in), `--hidden` (start in the tray),
 //! `--quit` (ask the running copy to quit; in host mode its engine drains first). `--bench` runs the lab benchmark on
 //! synthetic data (see `bench.rs`; `--bench-out <file>`, `--bench-shot <page>`, `--bench-hold <secs>`).
-//! `FAMILIAR_PERF=1` writes the perf log (see `perf.rs`).
+//! `FAMILIAR_PERF=1` writes the perf log (see `perf.rs`). `--apply-update <file> --wait <pid> --relaunch <path>` is the
+//! updater "Restart to update" starts (see `updates/apply.rs`).
 
 // Release builds are GUI-subsystem binaries (no console window); debug builds keep the console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -56,6 +57,7 @@ mod text_input;
 mod titlebar;
 mod tray;
 mod triggers;
+mod updates;
 
 use familiar_ui::AppearanceMode;
 use gpui::{
@@ -114,7 +116,7 @@ fn parse_args() -> Args {
             "--bench-shot" => args.bench_shot = it.next(),
             "--bench-hold" => args.bench_hold = it.next().and_then(|s| s.parse().ok()).unwrap_or(8),
             "--version" => {
-                println!("familiar-native {}", env!("CARGO_PKG_VERSION"));
+                println!("familiar-native {}", updates::VERSION);
                 std::process::exit(0);
             }
             _ => {}
@@ -139,6 +141,10 @@ fn window_options(cx: &App, title: &str, width: f32, height: f32, custom_titleba
 }
 
 fn main() {
+    // Started by "Restart to update" (`--apply-update`): install the staged update once the app has quit, then start it.
+    if let Some(code) = updates::apply::run_if_helper() {
+        std::process::exit(code);
+    }
     // macOS: an app opened from Finder or the Dock gets the login shell's PATH (claude, node...). Before any thread.
     familiar_host::login_path::adopt();
     let args = parse_args();
@@ -205,6 +211,7 @@ fn main() {
         // Toasts need an app identity when the app isn't packaged (the same id the window and installer use).
         cx.set_app_identity("dev.familiar.desktop", "Familiar");
         notify::init(cx);
+        updates::init(cx);
         let open = args.open.clone();
         let options = WindowOptions { show: !args.hidden, focus: !args.hidden, ..window_options(cx, "Familiar", 1180.0, 780.0, true) };
         let window = cx.open_window(options, move |window, cx| cx.new(|cx| root::Root::new(open, window, cx))).expect("open window");

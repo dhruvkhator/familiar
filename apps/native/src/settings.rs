@@ -19,7 +19,7 @@ use gpui::{
 use gpui_base::input::{InputEvent, InputState};
 use gpui_tokio::Tokio;
 
-use crate::data::{AppData, Mode};
+use crate::data::{AppData, DataEvent, Mode, Part};
 use crate::engine::{HOSTED, familiar_home};
 use crate::{desktop, prefs, text_input};
 
@@ -96,6 +96,22 @@ impl AppSettings {
             let stale = this.checked_at.is_none_or(|t| t.elapsed() > Duration::from_secs(5));
             if window.is_window_active() && this.shown && stale {
                 this.check(cx);
+            }
+        })
+        .detach();
+        // Updates: the status line, and "Restart to update" waits while a teammate works or an approval waits.
+        if let Some(updates) = crate::updates::entity(cx) {
+            cx.observe(&updates, |this: &mut Self, _, cx| {
+                if this.shown {
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
+        cx.subscribe(&data, |this: &mut Self, _, ev: &DataEvent, cx| {
+            let ready = crate::updates::entity(cx).is_some_and(|u| u.read(cx).ready().is_some());
+            if this.shown && ready && matches!(ev, DataEvent::Updated(Part::Overview | Part::Pending)) {
+                cx.notify();
             }
         })
         .detach();
@@ -536,6 +552,115 @@ impl AppSettings {
         }
         list.into_any_element()
     }
+
+    /// Settings → Updates: this version and where updates stand, "Check now", early versions, the last attempt's
+    /// outcome and, when one is ready, its notes and "Restart to update" (held back while work is under way).
+    fn updates(&self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::updates::{Status, VERSION};
+        use gpui::{InteractiveElement as _, StatefulInteractiveElement as _};
+        let theme = Theme::of(cx).clone();
+        let Some(entity) = crate::updates::entity(cx) else {
+            return card(cx).child(setting_row(format!("Familiar {VERSION}"), "", div().into_any_element(), &theme)).into_any_element();
+        };
+        let u = entity.read(cx);
+        let (summary, early, busy, restarting) = (u.summary(), u.early(), u.busy(), u.restarting);
+        let off = matches!(u.status, Status::Off(_));
+        let ready = u.ready().cloned();
+        let (last, apply_error) = (u.last.clone(), u.apply_error.clone());
+        let hold = ready.as_ref().and_then(|_| crate::updates::hold_reason(self.data.read(cx)));
+        let (check, toggle, restart) = (entity.clone(), entity.clone(), entity);
+        let mut list = card(cx).flex().flex_col();
+        list = list.child(setting_row(
+            format!("Familiar {VERSION}"),
+            summary,
+            Button::new("updates-check", if busy { "Checking…" } else { "Check now" })
+                .size(ButtonSize::Small)
+                .icon(icons::REFRESH)
+                .disabled(busy || off || restarting)
+                .on_click(move |_, _, cx| check.update(cx, |u, cx| u.check(cx)))
+                .into_any_element(),
+            &theme,
+        ));
+        if !off {
+            list = list.child(divider(cx)).child(setting_row(
+                "Early versions",
+                "Get alpha and beta versions as soon as they're out. They can have rough edges.",
+                Switch::new("updates-early", early)
+                    .on_toggle(move |on, _, cx| toggle.update(cx, |u, cx| u.set_early(on, cx)))
+                    .into_any_element(),
+                &theme,
+            ));
+        }
+        if let Some(last) = last {
+            let (tone, text_color, line) = if last.ok {
+                (Tone::Ok, theme.muted, last.message.clone())
+            } else {
+                (
+                    Tone::Bad,
+                    theme.bad,
+                    format!("The update to {} didn't install, so Familiar kept the version you had. {}", last.version, last.message),
+                )
+            };
+            list = list.child(divider(cx)).child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(16.0))
+                    .py(px(12.0))
+                    .child(chip(tone, if last.ok { "Updated" } else { "Update failed" }, cx))
+                    .child(div().flex_1().min_w_0().text_size(px(text::SMALL)).text_color(text_color).child(line)),
+            );
+        }
+        if let Some(staged) = ready {
+            let notes = if staged.notes.is_empty() { "No notes for this version.".to_owned() } else { staged.notes.clone() };
+            let note = match (&apply_error, &hold, restarting) {
+                (_, _, true) => Some(("Restarting… Familiar quits, installs the update and opens again.".to_owned(), theme.muted)),
+                (Some(e), _, _) => Some((e.clone(), theme.bad)),
+                (None, Some(h), _) => Some((h.clone(), theme.muted)),
+                _ => None,
+            };
+            list = list.child(divider(cx)).child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .px(px(16.0))
+                    .py(px(14.0))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(format!("What's new in {}", staged.version)))
+                    .child(
+                        div()
+                            .id("update-notes")
+                            .max_h(px(220.0))
+                            .overflow_y_scroll()
+                            .px(px(12.0))
+                            .py(px(10.0))
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(theme.sunken)
+                            .text_size(px(text::SMALL))
+                            .text_color(theme.ink)
+                            .child(notes),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.0))
+                            .child(
+                                Button::new("updates-restart", "Restart to update")
+                                    .primary()
+                                    .icon(icons::REFRESH)
+                                    .disabled(hold.is_some() || restarting || busy)
+                                    .on_click(move |_, _, cx| restart.update(cx, |u, cx| u.restart(cx))),
+                            )
+                            .when_some(note, |el, (n, color)| {
+                                el.child(div().flex_1().min_w_0().text_size(px(text::SMALL)).text_color(color).child(n))
+                            }),
+                    ),
+            );
+        }
+        list.into_any_element()
+    }
 }
 
 /// A labelled form field.
@@ -553,7 +678,7 @@ fn field(label: &'static str, hint: Option<SharedString>, input: impl IntoElemen
 }
 
 /// A settings line: label + hint on the left, the control on the right.
-fn setting_row(label: &'static str, hint: &'static str, control: AnyElement, theme: &Theme) -> AnyElement {
+fn setting_row(label: impl Into<SharedString>, hint: impl Into<SharedString>, control: AnyElement, theme: &Theme) -> AnyElement {
     div()
         .flex()
         .items_center()
@@ -567,8 +692,8 @@ fn setting_row(label: &'static str, hint: &'static str, control: AnyElement, the
                 .flex_1()
                 .min_w_0()
                 .gap(px(2.0))
-                .child(div().font_weight(FontWeight::MEDIUM).child(label))
-                .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(hint)),
+                .child(div().font_weight(FontWeight::MEDIUM).child(label.into()))
+                .child(div().text_size(px(text::CAPTION)).text_color(theme.muted).child(hint.into())),
         )
         .child(div().flex_none().child(control))
         .into_any_element()
@@ -598,6 +723,7 @@ impl Render for AppSettings {
         let codex = self.cli_card(Cli::Codex, cx);
         let account = self.account(window, cx);
         let computer = self.computer(cx);
+        let updates = self.updates(cx);
         div()
             .flex()
             .flex_col()
@@ -608,7 +734,7 @@ impl Render for AppSettings {
                     .flex_col()
                     .gap(px(4.0))
                     .child(div().text_size(px(text::DISPLAY)).font_weight(FontWeight::SEMIBOLD).child("Settings"))
-                    .child(div().text_size(px(text::LEAD)).text_color(theme.muted).child("Accounts, this computer, CRM webhooks, and about.")),
+                    .child(div().text_size(px(text::LEAD)).text_color(theme.muted).child("Accounts, this computer, updates, CRM webhooks, and about.")),
             )
             .child(section(
                 "AI accounts",
@@ -618,6 +744,7 @@ impl Render for AppSettings {
             ))
             .child(section("Your account", Some("Your sign-in, here and on your phone or another computer."), account, &theme))
             .child(section("This computer", None, computer, &theme))
+            .child(section("Updates", Some("Familiar installs its new versions itself: each is checked against Familiar's signature first."), updates, &theme))
             .child(section(
                 "Send CRM updates to another app",
                 Some("Zapier, HubSpot (through Zapier), Attio or your own app: every change you pick is sent there as it happens, signed so it can tell it came from Familiar."),
@@ -642,7 +769,7 @@ impl Render for AppSettings {
                                 div()
                                     .font_family(theme.font_mono.clone())
                                     .text_color(theme.muted)
-                                    .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+                                    .child(format!("v{}", crate::updates::VERSION)),
                             ),
                     )
                     .child(

@@ -1,4 +1,4 @@
-//! This app's own preferences (appearance, reduce motion), kept in `~/.familiar/native-ui.json`. Command-line flags
+//! This app's own preferences (appearance, reduce motion, early versions), kept in `~/.familiar/native-ui.json`. Command-line flags
 //! win over the file for that launch.
 
 use familiar_ui::AppearanceMode;
@@ -11,6 +11,8 @@ use crate::engine::familiar_home;
 pub struct Prefs {
     pub theme: AppearanceMode,
     pub reduce_motion: bool,
+    /// Settings → Updates → "Early versions" (pre-releases); `None`: on while this build is a pre-release.
+    pub early_updates: Option<bool>,
 }
 
 fn path() -> std::path::PathBuf {

@@ -528,6 +528,7 @@ pub struct SidebarItem {
     sublabel: Option<(SharedString, Option<Hsla>)>,
     selected: bool,
     badge: usize,
+    dot: bool,
     on_click: Option<ClickHandler>,
 }
 
@@ -541,6 +542,7 @@ impl SidebarItem {
             sublabel: None,
             selected: false,
             badge: 0,
+            dot: false,
             on_click: None,
         }
     }
@@ -562,6 +564,11 @@ impl SidebarItem {
     }
     pub fn badge(mut self, n: usize) -> Self {
         self.badge = n;
+        self
+    }
+    /// A quiet accent dot at the end of the row (something new there, nothing to count).
+    pub fn dot(mut self, on: bool) -> Self {
+        self.dot = on;
         self
     }
     pub fn on_click(mut self, handler: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> Self {
@@ -637,6 +644,7 @@ impl RenderOnce for SidebarItem {
                     }),
             )
             .when_some(badge(self.badge, cx), |el, b| el.child(b))
+            .when(self.dot, |el| el.child(div().flex_none().size(px(8.0)).rounded_full().bg(theme.accent)))
     }
 }
 

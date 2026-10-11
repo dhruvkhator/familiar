@@ -35,6 +35,30 @@ pub fn desktop_words(tool: &str, input: &serde_json::Value) -> Option<String> {
 }
 pub use instance::InstanceLock;
 
+/// The boot error when a newer Familiar has migrated the database past what this build knows: starting anyway would
+/// fail half-way (the API's migrations refuse) or misread the data. Shells match it to offer an update.
+pub const NEWER_DATA: &str =
+    "A newer version of Familiar has used this data, so this version can't open it. Update Familiar to continue; your data is fine.";
+
+/// Was the database migrated by a newer build? Some applied migration is newer than every one this build has.
+pub fn migrated_by_newer(applied: &[i64], known_newest: i64) -> bool {
+    applied.iter().any(|v| *v > known_newest)
+}
+
+/// [`migrated_by_newer`] for the database at `url`. A fresh database (no migrations table) or one that can't be read
+/// here is not "newer": the API's own migration reports anything else.
+async fn data_is_newer(url: &str) -> bool {
+    let Ok(pool) = sqlx::postgres::PgPoolOptions::new().max_connections(1).acquire_timeout(Duration::from_secs(15)).connect(url).await
+    else {
+        return false;
+    };
+    let applied: Result<Vec<i64>, _> =
+        sqlx::query_scalar("select version from _sqlx_migrations where success").fetch_all(&pool).await;
+    pool.close().await;
+    let newest = familiar_server::MIGRATOR.iter().map(|m| m.version).max().unwrap_or(0);
+    applied.is_ok_and(|applied| migrated_by_newer(&applied, newest))
+}
+
 /// Where startup is. Serialises as `starting | database | ready | error` (the web UI's `AppStatus.boot.phase`).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -178,6 +202,10 @@ impl Host {
         };
         if self.inner.stopping.is_cancelled() {
             return;
+        }
+        if data_is_newer(&url).await {
+            tracing::error!("the database was migrated by a newer Familiar");
+            return self.set(Phase::Error, NEWER_DATA);
         }
         self.inner.boot.send_modify(|b| b.database_url = Some(url.clone()));
         self.start_api(&cfg, &url);
@@ -385,6 +413,15 @@ pub fn init_logging(name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newer_data_is_a_migration_past_the_newest_this_build_knows() {
+        let newest = familiar_server::MIGRATOR.iter().map(|m| m.version).max().expect("this build has migrations");
+        assert!(!migrated_by_newer(&[], newest), "a fresh database");
+        assert!(!migrated_by_newer(&[20261002000000, newest], newest), "the same build");
+        assert!(!migrated_by_newer(&[20261002000000], newest), "an older build's data (the API migrates it forward)");
+        assert!(migrated_by_newer(&[20261002000000, newest, newest + 1], newest));
+    }
 
     #[test]
     fn boot_serialises_like_the_web_ui_expects() {

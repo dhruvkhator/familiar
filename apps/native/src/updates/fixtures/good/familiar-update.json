@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "version": "9.9.9",
+  "notes": "Faster chats.\n\n* Fix by @someone in https://github.com/dhruvkhator/familiar/pull/1",
+  "files": {
+    "Familiar-9.9.9-macos.tar.gz": {
+      "size": 23,
+      "sha256": "ae5ec7702857642eb7c8907d7b0da1c2cb21f1434570a08aee76fd43638d7322"
+    },
+    "Familiar-9.9.9-setup.exe": {
+      "size": 21,
+      "sha256": "1cfb43da2cfc3f3a55d0c6623fd232903226d54ffb38a24088152cb6332d9491"
+    }
+  }
+}

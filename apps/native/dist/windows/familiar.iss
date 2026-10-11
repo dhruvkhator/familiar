@@ -51,6 +51,9 @@ WizardStyle=modern
 Compression=lzma2/max
 SolidCompression=yes
 ; A running Familiar is closed (it drains its work and stops its database) before files are replaced.
+; In-app updates (apps/native/src/updates/apply.rs) run this installer with /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+; only after the app has quit, from a helper copy outside {app}, so there is nothing to close then; [Run] is skipped
+; when silent, and the helper starts the new version itself (from the InstallLocation of the uninstall entry).
 CloseApplications=yes
 RestartApplications=no
 

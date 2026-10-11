@@ -54,12 +54,27 @@ impl Root {
                     this.setup = None;
                 }
                 Phase::FirstRun(_) if this.setup.is_none() => this.setup = Some(SetupForm::new(window, cx)),
+                // A newer Familiar ran on this data: look for that update right away.
+                Phase::Failed(ref m) if m == familiar_host::NEWER_DATA => {
+                    if let Some(updates) = crate::updates::entity(cx) {
+                        updates.update(cx, |u, cx| u.check(cx));
+                    }
+                }
                 _ => {}
             }
             crate::tray::sync(cx);
             cx.notify();
         })
         .detach();
+        // The "newer data" screen shows where the update stands.
+        if let Some(updates) = crate::updates::entity(cx) {
+            cx.observe(&updates, |this, _, cx| {
+                if this.shell.is_none() {
+                    cx.notify();
+                }
+            })
+            .detach();
+        }
         // With the tray up, closing the window hides it and the engine keeps working; Quit in the tray quits.
         // Without one, closing quits (in host mode the engine drains first; the app quits when that is done).
         let quitting = engine.clone();
@@ -186,6 +201,66 @@ impl Root {
                             let _ = familiar_host::open_folder(&logs);
                         })),
                 ),
+            &theme,
+        )
+    }
+
+    /// The data was migrated by a newer Familiar (see `familiar_host::NEWER_DATA`): say so plainly and offer the update.
+    fn newer_data(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let updates = crate::updates::entity(cx);
+        let state = updates.as_ref().map(|u| {
+            let u = u.read(cx);
+            (u.summary(), u.ready().is_some(), u.busy() || u.restarting, matches!(u.status, crate::updates::Status::Off(_)), u.apply_error.clone())
+        });
+        let (summary, ready, busy, off, error) = state.unwrap_or_else(|| (String::new(), false, false, true, None));
+        let mut buttons = div().flex().gap(px(10.0)).mt(px(12.0));
+        if let Some(updates) = updates.filter(|_| !off) {
+            buttons = buttons.child(if ready {
+                Button::new("newer-restart", "Restart to update")
+                    .primary()
+                    .icon(icons::REFRESH)
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| updates.update(cx, |u, cx| u.restart(cx)))
+            } else {
+                Button::new("newer-check", if busy { "Checking…" } else { "Check for updates" })
+                    .primary()
+                    .icon(icons::REFRESH)
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| updates.update(cx, |u, cx| u.check(cx)))
+            });
+        }
+        buttons = buttons.child(Button::new("newer-logs", "Open logs").on_click(|_, _, _| {
+            let logs = familiar_home().join("logs");
+            let _ = std::fs::create_dir_all(&logs);
+            let _ = familiar_host::open_folder(&logs);
+        }));
+        let status = match (error, off) {
+            (Some(e), _) => Some((e, theme.bad)),
+            (None, true) => Some((
+                "Download the newest Familiar from github.com/dhruvkhator/familiar/releases and install it.".to_owned(),
+                theme.muted,
+            )),
+            (None, false) => (!summary.is_empty()).then_some((summary, theme.muted)),
+        };
+        screen(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(10.0))
+                .w(px(520.0))
+                .child(Mascot::new("newer-data", default_avatar("familiar"), MascotState::Paused, 96.0))
+                .child(title("This data is from a newer Familiar", &theme).mt(px(8.0)))
+                .child(div().text_size(px(text::LEAD)).text_color(theme.muted).text_center().child(format!(
+                    "A newer version of Familiar has run on this computer's data, and this one ({}) can't open it safely. \
+                     Update to the newest version; your data stays as it is.",
+                    crate::updates::VERSION
+                )))
+                .when_some(status, |el, (s, color)| {
+                    el.child(div().mt(px(6.0)).text_size(px(text::SMALL)).text_color(color).text_center().child(s))
+                })
+                .child(buttons),
             &theme,
         )
     }
@@ -334,7 +409,7 @@ impl Render for Root {
             _ if self.shell.is_some() => self.shell.clone().unwrap().into_any_element(),
             Phase::Booting(message) => self.boot(&message, cx),
             Phase::FirstRun(_) => self.first_run(window, cx),
-            Phase::Failed(message) => self.failed(&message, cx),
+            Phase::Failed(message) => if message == familiar_host::NEWER_DATA { self.newer_data(cx) } else { self.failed(&message, cx) },
             Phase::Ready(_) => self.boot("Opening your workspace…", cx),
         };
         perf::milestone_painted("first_frame");
