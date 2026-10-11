@@ -1,6 +1,8 @@
 //! Shared plumbing of the scripted fakes (`fake-claude`, `fake-codex`): scenario discovery, the JSONL invocation log
 //! and a stdin reader thread. See the README for the scenario format.
 
+pub mod fake_google;
+
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};

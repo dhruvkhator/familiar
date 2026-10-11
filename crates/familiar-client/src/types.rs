@@ -487,6 +487,8 @@ pub struct Template {
     pub logins: Vec<TemplateLogin>,
     /// Connector preset ids it benefits from.
     pub connectors: Vec<String>,
+    /// Connected accounts it uses (`google`: the owner's Gmail).
+    pub accounts: Vec<String>,
     pub first_task: Option<String>,
     /// It works on the owner's files: its Set up checklist asks for a folder.
     pub folder: bool,
@@ -563,6 +565,105 @@ impl Connector {
         }
         names
     }
+}
+
+/// A connected account (Integrations → Accounts). Its secret (refresh token or app password) never leaves the API.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Account {
+    pub id: Uuid,
+    /// `google` (Connect Google, OAuth) or `gmail_app_password` (IMAP/SMTP).
+    pub kind: String,
+    /// Who it is connected as.
+    pub email: String,
+    /// What the owner granted (OAuth scope URLs; empty for an app password).
+    pub scopes: Vec<String>,
+    /// `ok`, or `reconnect` (Google or Gmail stopped accepting it).
+    pub status: String,
+    /// The teammates that may use it.
+    pub bot_ids: Vec<Uuid>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+impl Account {
+    pub fn is_oauth(&self) -> bool {
+        self.kind == "google"
+    }
+
+    /// The granted scopes in plain words.
+    pub fn scope_words(&self) -> Vec<&'static str> {
+        if !self.is_oauth() {
+            return vec!["Read mail", "Send mail", "Save drafts"];
+        }
+        let has = |s: &str| self.scopes.iter().any(|x| x.ends_with(s));
+        [("gmail.readonly", "Read mail"), ("gmail.send", "Send mail"), ("gmail.compose", "Save drafts"), ("calendar.events", "Calendar events")]
+            .into_iter()
+            .filter(|(s, _)| has(s))
+            .map(|(_, w)| w)
+            .collect()
+    }
+}
+
+/// `GET /api/accounts`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccountsInfo {
+    pub google: GoogleSetup,
+    pub app_password: AppPasswordInfo,
+    pub accounts: Vec<Account>,
+}
+
+impl AccountsInfo {
+    pub fn oauth(&self) -> Option<&Account> {
+        self.accounts.iter().find(|a| a.is_oauth())
+    }
+
+    pub fn app_password_account(&self) -> Option<&Account> {
+        self.accounts.iter().find(|a| a.kind == "gmail_app_password")
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoogleSetup {
+    /// This build (or config.toml) has Familiar's Google OAuth client: "Connect Google" works.
+    pub configured: bool,
+    /// The one-time setup guide, for builds without one.
+    pub setup_url: String,
+    pub scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppPasswordInfo {
+    /// Where an app password is made.
+    pub url: String,
+}
+
+/// `POST /api/accounts/google/connect`: open `auth_url` in the system browser, then poll the flow.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConnectStart {
+    pub flow_id: Uuid,
+    pub auth_url: String,
+}
+
+/// A "Connect Google" in progress: `waiting`, `connected`, `failed` or `cancelled`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConnectStatus {
+    pub status: String,
+    pub error: Option<String>,
+    pub account_id: Option<Uuid>,
+}
+
+/// `DELETE /api/accounts/{id}`: whether Google confirmed the access was revoked.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Disconnected {
+    pub kind: String,
+    pub revoked: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1125,6 +1226,10 @@ body!(ConnectorPatch {
     name: String, preset: String, transport: String, command: String, args: Vec<String>,
     url: String, secrets: ConnectorSecrets, enabled: bool,
 });
+secret_body!(
+    /// Connect Gmail with an app password. Write-only.
+    NewAppPassword { email: String, app_password: String }
+);
 
 /// Input to the live browser view (`type` is click | type | key | scroll | navigate).
 #[derive(Debug, Clone, Default, Serialize)]

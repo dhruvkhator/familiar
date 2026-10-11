@@ -2111,3 +2111,7 @@ async fn pre_approved_send_rechecks_do_not_contact() {
     assert_eq!(sends, 0);
     h.finish().await;
 }
+
+// Connected accounts (Gmail / Calendar), in their own file with this harness.
+#[path = "accounts/mod.rs"]
+mod accounts;

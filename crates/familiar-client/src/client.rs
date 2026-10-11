@@ -535,6 +535,42 @@ impl Client {
 
     // ---- channels & triggers --------------------------------------------
 
+    // ---- connected accounts ----------------------------------------------
+
+    pub async fn accounts(&self) -> Result<AccountsInfo, ApiError> {
+        self.get("/api/accounts").await
+    }
+    /// Start "Connect Google": open the answer's `auth_url` in the system browser, then poll [`Self::google_connect_status`].
+    pub async fn start_google_connect(&self) -> Result<ConnectStart, ApiError> {
+        self.mutate(Method::POST, "/api/accounts/google/connect", None, true).await
+    }
+    pub async fn google_connect_status(&self, flow: Uuid) -> Result<ConnectStatus, ApiError> {
+        let (_, bytes) = self.send(Method::GET, &format!("/api/accounts/google/connect/{flow}"), None, true).await?;
+        Self::decode(Self::parse_value(&bytes))
+    }
+    pub async fn cancel_google_connect(&self, flow: Uuid) -> Result<(), ApiError> {
+        self.mutate::<Value>(Method::DELETE, &format!("/api/accounts/google/connect/{flow}"), None, true).await.map(|_| ())
+    }
+    /// Connect Gmail with an app password (Gmail checks it first).
+    pub async fn connect_app_password(&self, b: &NewAppPassword) -> Result<Account, ApiError> {
+        self.mutate(Method::POST, "/api/accounts/gmail", Some(body(b)), true).await
+    }
+    /// Disconnect (OAuth: revoked at Google first).
+    pub async fn delete_account(&self, id: Uuid) -> Result<Disconnected, ApiError> {
+        self.mutate(Method::DELETE, &format!("/api/accounts/{id}"), None, true).await
+    }
+    /// Who may use this account (the whole set).
+    pub async fn set_account_bots(&self, id: Uuid, bots: &[Uuid]) -> Result<Account, ApiError> {
+        self.mutate(Method::PUT, &format!("/api/accounts/{id}/bots"), Some(json!({ "bot_ids": bots })), true).await
+    }
+    pub async fn bot_accounts(&self, bot: Uuid) -> Result<Vec<Account>, ApiError> {
+        self.get(&format!("/api/bots/{bot}/accounts")).await
+    }
+    /// Which accounts this teammate may use (the whole set).
+    pub async fn set_bot_accounts(&self, bot: Uuid, ids: &[Uuid]) -> Result<Vec<Account>, ApiError> {
+        self.mutate(Method::PUT, &format!("/api/bots/{bot}/accounts"), Some(json!({ "account_ids": ids })), true).await
+    }
+
     pub async fn channels(&self) -> Result<Vec<Channel>, ApiError> {
         self.get("/api/channels").await
     }

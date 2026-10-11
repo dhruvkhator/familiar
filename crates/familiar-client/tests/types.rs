@@ -310,3 +310,38 @@ fn crm_webhooks_and_bundles() {
     assert_eq!(serde_json::to_value(CrmWebhookPatch { enabled: Some(false), ..Default::default() }).unwrap(), json!({"enabled": false}));
     assert_eq!(serde_json::to_value(FromBundle::default()).unwrap(), json!({}));
 }
+
+#[test]
+fn accounts_rows() {
+    let info: AccountsInfo = de(json!({
+        "google": { "configured": true, "setup_url": "https://example.test/setup", "scopes": ["a", "b"] },
+        "app_password": { "url": "https://myaccount.google.com/apppasswords" },
+        "accounts": [
+            { "id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "kind": "google", "email": "sam@acme.com", "status": "ok",
+              "scopes": ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/calendar.events"],
+              "bot_ids": ["7f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10"], "created_at": "2026-10-11T08:00:00Z", "updated_at": "2026-10-11T08:00:00Z" },
+            { "id": "8f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "kind": "gmail_app_password", "email": "sam@gmail.com",
+              "status": "reconnect", "scopes": [], "bot_ids": [], "future": 1 }
+        ]
+    }));
+    assert!(info.google.configured);
+    let g = info.oauth().unwrap();
+    assert!(g.is_oauth() && g.bot_ids.len() == 1);
+    assert_eq!(g.scope_words(), vec!["Read mail", "Calendar events"]);
+    let p = info.app_password_account().unwrap();
+    assert_eq!((p.status.as_str(), p.scope_words()), ("reconnect", vec!["Read mail", "Send mail", "Save drafts"]));
+    let s: ConnectStatus = de(json!({ "status": "failed", "error": "Google didn't give access", "account_id": null }));
+    assert_eq!(s.status, "failed");
+    let start: ConnectStart = de(json!({ "flow_id": "6f1d1c1e-8a52-4a69-9d4e-0a5b6d8b9f10", "auth_url": "https://accounts.google.com/o/oauth2/v2/auth?x=1" }));
+    assert!(start.auth_url.starts_with("https://"));
+    let d: Disconnected = de(json!({ "kind": "google", "revoked": true }));
+    assert!(d.revoked);
+}
+
+#[test]
+fn an_app_password_never_shows_in_debug() {
+    let b = NewAppPassword { email: Some("sam@gmail.com".into()), app_password: Some("abcdefghijklmnop".into()) };
+    let shown = format!("{b:?}");
+    assert!(!shown.contains("abcdefghijklmnop") && !shown.contains("sam@gmail.com"), "{shown}");
+    assert_eq!(serde_json::to_value(&b).unwrap(), json!({ "email": "sam@gmail.com", "app_password": "abcdefghijklmnop" }));
+}

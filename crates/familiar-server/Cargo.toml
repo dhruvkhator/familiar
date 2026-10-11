@@ -29,3 +29,7 @@ uuid = { version = "1.26.1", features = ["v4", "serde"] }
 familiar-crypto = { version = "0.1.0", path = "../familiar-crypto" }
 # "Always allow" is re-checked against the daemon's own rule (permissions::always_allow_rule) before a rule is added.
 familiar-core = { version = "0.1.0", path = "../familiar-core" }
+
+[dev-dependencies]
+# The fake Google (OAuth, Gmail REST, IMAP/SMTP over TLS) for the accounts tests.
+familiar-testkit = { path = "../familiar-testkit" }

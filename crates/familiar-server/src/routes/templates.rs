@@ -55,6 +55,9 @@ struct Template {
     schedules: Vec<TemplateSchedule>,
     logins: Vec<Login>,
     connectors: Vec<String>,
+    /// Connected accounts it uses (`google`: the owner's Gmail): a hire gets the ones already connected.
+    #[serde(default)]
+    accounts: Vec<String>,
     first_task: Option<String>,
     /// It works on the owner's files: the Set up checklist asks for a folder.
     #[serde(default)]
@@ -270,6 +273,17 @@ async fn hire(tx: &mut sqlx::PgConnection, owner: Uuid, h: &Hire<'_>) -> R<Uuid>
     .bind(&t.connectors)
     .execute(&mut *tx)
     .await?;
+
+    if t.accounts.iter().any(|a| a == "google") {
+        sqlx::query(
+            "insert into bot_accounts (bot_id, account_id) select $1, a.id from accounts a where a.owner_id = $2
+             on conflict do nothing",
+        )
+        .bind(bot)
+        .bind(owner)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     let setup = json!({
         "template": t.id,

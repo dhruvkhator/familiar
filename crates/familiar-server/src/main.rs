@@ -25,6 +25,9 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_default(),
         // Set when this API runs on the PC with the teammates' workspaces (next to `familiard`).
         bots_dir: env("FAMILIAR_BOTS_DIR").map(std::path::PathBuf::from),
+        // "Connect Google" needs the owner's browser on this machine (a loopback redirect): it is the desktop app's. A
+        // Gmail app password works anywhere.
+        google: familiar_core::google::Settings::default(),
     };
     familiar_server::serve(cfg, async {
         let _ = tokio::signal::ctrl_c().await;

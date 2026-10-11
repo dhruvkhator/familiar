@@ -23,7 +23,7 @@ async fn setup_bot_message_notice() {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let cfg = Config { database_url: u.to_string(), host: [127, 0, 0, 1], port: 0, secret_key: None, public_url: None, web_origins: vec![], bots_dir: None };
+    let cfg = Config { database_url: u.to_string(), host: [127, 0, 0, 1], port: 0, secret_key: None, public_url: None, web_origins: vec![], bots_dir: None, google: Default::default() };
     let (stop, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         let _ = serve_listener(listener, cfg, async {
@@ -135,7 +135,7 @@ async fn crm_roundtrip() {
     u.set_path(&format!("/{db}"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let cfg = Config { database_url: u.to_string(), host: [127, 0, 0, 1], port: 0, secret_key: None, public_url: None, web_origins: vec![], bots_dir: None };
+    let cfg = Config { database_url: u.to_string(), host: [127, 0, 0, 1], port: 0, secret_key: None, public_url: None, web_origins: vec![], bots_dir: None, google: Default::default() };
     let (stop, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         let _ = serve_listener(listener, cfg, async {
@@ -266,7 +266,7 @@ async fn crm_webhooks_and_bundles() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let key = Some("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=".to_string());
-    let cfg = Config { database_url: u.to_string(), host: [127, 0, 0, 1], port: 0, secret_key: key, public_url: None, web_origins: vec![], bots_dir: None };
+    let cfg = Config { database_url: u.to_string(), host: [127, 0, 0, 1], port: 0, secret_key: key, public_url: None, web_origins: vec![], bots_dir: None, google: Default::default() };
     let (stop, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         let _ = serve_listener(listener, cfg, async {

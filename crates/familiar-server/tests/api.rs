@@ -35,6 +35,10 @@ struct User {
 }
 
 async fn start(secret: bool) -> Option<App> {
+    start_with(secret, None).await
+}
+
+async fn start_with(secret: bool, google: Option<familiar_core::google::Settings>) -> Option<App> {
     let Ok(admin) = std::env::var("TEST_DATABASE_URL") else {
         eprintln!("SKIP: TEST_DATABASE_URL not set");
         return None;
@@ -60,6 +64,7 @@ async fn start(secret: bool) -> Option<App> {
         public_url: None,
         web_origins: vec![],
         bots_dir: Some(test_dir("bots")),
+        google: google.unwrap_or_default(),
     };
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -2487,4 +2492,164 @@ async fn crm_webhook_refusals_are_not_retried() {
     assert_eq!((ping["status"].as_str(), ping["attempts"].as_i64()), (Some("failed"), Some(1)));
     sqlx::query("update crm_webhook_deliveries set next_attempt_at = now() - interval '1 day'").execute(&app.pool).await.unwrap();
     assert_eq!(webhooks::deliver_due(&db, &sb).await.unwrap(), 0);
+}
+
+// ------------------------------------------------------------------ connected accounts
+
+fn fake_settings(google: &familiar_testkit::fake_google::FakeGoogle, mail: &familiar_testkit::fake_google::FakeMail) -> familiar_core::google::Settings {
+    familiar_core::google::Settings {
+        oauth: Some(familiar_core::google::OAuthClient {
+            client_id: "test-client.apps.googleusercontent.com".into(),
+            client_secret: "test-secret".into(),
+            auth_url: format!("{}/auth", google.base),
+            token_url: format!("{}/token", google.base),
+            revoke_url: format!("{}/revoke", google.base),
+            gmail_url: google.base.clone(),
+            calendar_url: format!("{}/calendar/v3", google.base),
+        }),
+        mail: familiar_core::google::MailServers {
+            imap: ("localhost".into(), mail.imap_port),
+            smtp: ("localhost".into(), mail.smtp_port),
+            extra_root: Some(mail.ca.ca_der.clone()),
+        },
+    }
+}
+
+/// Poll a "Connect Google" until it isn't waiting.
+async fn connect_outcome(app: &App, tok: &str, flow: &str) -> Value {
+    for _ in 0..200 {
+        let (s, v) = app.get(tok, &format!("/api/accounts/google/connect/{flow}")).await;
+        assert_eq!(s, 200, "{v}");
+        if v["status"] != "waiting" {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the sign-in never finished");
+}
+
+/// The browser coming back from Google to the loopback redirect.
+async fn redirect(auth_url: &str, query: &str) -> (u16, String) {
+    let u = url::Url::parse(auth_url).unwrap();
+    let back = u.query_pairs().find(|(k, _)| k == "redirect_uri").unwrap().1.into_owned();
+    let r = reqwest::get(format!("{back}?{query}")).await.unwrap();
+    (r.status().as_u16(), r.text().await.unwrap())
+}
+
+fn urlencode(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+#[tokio::test]
+async fn accounts_connect_google_link_and_disconnect() {
+    use familiar_testkit::fake_google::{self as fg, FakeGoogle, FakeMail};
+    let (google, mail) = (FakeGoogle::start(), FakeMail::start());
+    let Some(app) = start_with(true, Some(fake_settings(&google, &mail))).await else { return };
+    let a = app.owner().await;
+    let (s, v) = app.get(&a.tok, "/api/accounts").await;
+    assert_eq!(s, 200);
+    assert_eq!(v["google"]["configured"], true);
+    assert_eq!(len(&v["accounts"]), 0);
+    assert_eq!(len(&v["google"]["scopes"]), 4);
+
+    // Connect Google: PKCE S256, state, loopback redirect, the least scopes
+    let start = app.ok_post(&a.tok, "/api/accounts/google/connect", json!({}), 201).await;
+    let auth_url = start["auth_url"].as_str().unwrap().to_owned();
+    let flow = start["flow_id"].as_str().unwrap().to_owned();
+    let u = url::Url::parse(&auth_url).unwrap();
+    let q: std::collections::HashMap<String, String> = u.query_pairs().into_owned().collect();
+    assert!(auth_url.starts_with(&format!("{}/auth?", google.base)));
+    assert_eq!(q["code_challenge_method"], "S256");
+    assert!(q["redirect_uri"].starts_with("http://127.0.0.1:") && q["redirect_uri"].ends_with('/'));
+    assert_eq!(q["scope"], fg::SCOPES.split_whitespace().collect::<Vec<_>>().join(" "));
+    assert!(q["state"].len() >= 43 && !q.contains_key("client_secret"));
+    // another user doesn't see it
+    let b = app.second().await;
+    assert_eq!(app.get(&b.tok, &format!("/api/accounts/google/connect/{flow}")).await.0, 404);
+    // the browser comes back with the code
+    let (status, page) = redirect(&auth_url, &format!("state={}&code={}", q["state"], urlencode(fg::CODE))).await;
+    assert_eq!(status, 200, "{page}");
+    let done = connect_outcome(&app, &a.tok, &flow).await;
+    assert_eq!(done["status"], "connected", "{done}");
+    // the code was traded with the PKCE verifier that matches the challenge
+    let verifier = google.state.lock().unwrap().requests.iter().find(|r| r.path == "/token").unwrap().form.iter().find(|(k, _)| k == "code_verifier").unwrap().1.clone();
+    assert_eq!(familiar_core::google::oauth::challenge(&verifier), q["code_challenge"]);
+
+    let (_, v) = app.get(&a.tok, "/api/accounts").await;
+    let acct = &v["accounts"][0];
+    assert_eq!((acct["kind"].as_str(), acct["email"].as_str(), acct["status"].as_str()), (Some("google"), Some(fg::EMAIL), Some("ok")));
+    assert_eq!(len(&acct["scopes"]), 4);
+    let text = v.to_string();
+    assert!(!text.contains(fg::REFRESH) && !text.contains("secret_enc") && !text.contains("at-1"), "never a token: {text}");
+    let sealed: String = sqlx::query_scalar("select secret_enc from accounts").fetch_one(&app.pool).await.unwrap();
+    assert!(sealed.starts_with("v1:") && !sealed.contains("refresh"));
+    let id = acct["id"].as_str().unwrap().to_owned();
+    assert_eq!(len(&app.get(&b.tok, "/api/accounts").await.1["accounts"]), 0, "owner-scoped");
+
+    // who may use it, both ways
+    let bot = app.bot(&a.tok, "Mailer").await;
+    let (s, v) = app.put(&a.tok, &format!("/api/accounts/{id}/bots"), json!({ "bot_ids": [bot] })).await;
+    assert_eq!((s, v["bot_ids"].clone()), (200, json!([bot])));
+    let (s, v) = app.get(&a.tok, &format!("/api/bots/{bot}/accounts")).await;
+    assert_eq!((s, len(&v)), (200, 1));
+    let (s, v) = app.put(&a.tok, &format!("/api/bots/{bot}/accounts"), json!({ "account_ids": [] })).await;
+    assert_eq!((s, len(&v)), (200, 0));
+    assert_eq!(app.put(&b.tok, &format!("/api/accounts/{id}/bots"), json!({ "bot_ids": [] })).await.0, 404);
+    assert_eq!(app.put(&a.tok, &format!("/api/accounts/{id}/bots"), json!({ "bot_ids": [Uuid::new_v4()] })).await.0, 404);
+
+    // a forged redirect (another state) ends a sign-in without storing anything
+    let start = app.ok_post(&a.tok, "/api/accounts/google/connect", json!({}), 201).await;
+    let (status, page) = redirect(start["auth_url"].as_str().unwrap(), "state=forged&code=x").await;
+    assert!(status == 400 && !page.contains("forged"));
+    let done = connect_outcome(&app, &a.tok, start["flow_id"].as_str().unwrap()).await;
+    assert_eq!(done["status"], "failed");
+    // cancel
+    let start = app.ok_post(&a.tok, "/api/accounts/google/connect", json!({}), 201).await;
+    let f = start["flow_id"].as_str().unwrap();
+    assert_eq!(app.del(&a.tok, &format!("/api/accounts/google/connect/{f}")).await.0, 204);
+    assert_eq!(app.get(&a.tok, &format!("/api/accounts/google/connect/{f}")).await.1["status"], "cancelled");
+
+    // disconnect: revoked at Google, then gone
+    let (s, v) = app.del(&a.tok, &format!("/api/accounts/{id}")).await;
+    assert_eq!((s, v["revoked"].clone()), (200, json!(true)));
+    assert!(google.state.lock().unwrap().refresh_revoked);
+    assert_eq!(len(&app.get(&a.tok, "/api/accounts").await.1["accounts"]), 0);
+    assert_eq!(app.del(&a.tok, &format!("/api/accounts/{id}")).await.0, 404);
+}
+
+#[tokio::test]
+async fn accounts_gmail_app_password() {
+    use familiar_testkit::fake_google::{self as fg, FakeGoogle, FakeMail};
+    let (google, mail) = (FakeGoogle::start(), FakeMail::start());
+    let Some(app) = start_with(true, Some(fake_settings(&google, &mail))).await else { return };
+    let a = app.owner().await;
+    // checked with Gmail (IMAP over TLS) before it is stored
+    let (s, v) = app.post(&a.tok, "/api/accounts/gmail", json!({ "email": fg::EMAIL, "app_password": "wrongwrongwrongw" })).await;
+    assert_eq!(s, 400, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("refused the app password"), "{v}");
+    for bad in [json!({ "email": "not an address", "app_password": fg::APP_PASSWORD }), json!({ "email": fg::EMAIL, "app_password": "short" })] {
+        assert_eq!(app.post(&a.tok, "/api/accounts/gmail", bad).await.0, 400);
+    }
+    assert_eq!(len(&app.get(&a.tok, "/api/accounts").await.1["accounts"]), 0);
+    let v = app.ok_post(&a.tok, "/api/accounts/gmail", json!({ "email": fg::EMAIL, "app_password": "abcd efgh ijkl mnop" }), 201).await;
+    assert_eq!((v["kind"].as_str(), v["email"].as_str()), (Some("gmail_app_password"), Some(fg::EMAIL)));
+    let text = app.get(&a.tok, "/api/accounts").await.1.to_string();
+    assert!(!text.contains(fg::APP_PASSWORD) && !text.contains("abcd efgh") && !text.contains("secret_enc"), "{text}");
+    let (s, d) = app.del(&a.tok, &format!("/api/accounts/{}", v["id"].as_str().unwrap())).await;
+    assert_eq!((s, d["revoked"].clone(), d["kind"].clone()), (200, json!(false), json!("gmail_app_password")));
+}
+
+#[tokio::test]
+async fn accounts_without_a_google_client_or_key() {
+    let Some(app) = start(true).await else { return };
+    let a = app.owner().await;
+    let (_, v) = app.get(&a.tok, "/api/accounts").await;
+    assert_eq!(v["google"]["configured"], false);
+    assert!(v["google"]["setup_url"].as_str().unwrap().ends_with("docs/google-oauth-setup.md"));
+    let (s, v) = app.post(&a.tok, "/api/accounts/google/connect", json!({})).await;
+    assert_eq!(s, 503, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("google-oauth-setup.md"));
+    let Some(app) = start(false).await else { return };
+    let a = app.owner().await;
+    assert_eq!(app.post(&a.tok, "/api/accounts/gmail", json!({ "email": "a@b.io", "app_password": "abcdefghijklmnop" })).await.0, 503);
 }

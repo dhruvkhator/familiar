@@ -25,7 +25,7 @@ use tokio::sync::broadcast;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use routes::{
-    approvals, artifacts, bots, channels, connectors, crm, crm_webhooks, desktop, folders, live, memories, models, overview, rules,
+    accounts, approvals, artifacts, bots, channels, connectors, crm, crm_webhooks, desktop, folders, live, memories, models, overview, rules,
     runs, schedules, skills, stream, templates, threads, triggers,
 };
 
@@ -46,6 +46,10 @@ pub struct AppState {
     pub public_url: Option<String>,
     /// The teammates' workspaces, when the API runs on the PC that has them (see [`Config::bots_dir`]).
     pub bots_dir: Option<std::path::PathBuf>,
+    /// Connected accounts: Familiar's Google OAuth client (None: "Connect Google" isn't offered) and the Gmail servers.
+    pub google: familiar_core::google::Settings,
+    /// "Connect Google" sign-ins in progress or just finished, by flow id.
+    pub connects: Mutex<HashMap<uuid::Uuid, routes::accounts::Connect>>,
 }
 pub type S = Arc<AppState>;
 
@@ -166,6 +170,19 @@ fn router(state: S, web_origins: &[String]) -> Router {
         .route("/api/runs/{id}/artifacts", get(artifacts::for_run))
         .route("/api/bots/{id}/artifacts", get(artifacts::for_bot))
         .route("/api/artifacts/{id}/download", get(artifacts::download))
+        .route("/api/accounts", get(accounts::list))
+        .route("/api/accounts/google/connect", post(accounts::connect))
+        .route(
+            "/api/accounts/google/connect/{id}",
+            get(accounts::connect_status).delete(accounts::connect_cancel),
+        )
+        .route("/api/accounts/gmail", post(accounts::connect_app_password))
+        .route("/api/accounts/{id}", delete(accounts::remove))
+        .route("/api/accounts/{id}/bots", axum::routing::put(accounts::set_bots))
+        .route(
+            "/api/bots/{id}/accounts",
+            get(accounts::for_bot).put(accounts::set_for_bot),
+        )
         .route("/api/connectors/presets", get(connectors::presets))
         .route(
             "/api/connectors",
@@ -228,6 +245,9 @@ pub struct Config {
     /// The teammates' workspaces on this PC (the desktop app). Sharing folders with a teammate needs it: the API checks
     /// them on the PC they are on. None = a hosted API, where folders can't be shared.
     pub bots_dir: Option<std::path::PathBuf>,
+    /// Connected accounts (`familiar_core::google::Settings::from_config` in the desktop app). "Connect Google" needs the
+    /// owner's browser on the computer the API runs on (its loopback redirect), so a hosted API leaves `oauth` unset.
+    pub google: familiar_core::google::Settings,
 }
 
 /// Serve the API until `shutdown` resolves.
@@ -283,6 +303,8 @@ pub async fn serve_listener(
             .map(|u| u.trim().trim_end_matches('/').to_string())
             .filter(|u| !u.is_empty()),
         bots_dir: cfg.bots_dir,
+        google: cfg.google,
+        connects: Mutex::new(HashMap::new()),
     });
 
     axum::serve(listener, router(state, &cfg.web_origins))

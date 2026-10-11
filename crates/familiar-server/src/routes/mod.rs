@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::error::{ApiError, R};
 
+pub mod accounts;
 pub mod approvals;
 pub mod artifacts;
 pub mod bots;

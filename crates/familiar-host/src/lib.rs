@@ -225,6 +225,7 @@ impl Host {
             public_url: Some(format!("http://localhost:{port}")),
             web_origins: vec![],
             bots_dir: Some(cfg.bots_dir()),
+            google: familiar_core::google::Settings::from_config(cfg),
         };
         let stop = self.inner.api_stop.clone();
         self.inner.rt.spawn(async move {
