@@ -1657,6 +1657,7 @@ dependencies = [
  "croner",
  "familiar-core",
  "familiar-crypto",
+ "futures-util",
  "familiar-testkit",
  "hex",
  "rand 0.10.3",

@@ -1189,6 +1189,8 @@ async fn live_frames_and_input() {
         json!({"type": "wiggle"}),
         json!({"type": "click"}),
         json!({"type": "click", "x": -1, "y": 0}),
+        json!({"type": "move", "x": 5}),
+        json!({"type": "move", "x": 5, "y": -2}),
         json!({"type": "type"}),
         json!({"type": "type", "text": "x".repeat(2001)}),
         json!({"type": "key", "key": ""}),
@@ -1206,6 +1208,7 @@ async fn live_frames_and_input() {
     l.listen("familiar_input").await.unwrap();
     for (body, expect) in [
         (json!({"type": "click", "x": 10, "y": 20}), json!({"type": "click", "x": 10, "y": 20})),
+        (json!({"type": "move", "x": 11, "y": 21}), json!({"type": "move", "x": 11, "y": 21})),
         (json!({"type": "type", "text": "hello"}), json!({"type": "type", "text": "hello"})),
         (json!({"type": "key", "key": "Enter"}), json!({"type": "key", "key": "Enter"})),
         (json!({"type": "scroll", "dy": -120}), json!({"type": "scroll", "dy": -120})),
@@ -1220,6 +1223,76 @@ async fn live_frames_and_input() {
             assert_eq!(&got[k], want, "{got}");
         }
     }
+
+    // How long take-over input takes from the panel to the engine: POST, checked, NOTIFY received.
+    let mut ms = Vec::new();
+    for i in 0..50 {
+        let started = std::time::Instant::now();
+        assert_eq!(app.post(t, &ip, json!({"type": "move", "x": i, "y": i})).await.0, 202);
+        tokio::time::timeout(Duration::from_secs(10), l.recv()).await.expect("no notify").unwrap();
+        ms.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!("input POST to NOTIFY: p50={:.1} ms p95={:.1} ms", ms[25], ms[47]);
+}
+
+/// The desktop app's fast path: the frame stream and the sign-in window answer only with a daemon in this process
+/// (503 from a hosted API), only for the owner's teammates, only with the header token.
+#[tokio::test(flavor = "multi_thread")]
+async fn live_stream_and_sign_in_window() {
+    let app = app!();
+    let a = app.owner().await;
+    let t = &a.tok;
+    let bot = app.bot(t, "Browser").await;
+    let stream = format!("/api/bots/{bot}/live/stream");
+    let window = format!("/api/bots/{bot}/live/window");
+
+    // No daemon in this process (a hosted API).
+    let (s, v) = app.get(t, &stream).await;
+    assert_eq!(s, 503, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("desktop app"), "{v}");
+    assert_eq!(app.get(t, &window).await, (200, json!({"available": false, "open": false})));
+    assert_eq!(app.post(t, &window, json!({"url": "https://example.com"})).await.0, 503);
+    assert_eq!(app.del(t, &window).await.0, 503);
+
+    // The owner's daemon runs in this process (as in the desktop app); its browser binary doesn't exist.
+    let db = familiar_core::db::Db { pool: app.pool.clone(), owner: a.id };
+    let manager = std::sync::Arc::new(familiar_core::browser::Manager::default());
+    let profiles = test_dir("live-profiles");
+    let missing = profiles.join("no-such-browser.exe").display().to_string();
+    let _local = familiar_core::browser::register(db, manager.clone(), profiles, Some(missing));
+
+    assert_eq!(app.get(t, &window).await, (200, json!({"available": true, "open": false})));
+    let (s, v) = app.post(t, &window, json!({"url": "https://example.com/login"})).await;
+    assert_eq!(s, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("Install Google Chrome"), "{v}");
+    for bad in [json!({"url": "file:///etc/passwd"}), json!({"url": "javascript:alert(1)"}), json!({"url": "chrome://settings"})] {
+        assert_eq!(app.post(t, &window, bad.clone()).await.0, 400, "{bad}");
+    }
+    // A run is using the teammate's browser: refused, with its name.
+    let ada = app.bot(t, "Ada").await;
+    let ada_id: Uuid = ada.parse().unwrap();
+    assert!(manager.begin_run(ada_id));
+    let (s, v) = app.post(t, &format!("/api/bots/{ada}/live/window"), json!({})).await;
+    assert_eq!(s, 409);
+    assert!(v["error"].as_str().unwrap().starts_with("Ada is using its browser right now"), "{v}");
+    manager.end_run(ada_id);
+    assert_eq!(app.del(t, &window).await, (200, json!({"closed": false})), "nothing to close");
+
+    // The stream opens for the owner (frames come as the page changes, pings while it doesn't).
+    let r = app.http.get(format!("{}{stream}?w=800&h=500", app.base)).bearer_auth(t).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["content-type"], "application/x-familiar-frames");
+    assert_eq!(r.headers()["cache-control"], "no-store");
+    drop(r);
+    // The header token only (no `?token=`), and only the owner's own teammates.
+    assert_eq!(app.http.get(format!("{}{stream}?token={t}", app.base)).send().await.unwrap().status(), 401);
+    assert_eq!(app.get(t, &format!("/api/bots/{}/live/stream", Uuid::new_v4())).await.0, 404);
+    let b = app.second().await;
+    assert_eq!(app.get(&b.tok, &stream).await.0, 404);
+    assert_eq!(app.get(&b.tok, &window).await.0, 404);
+    assert_eq!(app.post(&b.tok, &window, json!({})).await.0, 404);
+    assert_eq!(app.call(Method::GET, &window, None, None).await.0, 401);
 }
 
 // ------------------------------------------------------------------ SSE

@@ -1231,7 +1231,7 @@ secret_body!(
     NewAppPassword { email: String, app_password: String }
 );
 
-/// Input to the live browser view (`type` is click | type | key | scroll | navigate).
+/// Input to the live browser view (`type` is click | move | type | key | scroll | navigate).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct LiveInput {
     #[serde(rename = "type")]
@@ -1253,6 +1253,10 @@ pub struct LiveInput {
 impl LiveInput {
     pub fn click(x: i64, y: i64) -> Self {
         Self { kind: "click".into(), x: Some(x), y: Some(y), ..Default::default() }
+    }
+    /// The pointer moved (hover menus, tooltips); senders keep only the newest of a burst.
+    pub fn moved(x: i64, y: i64) -> Self {
+        Self { kind: "move".into(), x: Some(x), y: Some(y), ..Default::default() }
     }
     pub fn type_text(t: impl Into<String>) -> Self {
         Self { kind: "type".into(), text: Some(t.into()), ..Default::default() }

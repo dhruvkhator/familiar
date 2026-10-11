@@ -341,7 +341,31 @@ JPEG every ~1 s via CDP (only when it changed) into `live_frames` (one row per b
 API: `GET /api/bots/:id/live` → `{url,title,width,height,updated_at}` (404 if none), `GET /api/bots/:id/live.jpg?token=`
 (image/jpeg, no-store), `POST /api/bots/:id/live/input {type:'click'|'type'|'key'|'scroll'|'navigate', x?,y?,text?,
 key?,dy?,url?}` → `pg_notify('familiar_input', {owner,bot,...})` → daemon dispatches via CDP (take-over). Coordinates are in
-frame pixels.
+the page's CSS pixels. `type` also takes `move` (`x,y`; the app sends at most ~30 a second). The daemon replays one bot's
+input in order (one worker per bot); the app merges what piles up while a request is on its way (moves keep the newest,
+wheel turns add up, typed text joins).
+
+*Fast path (desktop app: the API and the daemon share a process, `browser::local`).* `GET /api/bots/:id/live/stream?w=&h=`
+(owner, header token only, loopback peers only; a hosted API answers 503 and clients fall back to `live.jpg`) streams
+frames as the page changes: while at least one stream is open the daemon screencasts the tab in front
+(`Page.startScreencast`, JPEG q65, max size = the biggest viewer's panel, each frame acked no sooner than 30 ms after
+the previous one, the way Playwright throttles; ~30 fps, nothing while the page is still) and the stream always sends
+the newest frame (stale ones are dropped). Format: repeated `u32 BE len, JSON {seq,vw,vh,url,title}, u32 BE len, JPEG`;
+a `{"ping":true}` header with no picture every 5 s of quiet. No viewer → no screencast. If the screencast fails the
+viewers get screenshots (~1 s) and it is retried. The API's sockets set TCP_NODELAY. Measured on a local page (debug
+build, loaded PC): engine ~28–30 fps, click → picture in the engine p50 27–52 ms; end to end (POST input → NOTIFY → CDP →
+screencast → stream received by the client) p50 ~32 ms, p95 ~50 ms. Before: a screenshot every 900 ms (p50 ~575 ms,
+p95 ~960 ms from click to picture in the daemon, then a DB write, a notice and two HTTP requests).
+
+*Sign in in a window.* `GET|POST|DELETE /api/bots/:id/live/window` (`{available, open}`; POST `{url?}` http(s) only; same
+owner/loopback rules). POST stops the teammate's headless Chrome and opens its profile as a normal, visible Chrome/Edge
+window (`--user-data-dir`, no DevTools port, no headless/automation/user-agent/keychain switches, so cookies are shared
+with the headless browser; the binary itself on Windows and macOS). Refused (409) while a run of the teammate is using
+the browser; while the window is open the scheduler holds that teammate's runs (`Manager::begin_run`) and `ensure` won't
+start headless. When the window's process ends (`live_window` notice) runs go again and the next use starts headless on
+the same profile. DELETE ("Done") closes it gracefully (needed on macOS, where closing the last window leaves Chrome
+running). Two browsers never share a profile: the gate, the PID file (`kill_leftover`) and Chrome's own lock (Windows
+`lockfile` held open, unix `SingletonLock`) are checked before either starts. Teammates have no way to trigger it.
 
 ## CRM (`familiar_core::crm`, migrations `20261009000000_crm.sql`, `20261009000001_crm_webhooks.sql`)
 A small CRM inside Familiar, where the GTM crew keeps its work. Customer data stays in Familiar's Postgres; other CRMs

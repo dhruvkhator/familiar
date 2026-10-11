@@ -140,6 +140,11 @@ fn router(state: S, web_origins: &[String]) -> Router {
         .route("/api/bots/{id}/live", get(live::info))
         .route("/api/bots/{id}/live.jpg", get(live::frame))
         .route("/api/bots/{id}/live/input", post(live::input))
+        .route("/api/bots/{id}/live/stream", get(live::stream))
+        .route(
+            "/api/bots/{id}/live/window",
+            get(live::window_state).post(live::open_window).delete(live::close_window),
+        )
         .route("/api/desktop/stop", post(desktop::stop))
         .route("/api/bots/{id}/folders", get(folders::list).post(folders::create))
         .route("/api/folders/{id}", patch(folders::update).delete(folders::remove))
@@ -307,9 +312,17 @@ pub async fn serve_listener(
         connects: Mutex::new(HashMap::new()),
     });
 
-    axum::serve(listener, router(state, &cfg.web_origins))
-        .with_graceful_shutdown(shutdown)
-        .await?;
+    // No Nagle: a streamed live frame's last packet must not wait for the client's delayed ACK (up to 200 ms).
+    let listener = axum::serve::ListenerExt::tap_io(listener, |tcp| {
+        let _ = tcp.set_nodelay(true);
+    });
+    // The peer address: the live stream and sign-in window answer only on this computer.
+    axum::serve(
+        listener,
+        router(state, &cfg.web_origins).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
     Ok(())
 }
 

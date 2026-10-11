@@ -291,6 +291,8 @@ async fn browser_args(ctx: &Ctx, bot: &Bot, profile: &Path, shots: &Path) -> Vec
     };
     match ctx.browsers.ensure(bot.id, &bot.slug, profiles, ctx.cfg.browser_bin.as_deref()).await {
         Some(endpoint) => args.extend(["--cdp-endpoint".to_owned(), endpoint]),
+        // The owner's sign-in window has the profile (runs wait for it to close; this is only a safety net).
+        None if ctx.browsers.signing_in(bot.id) => args.extend(["--headless".to_owned(), "--isolated".to_owned()]),
         None => args.extend(["--headless".to_owned(), "--user-data-dir".to_owned(), profile.display().to_string()]),
     }
     args.extend(["--output-dir".to_owned(), shots.display().to_string()]);

@@ -161,7 +161,7 @@ impl Client {
     }
 
     /// GETs are retried once on a network error.
-    async fn send(&self, method: Method, path: &str, body: Option<&Value>, auth: bool) -> Result<(u16, Bytes), ApiError> {
+    pub(crate) async fn send(&self, method: Method, path: &str, body: Option<&Value>, auth: bool) -> Result<(u16, Bytes), ApiError> {
         let attempts = if method == Method::GET { 2 } else { 1 };
         let mut i = 1;
         loop {
@@ -185,7 +185,7 @@ impl Client {
         serde_json::from_value(v).map_err(|e| ApiError::Decode(e.to_string()))
     }
 
-    async fn mutate<T: DeserializeOwned>(&self, method: Method, path: &str, b: Option<Value>, auth: bool) -> Result<T, ApiError> {
+    pub(crate) async fn mutate<T: DeserializeOwned>(&self, method: Method, path: &str, b: Option<Value>, auth: bool) -> Result<T, ApiError> {
         let (_, bytes) = self.send(method, path, b.as_ref(), auth).await?;
         self.0.cache.clear_inflight();
         Self::decode(Self::parse_value(&bytes))

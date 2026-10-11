@@ -6,10 +6,12 @@
 mod cache;
 mod client;
 mod error;
+pub mod live;
 pub mod stream;
 pub mod types;
 
 pub use client::{Client, WakingCallback};
 pub use error::ApiError;
+pub use live::{FrameParser, LiveFrame, LiveWindow, coalesce_inputs};
 pub use stream::{Coalescer, Delta, DeltaKind, LiveEvent, Notice, SseMessage, SseParser, resync_wins};
 pub use types::*;

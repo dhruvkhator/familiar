@@ -139,6 +139,13 @@ async fn serve(cfg: Config, shutdown: CancellationToken, signals: broadcast::Sen
         desktop_ui,
         google,
     };
+    // The API in this process (the desktop app) streams the live view and opens sign-in windows through this.
+    let _local = crate::browser::register(
+        ctx.db.clone(),
+        ctx.browsers.clone(),
+        ctx.cfg.bots_dir().join(".browsers"),
+        ctx.cfg.browser_bin.clone(),
+    );
     mcp::serve(mcp_listener, ctx.clone(), shutdown.clone());
     tokio::spawn(crate::tools::ensure_playwright());
     tokio::spawn(crate::telegram::run(ctx.clone(), shutdown.clone()));
@@ -235,6 +242,8 @@ async fn listen(
     active: ActiveMap,
     shutdown: CancellationToken,
 ) {
+    // Take-over input per bot, applied one at a time in the order it was sent.
+    let mut inputs: HashMap<Uuid, tokio::sync::mpsc::UnboundedSender<serde_json::Value>> = HashMap::new();
     loop {
         let next = tokio::select! { n = listener.try_recv() => n, _ = shutdown.cancelled() => return };
         match next {
@@ -253,20 +262,13 @@ async fn listen(
                     let bot = ev["bot"].as_str().and_then(|b| b.parse::<Uuid>().ok());
                     if let (Some(owner), Some(bot)) = (owner, bot) {
                         if owner == ctx.db.owner {
-                            let ctx = ctx.clone();
-                            tokio::spawn(async move {
-                                // Opening a page (the Set up checklist's "Log in to …") starts the bot's browser even
-                                // before its first run, so you can sign in to sites in its own profile.
-                                if ev["type"] == "navigate"
-                                    && let Ok(b) = ctx.db.bot(bot).await
-                                {
-                                    let profiles = ctx.cfg.bots_dir().join(".browsers");
-                                    ctx.browsers.ensure(b.id, &b.slug, profiles, ctx.cfg.browser_bin.as_deref()).await;
-                                }
-                                if let Err(e) = ctx.browsers.input(&ctx.db, bot, &ev).await {
-                                    warn!("take-over input failed: {e:#}");
-                                }
-                            });
+                            let queue = inputs.entry(bot).or_insert_with(|| take_over(ctx.clone(), bot));
+                            if let Err(e) = queue.send(ev) {
+                                // Its worker ended (it never should); a new one takes this and the next inputs.
+                                let q = take_over(ctx.clone(), bot);
+                                let _ = q.send(e.0);
+                                inputs.insert(bot, q);
+                            }
                         }
                     }
                     continue;
@@ -278,8 +280,9 @@ async fn listen(
                 if notice.t == "runs" && active.lock().unwrap().contains_key(&notice.id) {
                     check_cancel(&ctx, &active, notice.id).await;
                 }
-                // A decided draft (approvals) gets its follow-up run queued on the next tick.
-                if matches!(notice.t.as_str(), "runs" | "messages" | "schedules" | "approvals") {
+                // A decided draft (approvals) gets its follow-up run queued on the next tick; runs that waited for a
+                // sign-in window (live_window) start when it closes.
+                if matches!(notice.t.as_str(), "runs" | "messages" | "schedules" | "approvals" | "live_window") {
                     wake.notify_one();
                 }
                 if notice.t == "crm_webhook_deliveries" && notice.op.as_deref() == Some("INSERT") {
@@ -300,6 +303,26 @@ async fn listen(
             }
         }
     }
+}
+
+/// The worker that replays one bot's take-over input, in order (a click never overtakes the typing before it).
+fn take_over(ctx: Ctx, bot: Uuid) -> tokio::sync::mpsc::UnboundedSender<serde_json::Value> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            // Opening a page starts the bot's browser even before its first run.
+            if ev["type"] == "navigate"
+                && let Ok(b) = ctx.db.bot(bot).await
+            {
+                let profiles = ctx.cfg.bots_dir().join(".browsers");
+                ctx.browsers.ensure(b.id, &b.slug, profiles, ctx.cfg.browser_bin.as_deref()).await;
+            }
+            if let Err(e) = ctx.browsers.input(&ctx.db, bot, &ev).await {
+                warn!("take-over input failed: {e:#}");
+            }
+        }
+    });
+    tx
 }
 
 /// "Stop desktop control": the teammate using the desktop loses it at once, its waiting desktop requests are denied and
@@ -381,7 +404,14 @@ async fn tick(ctx: &Ctx, active: &ActiveMap, wake: &Arc<Notify>) -> Result<()> {
         if active.lock().unwrap().values().any(|a| a.bot == run.bot_id) {
             continue;
         }
-        if !ctx.db.claim_run(run.id).await? {
+        // While the owner signs in in the teammate's browser window, its runs wait (the window has the profile).
+        if !ctx.browsers.begin_run(run.bot_id) {
+            continue;
+        }
+        let claimed = ctx.db.claim_run(run.id).await;
+        if !matches!(claimed, Ok(true)) {
+            ctx.browsers.end_run(run.bot_id);
+            claimed?;
             continue;
         }
         let cancel = CancellationToken::new();
@@ -389,8 +419,10 @@ async fn tick(ctx: &Ctx, active: &ActiveMap, wake: &Arc<Notify>) -> Result<()> {
         started += 1;
         let (ctx, active, wake) = (ctx.clone(), active.clone(), wake.clone());
         tokio::spawn(async move {
-            let id = run.id;
+            let (id, bot) = (run.id, run.bot_id);
+            let browsers = ctx.browsers.clone();
             runner::execute(ctx, run, cancel).await;
+            browsers.end_run(bot);
             active.lock().unwrap().remove(&id);
             wake.notify_one();
         });
