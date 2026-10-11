@@ -84,6 +84,8 @@ fn forward_signals(app: AppHandle, mut rx: broadcast::Receiver<Signal>) {
                 Signal::ApprovalPending { bot, tool } => notify(&app, "Approval needed", format!("{bot} wants to use {tool}")),
                 Signal::RunFinished { bot, status } => notify(&app, "Run finished", format!("{bot}: {status}")),
                 Signal::Notify { bot, message, .. } => notify(&app, &bot, message),
+                // Desktop control is offered only by the native app.
+                Signal::Desktop { .. } => {}
             }
         }
     });

@@ -50,6 +50,19 @@ jobs:
       - run: pnpm --filter web typecheck
       - run: pnpm --filter web build
 
+  # The native desktop app (the product): its own Cargo workspace and pinned toolchain (apps/native/rust-toolchain.toml).
+  native:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/native -> target
+      - run: cargo test --workspace
+        working-directory: apps/native
+
+  # The legacy Tauri app, kept compiling until it is removed.
   desktop:
     runs-on: windows-latest
     steps:

@@ -444,6 +444,14 @@ mod tests {
         std::os::unix::fs::symlink(target, at).is_ok()
     }
 
+    /// Remove what [`link`] made: a Windows junction goes like a folder, a Unix symlink like a file.
+    fn unlink(at: &Path) {
+        #[cfg(windows)]
+        std::fs::remove_dir(at).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(at).unwrap();
+    }
+
     #[test]
     fn links_are_followed_before_checking() {
         let f = Fake::new();
@@ -478,7 +486,7 @@ mod tests {
         assert_eq!(ok, vec![Folder { path: docs, write: false }]);
         assert!(skipped.iter().any(|(p, why)| *p == shared.display().to_string() && why.contains("hidden settings folder")), "{skipped:?}");
         // ...or to an allowed but different place: skipped too (it isn't what the owner shared).
-        std::fs::remove_dir(&shared).unwrap();
+        unlink(&shared);
         assert!(link(&f.root.join("Data/Projects"), &shared));
         let (_, skipped) = active(&rows, &f.env);
         assert!(skipped.iter().any(|(_, why)| why.contains("leads somewhere else")), "{skipped:?}");
