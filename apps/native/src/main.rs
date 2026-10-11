@@ -15,6 +15,7 @@
 // Release builds are GUI-subsystem binaries (no console window); debug builds keep the console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod accounts;
 mod activity;
 mod approval;
 mod bench;

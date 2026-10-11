@@ -5,9 +5,9 @@
 //! Google Workspace for email (installed in Integrations, which then offers to link it to them; or linked here when it
 //! is already installed), turn the schedules on.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
-use familiar_client::{Bot, Connector, ConnectorPreset, FromBundle, SchedulePatch, Template, TemplateBundle};
+use familiar_client::{Account, Bot, FromBundle, SchedulePatch, Template, TemplateBundle};
 use familiar_ui::anim;
 use familiar_ui::components::{Button, ButtonSize, Skeleton, card, chip, divider};
 use familiar_ui::icons::{self, icon};
@@ -31,8 +31,8 @@ use crate::text_input;
 
 /// The bundle this flow hires.
 pub const CREW: &str = "gtm-crew";
-/// The connector its email teammates use.
-const EMAIL_CONNECTOR: &str = "google-workspace";
+/// The connected account its email teammates use (`accounts` in templates.json).
+const EMAIL_ACCOUNT: &str = "google";
 
 pub enum CrewEvent {
     Cancelled,
@@ -67,10 +67,8 @@ pub struct CrewHire {
     toasts: Entity<ToastStack>,
     bundle: Option<TemplateBundle>,
     templates: Option<Vec<Template>>,
-    presets: Vec<ConnectorPreset>,
-    connectors: Option<Vec<Connector>>,
-    /// The connectors linked to each hired teammate.
-    linked: HashMap<Uuid, Vec<Uuid>>,
+    /// The owner's connected accounts, with who may use each (`None` until loaded).
+    accounts: Option<Vec<Account>>,
     answers: Vec<(String, String, Answer)>,
     busy: bool,
     error: Option<String>,
@@ -83,15 +81,22 @@ impl EventEmitter<CrewEvent> for CrewHire {}
 impl CrewHire {
     pub fn new(data: Entity<AppData>, toasts: Entity<ToastStack>, bundle: Option<TemplateBundle>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         crate::data::redraw_on_updates(&data, cx);
+        // Google connected (or linked) in Integrations while this page is open.
+        cx.subscribe(&data, |this: &mut Self, _, ev: &crate::data::DataEvent, cx| {
+            if let crate::data::DataEvent::Changed(n) = ev
+                && n.as_ref().is_none_or(|n| n.t == "accounts")
+            {
+                this.load_links(cx);
+            }
+        })
+        .detach();
         let client = data.read(cx).client.clone();
         let mut this = Self {
             data,
             toasts,
             bundle: None,
             templates: None,
-            presets: Vec::new(),
-            connectors: None,
-            linked: HashMap::new(),
+            accounts: None,
             answers: Vec::new(),
             busy: false,
             error: None,
@@ -119,7 +124,6 @@ impl CrewHire {
             }
         }
         swr(&mut this, &client, "/api/templates".into(), cx, |this, list: Vec<Template>, _| this.templates = Some(list));
-        swr(&mut this, &client, "/api/connectors/presets".into(), cx, |this, p: Vec<ConnectorPreset>, _| this.presets = p);
         this
     }
 
@@ -191,25 +195,17 @@ impl CrewHire {
         .detach();
     }
 
-    /// Which connectors exist, and which each new teammate has.
+    /// The owner's connected accounts (with who may use each).
     fn load_links(&mut self, cx: &mut Context<Self>) {
-        let Some(ids) = self.hired.clone() else { return };
+        if self.hired.is_none() {
+            return;
+        }
         let client = self.data.read(cx).client.clone();
-        let task = Tokio::spawn(cx, async move {
-            let all = client.connectors().await.ok();
-            let mut linked = HashMap::new();
-            for id in ids {
-                if let Ok(list) = client.bot_connectors(id).await {
-                    linked.insert(id, list.into_iter().map(|c| c.id).collect::<Vec<_>>());
-                }
-            }
-            (all, linked)
-        });
+        let task = Tokio::spawn(cx, async move { client.accounts().await });
         cx.spawn(async move |this, cx| {
-            if let Ok((all, linked)) = task.await {
+            if let Ok(Ok(info)) = task.await {
                 let _ = this.update(cx, |p, cx| {
-                    p.connectors = all;
-                    p.linked = linked;
+                    p.accounts = Some(info.accounts);
                     cx.notify();
                 });
             }
@@ -217,43 +213,38 @@ impl CrewHire {
         .detach();
     }
 
-    /// The hired teammates whose template uses the email connector.
+    /// The hired teammates whose template uses the owner's Gmail.
     fn email_bots(&self, cx: &App) -> Vec<Uuid> {
         let (Some(ids), Some(all)) = (self.hired.as_ref(), self.templates.as_ref()) else { return Vec::new() };
         let d = self.data.read(cx);
         ids.iter()
             .filter(|id| {
                 let tpl = d.bot(**id).and_then(|b| b.setup.as_ref()).and_then(|s| s.template.clone());
-                tpl.and_then(|t| all.iter().find(|x| x.id == t)).is_some_and(|t| t.connectors.iter().any(|c| c == EMAIL_CONNECTOR))
+                tpl.and_then(|t| all.iter().find(|x| x.id == t)).is_some_and(|t| t.accounts.iter().any(|a| a == EMAIL_ACCOUNT))
             })
             .copied()
             .collect()
     }
 
-    /// Link the Google Workspace connector to the teammates that use it (keeping what each already has).
-    fn link_email(&mut self, connector: Uuid, cx: &mut Context<Self>) {
-        let bots = self.email_bots(cx);
-        let linked = self.linked.clone();
+    /// Let the crew's email teammates use the connected account (keeping whoever already may).
+    fn link_email(&mut self, account: Account, cx: &mut Context<Self>) {
+        let mut ids = account.bot_ids.clone();
+        for b in self.email_bots(cx) {
+            if !ids.contains(&b) {
+                ids.push(b);
+            }
+        }
         let client = self.data.read(cx).client.clone();
         self.busy = true;
         cx.notify();
-        let task = Tokio::spawn(cx, async move {
-            for b in bots {
-                let mut ids = linked.get(&b).cloned().unwrap_or_default();
-                if !ids.contains(&connector) {
-                    ids.push(connector);
-                    client.set_bot_connectors(b, &ids).await?;
-                }
-            }
-            Ok::<_, familiar_client::ApiError>(())
-        });
+        let task = Tokio::spawn(cx, async move { client.set_account_bots(account.id, &ids).await });
         cx.spawn(async move |this, cx| {
             let r = task.await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.message()));
             let _ = this.update(cx, |p, cx| {
                 p.busy = false;
                 match r {
-                    Ok(()) => p.toast(Tone::Ok, "Google Workspace is linked to the crew", None, cx),
-                    Err(e) => p.toast(Tone::Bad, "Couldn't link it", Some(e), cx),
+                    Ok(_) => p.toast(Tone::Ok, "The crew can use your Gmail", Some("Every email they send still asks you first.".into()), cx),
+                    Err(e) => p.toast(Tone::Bad, "Couldn't change that", Some(e), cx),
                 }
                 p.load_links(cx);
                 cx.notify();
@@ -598,61 +589,43 @@ impl CrewHire {
             rows.push(check_row(done, format!("Log in to {site}"), detail, action, &theme));
         }
 
-        // Google Workspace for email.
+        // Connect Google for email (Integrations → Accounts), then let the crew use it.
         let email_bots = self.email_bots(cx);
         if !email_bots.is_empty() {
-            let conn = self.connectors.as_ref().and_then(|all| all.iter().find(|c| c.preset.as_deref() == Some(EMAIL_CONNECTOR)).cloned());
-            let linked_all = conn.as_ref().is_some_and(|c| email_bots.iter().all(|b| self.linked.get(b).is_some_and(|l| l.contains(&c.id))));
+            let account = self.accounts.as_ref().and_then(|all| all.iter().find(|a| a.is_oauth()).or_else(|| all.first()).cloned());
+            let linked_all = account.as_ref().is_some_and(|a| email_bots.iter().all(|b| a.bot_ids.contains(b)));
             let names: Vec<String> = email_bots.iter().filter_map(|id| bots.iter().find(|b| b.id == *id)).map(|b| b.name.clone()).collect();
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
-            let (detail, action): (String, Option<AnyElement>) = match (&conn, linked_all) {
-                (Some(_), true) => (format!("Linked to {}", crate::crm_model::join_and(&names)), None),
-                (Some(c), false) => {
+            let (detail, action): (String, Option<AnyElement>) = match (&account, linked_all) {
+                (Some(a), true) => (format!("{} · {} may use it", a.email, crate::crm_model::join_and(&names)), None),
+                (Some(a), false) => {
                     let this = cx.entity();
-                    let id = c.id;
+                    let a = a.clone();
                     (
-                        "It's set up in Familiar: link it so they can read replies and send what you approve.".to_owned(),
+                        format!("Connected as {}: let {} use it to read replies and send what you approve.", a.email, crate::crm_model::join_and(&names)),
                         Some(
-                            Button::new("crew-link", "Link it")
+                            Button::new("crew-link", "Let them use it")
                                 .size(ButtonSize::Small)
                                 .disabled(self.busy)
-                                .on_click(move |_, _, cx| this.update(cx, |p, cx| p.link_email(id, cx)))
+                                .on_click(move |_, _, cx| this.update(cx, |p, cx| p.link_email(a.clone(), cx)))
                                 .into_any_element(),
                         ),
                     )
                 }
-                (None, _) => {
-                    let docs = self.presets.iter().find(|p| p.id == EMAIL_CONNECTOR).and_then(|p| p.docs_url.as_deref().and_then(crate::crm_model::safe_url));
-                    (
-                        "So they can read replies and send the emails you approve. It needs a Google OAuth client (the guide says how); once it's installed, Familiar asks who may use it.".to_owned(),
-                        Some(
-                            div()
-                                .flex()
-                                .gap(px(6.0))
-                                .when_some(docs, |el, url| {
-                                    el.child(
-                                        Button::new("crew-docs", "Guide")
-                                            .ghost()
-                                            .size(ButtonSize::Small)
-                                            .icon(icons::LINK)
-                                            .tooltip(url.clone())
-                                            .on_click(move |_, _, cx| cx.open_url(&url)),
-                                    )
-                                })
-                                .child(
-                                    Button::new("crew-connect", "Set it up")
-                                        .size(ButtonSize::Small)
-                                        .icon(icons::PLUG)
-                                        .tooltip("Opens Integrations with Google Workspace's install form")
-                                        .on_click(|_, _, cx| crate::shell::open_page(&format!("integrations/{EMAIL_CONNECTOR}"), cx)),
-                                )
-                                .into_any_element(),
-                        ),
-                    )
-                }
+                (None, _) => (
+                    "So they can read replies and send the emails you approve (each send asks you). Sign in with Google, or use a Gmail app password.".to_owned(),
+                    Some(
+                        Button::new("crew-connect", "Connect Google")
+                            .size(ButtonSize::Small)
+                            .icon(icons::LINK)
+                            .tooltip("Opens Integrations → Accounts")
+                            .on_click(|_, _, cx| crate::shell::open_page("integrations", cx))
+                            .into_any_element(),
+                    ),
+                ),
             };
-            let done = conn.is_some() && linked_all;
-            rows.push(check_row(done, "Connect Google Workspace for email".to_owned(), detail, action, &theme));
+            let done = account.is_some() && linked_all;
+            rows.push(check_row(done, "Connect Google".to_owned(), detail, action, &theme));
         }
 
         // Schedules.

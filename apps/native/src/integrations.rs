@@ -1,8 +1,8 @@
 //! Integrations (the web's `pages/Integrations.tsx`): connectors, the MCP servers that give teammates tools. The
 //! installed ones (on/off, edit, delete with a confirmation), the catalog of ready-made ones (`/api/connectors/presets`)
 //! and your own server: a program on this PC (command, arguments, environment variables) or an online one (an address
-//! and headers). Installing or editing happens in a dialog over the page. Telegram has its own card
-//! ([`crate::telegram`]).
+//! and headers). Installing or editing happens in a dialog over the page. Accounts (Connect Google, Gmail with an app
+//! password: [`crate::accounts`]) and Telegram ([`crate::telegram`]) have their own cards.
 //!
 //! Secrets are write-only: typed into masked fields, read out only to send them (held in [`Zeroizing`] strings, and
 //! wiped from the request struct once it went; the client's JSON and HTTP buffers are freed unwiped), never shown again
@@ -114,6 +114,8 @@ pub struct IntegrationsPage {
     scroll: ScrollHandle,
     form_scroll: ScrollHandle,
     telegram: Entity<TelegramCard>,
+    /// Accounts: Connect Google, Gmail with an app password.
+    accounts: Entity<crate::accounts::AccountsCard>,
     /// After an install: who may use it.
     linking: Option<Linking>,
     /// The templates (which connectors each wants), to suggest who may use a new one.
@@ -129,6 +131,7 @@ impl IntegrationsPage {
         })
         .detach();
         let telegram = cx.new(|cx| TelegramCard::new(data.clone(), toasts.clone(), cx));
+        let accounts = cx.new(|cx| crate::accounts::AccountsCard::new(data.clone(), toasts.clone(), cx));
         let mut this = Self {
             data,
             toasts,
@@ -144,6 +147,7 @@ impl IntegrationsPage {
             scroll: ScrollHandle::new(),
             form_scroll: ScrollHandle::new(),
             telegram,
+            accounts,
             linking: None,
             templates: None,
         };
@@ -182,6 +186,7 @@ impl IntegrationsPage {
             self.reload(cx);
         }
         self.telegram.update(cx, |t, cx| t.set_shown(shown, cx));
+        self.accounts.update(cx, |a, cx| a.set_shown(shown, cx));
         cx.notify();
     }
 
@@ -618,7 +623,7 @@ impl IntegrationsPage {
             .gap(px(4.0))
             .child(div().text_size(px(text::HEADLINE)).font_weight(FontWeight::SEMIBOLD).text_color(theme.ink).child("Integrations"))
             .child(div().text_size(px(text::LEAD)).text_color(theme.muted).child(
-                "Tools your teammates can use (GitHub, Notion, Slack, your own), and a way to reach them from your phone.",
+                "Your Gmail and the tools your teammates can use (GitHub, Notion, Slack, your own), and a way to reach them from your phone.",
             ))
             .into_any_element()
     }
@@ -1247,6 +1252,16 @@ impl Render for IntegrationsPage {
                     ),
             )
             .child(self.installed(cx));
+        let accounts = div()
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .child(Self::section_head(
+                "Accounts",
+                "Your own Gmail and Google Calendar, for the teammates you pick. Familiar's own tools use it; the sign-in stays encrypted on this computer.",
+                &theme,
+            ))
+            .child(self.accounts.clone());
         let phone = div()
             .flex()
             .flex_col()
@@ -1272,6 +1287,7 @@ impl Render for IntegrationsPage {
             .flex_col()
             .gap(px(36.0))
             .child(anim::appear("integ-head", div().child(self.header(cx))))
+            .child(accounts)
             .child(connectors)
             .child(phone)
             .child(catalog);
