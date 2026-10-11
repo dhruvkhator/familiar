@@ -60,6 +60,10 @@ jobs:
           # The app's version (Settings, and what in-app updates compare against); see updates/mod.rs.
           FAMILIAR_VERSION: ${{ steps.version.outputs.value }}
           FAMILIAR_BUILT_AT: ${{ steps.version.outputs.built_at }}
+          # Familiar's Google OAuth client (docs/google-oauth-setup.md): repository Actions *variables*, not secrets (a desktop
+          # client's secret ships inside the app). Unset = empty: the app then shows the setup note instead of Connect Google.
+          FAMILIAR_GOOGLE_CLIENT_ID: ${{ vars.FAMILIAR_GOOGLE_CLIENT_ID }}
+          FAMILIAR_GOOGLE_CLIENT_SECRET: ${{ vars.FAMILIAR_GOOGLE_CLIENT_SECRET }}
         run: cargo build --release --locked
 
       - name: Stage package
@@ -128,6 +132,8 @@ jobs:
         env:
           FAMILIAR_VERSION: ${{ steps.version.outputs.value }}
           FAMILIAR_BUILT_AT: ${{ steps.version.outputs.built_at }}
+          FAMILIAR_GOOGLE_CLIENT_ID: ${{ vars.FAMILIAR_GOOGLE_CLIENT_ID }}
+          FAMILIAR_GOOGLE_CLIENT_SECRET: ${{ vars.FAMILIAR_GOOGLE_CLIENT_SECRET }}
           MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           cargo build --release --locked --target aarch64-apple-darwin

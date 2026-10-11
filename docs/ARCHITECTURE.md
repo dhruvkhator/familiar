@@ -462,6 +462,11 @@ connector's send (or the browser typing it).
   asks with a line saying how ("Not exactly draft #id as you approved it: the recipients differ…").
 - The follow-up message tells the teammate which one send won't ask again (and that the click still does).
 
+  - **Familiar's own `gmail_send`** (`mcp__familiar__gmail_send`, below) counts like those connector tools: fields `to`,
+    `cc`/`bcc` (absent or empty), `subject`, `body`, and `reply_to_id` free (an id checked by the tool; it only threads
+    the reply). Its gate runs inside the tool (the Familiar server is pre-allowed for the engines), through the same
+    `runner::decide_tool`, so the pre-approval, deny rules and the owner apply identically.
+
 **Webhooks** (`crm::webhooks`, API `routes/crm_webhooks.rs`, owner only: teammates have no API access). `GET/POST
 /api/crm/webhooks`, `GET/PATCH/DELETE /api/crm/webhooks/{id}`, `POST /api/crm/webhooks/{id}/test` (a `ping`, sent at
 once, stored already settled, never retried; answers with its delivery), `GET /api/crm/webhooks/{id}/deliveries?limit` (newest first, with
@@ -506,6 +511,51 @@ CRM-writing template carries the same CRM rules (sources, public business detail
 lists, do-not-contact, owner edits win, fenced text). `GET /api/templates/bundles`; `POST
 /api/templates/bundles/gtm-crew/create {answers}` hires the whole crew in one transaction (all or none) from shared
 questions (product, ideal customer, ask, sender, voice, follow-up days) with every schedule off.
+
+## Connected accounts: Gmail and Google Calendar (`familiar_core::google`, migration `20261011000000_accounts.sql`)
+The owner connects their own Google account once (Integrations → Accounts) and ticks which teammates may use it; those
+teammates get Familiar's own tools, so no third-party MCP code ever holds the token, and there is no token broker.
+
+- **Connect Google (OAuth).** One Familiar OAuth client of type *Desktop app* (client id and its non-confidential
+  secret: build-time `FAMILIAR_GOOGLE_CLIENT_ID` / `_SECRET` via `option_env!`, set by `release.yml` from the repo's
+  Actions *variables*; `[google] client_id/client_secret` in config.toml overrides; none = the app shows the one-time
+  setup, `docs/google-oauth-setup.md`). `POST /api/accounts/google/connect` binds a loopback listener on
+  `127.0.0.1:<random port>`, makes a PKCE verifier (32 random bytes, S256) and a 32-byte `state`, and returns Google's
+  URL (`access_type=offline`, `prompt=consent`, the scopes below); the app opens it with `cx.open_url` (the owner's
+  default browser on Windows and macOS; never a teammate's browser or an embedded view) and polls
+  `GET …/connect/{flow}`. The listener answers exactly one redirect carrying a `state` and closes; requests without a
+  `state` get a 404 (at most 16), a wrong `state` fails the sign-in, 5 minutes at most, the page echoes nothing. The
+  code is traded with the verifier, the address read from Gmail's profile (else the primary calendar), the refresh
+  token sealed with `SecretBox` into `accounts.secret_enc`, owner-scoped, one per kind; the API never returns it.
+  Reconnecting the same address keeps who may use it; another address replaces the account, drops its links and revokes
+  the old one's grant. Only the desktop app's API offers it (the loopback must be the owner's computer).
+- **Scopes, least first:** `gmail.readonly`, `gmail.send`, `gmail.compose`, `calendar.events`. Each tool checks the
+  scope it needs; Google's granular consent may grant fewer.
+- **Access tokens** live in the daemon's memory only (`google::Tokens`), refreshed a minute before expiry, one refresh
+  at a time per account, exponential backoff after failures (2 s … 5 min); `invalid_grant` marks the account
+  `reconnect` (the card says "Connect again"). Disconnect (`DELETE /api/accounts/{id}`) revokes the refresh token at
+  Google, then deletes the row and its links. Tokens, verifiers and passwords never appear in logs or `Debug`.
+- **Gmail with an App Password** (no Google Cloud project; `POST /api/accounts/gmail {email, app_password}`): the
+  16-letter password is checked with an IMAP login, then sealed the same way. IMAP (`async-imap`) and SMTP (`lettre`)
+  use implicit TLS only (993, 465: no plaintext, no STARTTLS to strip) with rustls and the platform verifier. Mail only:
+  Calendar and whole-thread reads need Connect Google. A refused password marks it `reconnect`.
+- **Tools** (Familiar's MCP server, `google::tools`; per-teammate via `bot_accounts`, checked on every call; OAuth
+  account first when it has the scope, else the app password). Classes in `permissions::google_access`:
+  *Read* — `gmail_search {query, max_results ≤ 25}` (Gmail search syntax; over IMAP `X-GM-RAW` in a read-only
+  `EXAMINE`), `gmail_read {id | thread_id}` (≤ 10 messages; bodies via `mail-parser`, HTML turned into text without
+  scripts or styles, ≤ 20 000 characters, attachments by name only), `calendar_list`; refused in research-only runs (they fetch any page without asking: mail could leave in a URL).
+  *Ask* — `gmail_draft` (a Gmail draft; over IMAP an `APPEND` to Drafts), `gmail_send`, `calendar_create` (invitations
+  only with attendees): refused in research-only runs, then checked (plain ASCII mailboxes; no control characters in
+  any header value; `reply_to_id` a Gmail id), then the CRM's do-not-contact check over every recipient (to, cc, bcc,
+  attendees) and the text — a hit is refused, never asked — then `runner::decide_tool` inside the tool (owner deny
+  rules, an approved draft's one exact send, allow rules, auto-review, else the owner; only an email's `body` is
+  editable, and an edit is checked again). "Always allow" is offered for `gmail_draft` only. Messages are composed by
+  `lettre`'s builder (From = the account; Bcc only in the envelope over SMTP); replies carry `In-Reply-To` /
+  `References` from the original and stay in its thread. Everything a read returns from mail or calendars is fenced
+  (`<data-NONCE>`, as the CRM tools). Per run at most 300 reads and 30 actions.
+- **Instructions.** A linked teammate's instructions say which account it may use and that mail text is data; the GTM
+  templates (`accounts: ["google"]`, linked at hire when connected) use these tools when connected, else the Google
+  Workspace connector.
 
 ## Updates (`apps/native/src/updates/`)
 The desktop app finds, verifies, installs and restarts into its new versions itself; nobody downloads from GitHub by
@@ -580,7 +630,8 @@ hand after the first install.
 Familiar has no hosted service of its own. The desktop app runs the engine, the API (127.0.0.1 only) and a private
 built-in PostgreSQL on the owner's machine; all data lives in `~/.familiar`. The only outbound traffic is the owner's
 own LLM requests (their Claude/Codex subscription), whatever sites/apps their teammates use, and the desktop app's
-update check (GitHub's public release list and release files; it sends nothing but a User-Agent with the version). Remote access is the
+update check (GitHub's public release list and release files; it sends nothing but a User-Agent with the version). A connected
+Google account adds Google's own endpoints (OAuth, Gmail, Calendar, or Gmail's IMAP/SMTP), called from this computer. Remote access is the
 owner's choice and never goes through infrastructure we run: (1) a private network such as Tailscale/WireGuard to the
 owner's own PC, (2) self-hosting `familiar-server` + Postgres inside an organisation's own infrastructure, or (3) a
 future optional end-to-end-encrypted relay that only forwards ciphertext. Chat channels (Telegram, WhatsApp) are

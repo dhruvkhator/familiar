@@ -54,6 +54,11 @@ connect accounts while staying in control. It is updated as new features ship.
 | Teamwork | Hands tasks to other teammates and can wait for the result |
 | Reach you | Asks questions, sends notifications (desktop, Telegram) |
 | Integrations | Any MCP server as a connector (GitHub, Notion, Slack, Linear, Google Workspace, …) |
+| Your Gmail | Connect Google (one click, OAuth with PKCE, token encrypted on your PC) or a Gmail app password; teammates you pick search, read, draft and send (every send asks you) |
+
+Connect Google: until Google verifies the app, Google shows "Google hasn't verified this app" once: choose **Advanced →
+Go to Familiar**. Building Familiar yourself? It needs a one-time Google OAuth client:
+[docs/google-oauth-setup.md](docs/google-oauth-setup.md).
 
 ## Safety model
 - Teammates run Claude Code in `--restricted` mode: they can't grant themselves permissions, file tools are confined to
