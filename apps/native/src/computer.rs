@@ -537,7 +537,7 @@ impl Render for ComputerPanel {
                     .on_click(move |_, window, cx| this.update(cx, |p, cx| p.set_control(!p.control, window, cx))),
             )
             .child(div().flex_1().min_w_0().truncate().text_size(px(text::CAPTION)).text_color(theme.muted).child(if control {
-                "Click, scroll and type on the page. Ctrl+V pastes.".to_owned()
+                format!("Click, scroll and type on the page. {} pastes.", if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+V" })
             } else {
                 format!("{name} is driving.")
             }));

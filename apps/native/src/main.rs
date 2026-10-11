@@ -139,6 +139,8 @@ fn window_options(cx: &App, title: &str, width: f32, height: f32, custom_titleba
 }
 
 fn main() {
+    // macOS: an app opened from Finder or the Dock gets the login shell's PATH (claude, node...). Before any thread.
+    familiar_host::login_path::adopt();
     let args = parse_args();
     // One copy per user: a second launch shows the running window and exits. The gallery and the bench run beside it.
     let nudge = if args.quit { desktop::Nudge::Quit } else { desktop::Nudge::Show };
@@ -171,7 +173,10 @@ fn main() {
     if !args.gallery && !args.bench {
         engine::start_early(&handle);
     }
-    gpui_platform::application().with_assets(familiar_ui::icons::Assets).run(move |cx: &mut App| {
+    let app = gpui_platform::application().with_assets(familiar_ui::icons::Assets);
+    // macOS: clicking the Dock icon (or opening the app again from Finder) while it runs shows the window.
+    app.on_reopen(desktop::show_main);
+    app.run(move |cx: &mut App| {
         perf::milestone("app_ready");
         gpui_tokio::init_from_handle(cx, handle.clone());
         gpui_base::init(cx);
@@ -206,6 +211,7 @@ fn main() {
         perf::milestone("window_open");
         cx.set_global(desktop::MainWindow(window));
         tray::install(cx);
+        desktop::install(cx);
         if let Some(mut nudges) = nudges {
             cx.spawn(async move |cx| {
                 use futures::StreamExt as _;

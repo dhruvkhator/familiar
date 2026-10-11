@@ -65,7 +65,7 @@ impl Root {
         let quitting = engine.clone();
         window.on_window_should_close(cx, move |window, cx| {
             if crate::tray::installed(cx) {
-                crate::desktop::hide_window(window);
+                crate::desktop::hide_window(window, cx);
                 return false;
             }
             quitting.update(cx, |e, cx| e.request_quit(cx))
@@ -78,7 +78,7 @@ impl Root {
         if self.engine.update(cx, |e, cx| e.request_quit(cx)) {
             cx.quit();
         } else {
-            crate::desktop::show_window(window);
+            crate::desktop::show_window(window, cx);
         }
     }
 
@@ -233,6 +233,15 @@ impl Root {
                     )
                     .when_some(error, |el, e| {
                         el.child(div().w_full().text_size(px(text::SMALL)).text_color(theme.bad).child(e))
+                    })
+                    .when(!familiar_host::claude_found(), |el| {
+                        el.child(div().w_full().mt(px(8.0)).child(notice_chip(
+                            &theme,
+                            true,
+                            "Claude Code isn't installed",
+                            familiar_host::CLAUDE_MISSING,
+                            NoticeChipIcon::Tile,
+                        )))
                     })
                     .child(
                         div().w_full().mt(px(10.0)).child(

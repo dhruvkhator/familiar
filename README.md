@@ -77,15 +77,36 @@ connect accounts while staying in control. It is updated as new features ship.
   icon turns red and the tray's **Stop desktop control** ends it at once. It only works inside the Familiar app.
 
 ## Install
-Download `Familiar-<version>-setup.exe` from [Releases](https://github.com/dhruvkhator/familiar/releases) (Windows;
-macOS/Linux later), install (no admin rights needed), and open Familiar. The installer isn't code-signed yet, so Windows
-SmartScreen may warn: choose *More info → Run anyway*, and compare the file with `SHA256SUMS.txt` if you like. First launch sets up the built-in database, checks your Claude Code / Codex
-sign-in, and walks you through creating your first teammate. Requires [Claude Code](https://docs.claude.com/en/docs/claude-code)
-and/or the [Codex CLI](https://www.npmjs.com/package/@openai/codex) signed in, plus Node 20+ for browser/connector tools.
+Download from [Releases](https://github.com/dhruvkhator/familiar/releases) (Windows and macOS; Linux later). Compare a
+file with `SHA256SUMS.txt` if you like.
+
+**Windows:** run `Familiar-<version>-setup.exe` (no admin rights needed) and open Familiar. The installer isn't
+code-signed yet, so SmartScreen may warn: choose *More info → Run anyway*.
+
+**macOS** (Apple Silicon and Intel, macOS 11+): open `Familiar-<version>.dmg` and drag Familiar into Applications.
+Familiar isn't notarized by Apple yet, so the first launch takes a few extra clicks:
+1. Open Familiar from Applications. macOS says it can't verify the app: click **Done** (not *Move to Trash*).
+2. Open **System Settings → Privacy & Security**, scroll to *Security*, and next to "Familiar was blocked" click
+   **Open Anyway**; confirm, then **Open**. (macOS 14 or earlier: Control-click Familiar → **Open** → **Open** also
+   works. macOS 15 removed that shortcut.)
+3. If macOS says Familiar "is damaged and can't be opened": run
+   `xattr -dr com.apple.quarantine /Applications/Familiar.app` in Terminal and open it again.
+
+Closing the window keeps Familiar working from the menu bar; quit from there or with ⌘Q. Desktop control is Windows
+only for now. Data lives in `~/.familiar` on both systems.
+
+**Requirements:** [Claude Code](https://docs.claude.com/en/docs/claude-code) installed and signed in
+(`npm install -g @anthropic-ai/claude-code`, or `brew install --cask claude-code` on a Mac; run `claude` once to sign in)
+and/or the [Codex CLI](https://www.npmjs.com/package/@openai/codex), Node 20+ for browser/connector tools, and Chrome or
+Edge for the browser tool. On a Mac, Familiar finds them the way Terminal does (it reads your login shell's PATH), even
+when opened from Finder. First launch downloads the built-in database once, checks your Claude Code / Codex sign-in,
+and walks you through creating your first teammate.
 
 ## Build from source
 - Native desktop app: `cd apps/native && cargo build --release` → `apps/native/target/release/familiar-native.exe`
-  (Rust 1.99, pinned in `apps/native/rust-toolchain.toml`; the first build compiles GPUI and takes a while).
+  (Rust 1.99, pinned in `apps/native/rust-toolchain.toml`; the first build compiles GPUI and takes a while). On a Mac
+  the binary is `familiar-native`; `apps/native/dist/macos/bundle.sh <binary> <version> <dir>` wraps it in
+  `Familiar.app` (needs Xcode's command line tools).
 - Engine, API and tests: `cargo test --workspace --exclude familiar-desktop` (integration tests need
   `TEST_DATABASE_URL` pointing at any Postgres).
 - Web app: `pnpm install && pnpm --filter web dev` (set `VITE_API_URL`).

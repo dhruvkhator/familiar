@@ -425,7 +425,11 @@ impl AppSettings {
         let (engine_label, engine_hint) = match mode {
             Mode::Hosted => (
                 "Running Familiar's engine",
-                "This app runs the database, the API and your teammates' work. It keeps running in the tray when you close the window.",
+                if cfg!(target_os = "macos") {
+                    "This app runs the database, the API and your teammates' work. It keeps running in the menu bar when you close the window."
+                } else {
+                    "This app runs the database, the API and your teammates' work. It keeps running in the tray when you close the window."
+                },
             ),
             Mode::Attached => (
                 "Using the Familiar app's engine",
@@ -470,7 +474,11 @@ impl AppSettings {
             ),
             setting_row(
                 "Start at login",
-                "Open Familiar in the tray when you sign in to Windows.",
+                if cfg!(target_os = "macos") {
+                    "Open Familiar in the menu bar when you log in to your Mac."
+                } else {
+                    "Open Familiar in the tray when you sign in to Windows."
+                },
                 Switch::new("autostart", self.autostart)
                     .on_toggle(move |on, _, cx| {
                         this.update(cx, |p, cx| {
@@ -486,7 +494,7 @@ impl AppSettings {
             ),
             setting_row(
                 "Appearance",
-                "Follow Windows, or pin light or dark.",
+                if cfg!(target_os = "macos") { "Follow macOS, or pin light or dark." } else { "Follow Windows, or pin light or dark." },
                 Segmented::new(
                     "settings-theme",
                     AppearanceMode::ALL.iter().map(|m| (SharedString::from(m.label()), Some(m.icon()))).collect(),
@@ -504,7 +512,11 @@ impl AppSettings {
             ),
             setting_row(
                 "Reduce motion",
-                "Fewer animations. Windows' own setting is followed when this is off.",
+                if cfg!(target_os = "macos") {
+                    "Fewer animations."
+                } else {
+                    "Fewer animations. Windows' own setting is followed when this is off."
+                },
                 Switch::new("settings-motion", reduce)
                     .on_toggle(move |on, _, cx| {
                         motion::set_preference(if on { ReduceMotion::On } else { ReduceMotion::System }, cx);

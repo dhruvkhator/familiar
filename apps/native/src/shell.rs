@@ -655,6 +655,14 @@ impl Shell {
                     .child(div().text_size(px(text::LEAD)).text_color(theme.muted).child(subtitle)),
             ));
 
+        // Nothing runs without Claude Code; say so first (an app opened from Finder only sees the login shell's PATH).
+        page = page.when(!familiar_host::claude_found(), |p| {
+            p.child(anim::appear(
+                "today-no-claude",
+                div().child(notice_chip(&theme, true, "Claude Code isn't installed", familiar_host::CLAUDE_MISSING, NoticeChipIcon::Tile)),
+            ))
+        });
+
         if let Some(e) = failed {
             return page
                 .child(anim::appear(

@@ -77,11 +77,15 @@ impl Env {
         } else {
             for p in [
                 "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/var", "/boot", "/dev", "/proc", "/sys", "/root",
-                "/opt", "/snap", "/System", "/Library", "/private", "/Applications",
+                "/opt", "/snap", "/System", "/Library", "/private", "/cores", "/Network",
             ] {
                 protected.push((PathBuf::from(p), "system files"));
             }
+            protected.push((PathBuf::from("/Applications"), "installed programs"));
+            // macOS keeps every app's data here: the keychains, Mail, Messages, Safari, browsers' saved passwords and
+            // cookies, iCloud Drive's own folder.
             protected.push((home.join("Library"), "app data (saved passwords and sign-ins live there)"));
+            protected.push((home.join("Applications"), "installed programs"));
         }
         Env { home, familiar_home: crate::Config::home_dir(), bots_dir: bots_dir.to_path_buf(), protected }
     }
@@ -117,7 +121,7 @@ pub fn check(raw: &str, env: &Env) -> Result<PathBuf, String> {
 /// Why a resolved folder must never be shared, if it must not.
 fn refusal(c: &Path, env: &Env) -> Option<String> {
     let k = key(c);
-    if c.parent().is_none() {
+    if c.parent().is_none() || is_volume(c) {
         return Some("it's a whole drive".into());
     }
     if c.components().any(|p| {
@@ -295,11 +299,27 @@ fn resolve(p: &Path) -> Option<PathBuf> {
     }
 }
 
-/// The comparable form of a path: separators unified, no trailing separator, lowercase on Windows.
+/// macOS mounts every other disk (and `/Volumes` itself holds them all) under `/Volumes`: sharing one is sharing a
+/// whole drive.
+fn is_volume(c: &Path) -> bool {
+    cfg!(target_os = "macos") && {
+        let k = key(c);
+        k == key(Path::new("/Volumes")) || c.parent().is_some_and(|p| key(p) == key(Path::new("/Volumes")))
+    }
+}
+
+/// The comparable form of a path: separators unified, no trailing separator, lowercase where file names ignore case
+/// (Windows, and macOS's default disks: `~/library` is `~/Library` there).
 fn key(p: &Path) -> String {
     let s = p.to_string_lossy();
     let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
-    let s = if cfg!(windows) { s.replace('/', "\\").to_lowercase() } else { s.to_owned() };
+    let s = if cfg!(windows) {
+        s.replace('/', "\\").to_lowercase()
+    } else if cfg!(target_os = "macos") {
+        s.to_lowercase()
+    } else {
+        s.to_owned()
+    };
     s.trim_end_matches(SEP).to_owned()
 }
 
@@ -407,6 +427,26 @@ mod tests {
         let env = Env { bots_dir: f.root.join("Data"), ..f.env.clone() };
         assert!(check(&f.p("Data/Projects"), &env).unwrap_err().contains("teammates' workspaces"));
         assert!(check(&f.p(""), &env).unwrap_err().contains("contains"));
+    }
+
+    /// macOS disks ignore case by default, so a differently cased path is the same folder; other disks are whole drives.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_case_and_volumes() {
+        let f = Fake::new();
+        for (rel, why) in [("users/ME/.SSH", "hidden settings folder"), ("Users/me/APPDATA/roaming", "app data"), ("users", "contains your home folder")] {
+            let e = f.check(rel).expect_err(rel);
+            assert!(e.contains(why), "{rel}: {e}");
+        }
+        assert!(check("/Volumes", &f.env).unwrap_err().contains("whole drive"));
+        let real = Env::current(&f.env.bots_dir);
+        for p in ["/System/Library", "/Applications", "/private/etc", "/tmp", "/usr/local"] {
+            assert!(check(p, &real).is_err(), "{p}");
+        }
+        let lib = real.home.join("Library");
+        if lib.is_dir() {
+            assert!(check(&lib.display().to_string(), &real).unwrap_err().contains("app data"));
+        }
     }
 
     #[test]

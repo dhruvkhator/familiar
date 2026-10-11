@@ -83,24 +83,48 @@ fn build() -> Result<Tray, String> {
         &quit,
     ])
     .map_err(|e| e.to_string())?;
-    // The app icon embedded as resource 1 (build.rs).
     let icon = app_icon()?;
+    // macOS: a menu bar item opens its menu on a click and draws a template icon in the menu bar's own colours.
     let icon = TrayIconBuilder::new()
         .with_tooltip("Familiar")
         .with_icon(icon)
+        .with_icon_as_template(cfg!(target_os = "macos"))
         .with_menu(Box::new(menu))
-        .with_menu_on_left_click(false)
+        .with_menu_on_left_click(cfg!(target_os = "macos"))
         .build()
         .map_err(|e| e.to_string())?;
     Ok(Tray { icon, pause, autostart, stop_desktop })
 }
 
-/// The app icon embedded as resource 1 (build.rs).
+/// The app icon: on Windows embedded as resource 1 (build.rs); on macOS the menu bar's template of the mark.
 fn app_icon() -> Result<Icon, String> {
     #[cfg(windows)]
     return Icon::from_resource(1, Some((32, 32))).map_err(|e| e.to_string());
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    return menu_bar_icon();
+    #[cfg(not(any(windows, target_os = "macos")))]
     return Icon::from_rgba(vec![0x72, 0x85, 0xd5, 0xff].repeat(16 * 16), 16, 16).map_err(|e| e.to_string());
+}
+
+/// The mark as a menu bar template (macOS draws it black or white to suit the bar): the rounded square solid, the
+/// white "F.." cut out of it. 36 px for the 18 pt bar on Retina screens.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn menu_bar_icon() -> Result<Icon, String> {
+    const N: u32 = 36;
+    let mark = image::load_from_memory_with_format(include_bytes!("../dist/macos/familiar.png"), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?
+        .to_rgba8();
+    let small = image::imageops::resize(&mark, N, N, image::imageops::FilterType::Lanczos3);
+    let px = small
+        .pixels()
+        .flat_map(|p| {
+            let [r, g, b, a] = p.0;
+            // How white the pixel is: the blue square is ~0.3, the letter 1.
+            let white = (f32::from(r.min(g).min(b)) / 255.0 - 0.45).clamp(0.0, 0.55) / 0.55;
+            [0, 0, 0, (f32::from(a) * (1.0 - white)).round() as u8]
+        })
+        .collect();
+    Icon::from_rgba(px, N, N).map_err(|e| e.to_string())
 }
 
 /// The icon while a teammate uses the desktop: a red disc with a white dot ("on air"), unmistakable in the tray.
@@ -133,7 +157,12 @@ pub fn desktop_changed(bot: Option<String>, cx: &mut App) {
             None => (app_icon(), "Familiar".to_owned()),
         };
         if let Ok(icon) = icon {
-            let _ = tray.icon.set_icon(Some(icon));
+            // The red "on air" icon keeps its colour; the plain one is a template on macOS.
+            if cfg!(target_os = "macos") {
+                let _ = tray.icon.set_icon_with_as_template(Some(icon), bot.is_none());
+            } else {
+                let _ = tray.icon.set_icon(Some(icon));
+            }
         }
         let _ = tray.icon.set_tooltip(Some(tip));
         tray.stop_desktop.set_enabled(bot.is_some());
@@ -145,7 +174,7 @@ pub fn desktop_changed(bot: Option<String>, cx: &mut App) {
     let (title, body) = match &bot {
         Some(name) => (
             format!("{name} is using your desktop"),
-            "Every step asks you first. Stop it any time from the tray: Stop desktop control.".to_owned(),
+            format!("Every step asks you first. Stop it any time from {}: Stop desktop control.", desktop::TRAY),
         ),
         None => ("Desktop control ended".to_owned(), "No teammate is using your desktop now.".to_owned()),
     };
@@ -205,4 +234,13 @@ pub fn sync(cx: &mut App) {
     tray.pause.set_enabled(host.is_some());
     tray.pause.set_text(if host.is_some_and(|h| h.daemon_paused()) { "Resume work" } else { "Pause work" });
     tray.autostart.set_checked(desktop::autostart_enabled());
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn menu_bar_template_decodes() {
+        assert!(super::menu_bar_icon().is_ok());
+        assert!(super::busy_icon().is_ok());
+    }
 }

@@ -1,0 +1,31 @@
+Installing Familiar on a Mac
+============================
+
+1. Drag Familiar into the Applications folder (in this window).
+
+2. Open Familiar from Applications. It isn't notarized by Apple yet, so macOS says it
+   can't verify the app: click Done (not Move to Trash).
+
+3. Open System Settings > Privacy & Security, scroll down to Security, and next to
+   "Familiar was blocked" click Open Anyway. Confirm with your password or Touch ID,
+   then click Open. (On macOS 14 or earlier, Control-click Familiar in Applications,
+   choose Open, then Open again.)
+
+4. If macOS says Familiar "is damaged and can't be opened", open Terminal and run:
+
+       xattr -dr com.apple.quarantine /Applications/Familiar.app
+
+   then open Familiar again.
+
+You only do this once. Familiar keeps working from the menu bar when its window is closed;
+quit it from there or with Command-Q.
+
+You also need:
+- Claude Code, installed and signed in: in Terminal run
+      npm install -g @anthropic-ai/claude-code
+  (or: brew install --cask claude-code), then run "claude" once to sign in.
+- Node.js 20 or later (https://nodejs.org or "brew install node").
+- Google Chrome or Microsoft Edge, for the browser tool.
+
+The first launch downloads Familiar's built-in database once (internet needed).
+Your data lives in the .familiar folder in your home folder.

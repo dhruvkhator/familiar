@@ -1,10 +1,10 @@
 name: Release
 
-# Push a tag like v0.1.0 (or run manually) and GitHub builds the Windows installer and attaches it to a release.
-# Users download Familiar-<version>-setup.exe; nobody has to compile anything.
+# Push a tag like v0.1.0 (or run manually) and GitHub builds the Windows installer and the macOS app and attaches them
+# to a release. Users download Familiar-<version>-setup.exe or Familiar-<version>.dmg; nobody has to compile anything.
 #
 # Supply chain: every action is pinned to a full commit SHA (version in the comment), and only the small publish job
-# can write to the repository; the build job is read-only.
+# can write to the repository; the build jobs are read-only.
 on:
   push:
     tags: ["v*"]
@@ -13,6 +13,10 @@ on:
       version:
         description: "Version without the leading v (e.g. 0.1.0)"
         required: true
+      dry_run:
+        description: "Build only: keep the artifacts in the run, publish no release"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -76,23 +80,109 @@ jobs:
           path: out/
           if-no-files-found: error
 
+  # macOS: one universal binary (Apple Silicon + Intel) in Familiar.app, signed ad hoc (no Apple Developer account
+  # yet, so not notarized: the release notes say how to open it the first time). Familiar-<v>.dmg installs it;
+  # Familiar-<v>-macos.tar.gz is the same .app for in-app updates.
+  build-macos:
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Version
+        id: version
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$EVENT" = "push" ]; then v="${REF_NAME#v}"; else v="$INPUT_VERSION"; fi
+          if ! [[ $v =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then echo "bad version '$v'"; exit 1; fi
+          echo "value=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/native -> target
+
+      # The pinned toolchain (apps/native/rust-toolchain.toml) with both Mac targets.
+      - name: Add the Apple Silicon and Intel targets
+        working-directory: apps/native
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build native app (release, universal)
+        working-directory: apps/native
+        env:
+          FAMILIAR_VERSION: ${{ steps.version.outputs.value }}
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p target/universal
+          lipo -create -output target/universal/familiar-native \
+            target/aarch64-apple-darwin/release/familiar-native target/x86_64-apple-darwin/release/familiar-native
+          lipo -info target/universal/familiar-native
+
+      - name: Familiar.app, disk image and update archive
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          bash apps/native/dist/macos/bundle.sh apps/native/target/universal/familiar-native "$VERSION" stage
+          mkdir -p out dmg
+          cp -R stage/Familiar.app dmg/
+          ln -s /Applications dmg/Applications
+          cp "apps/native/dist/macos/First launch.txt" dmg/
+          hdiutil create -volname "Familiar $VERSION" -srcfolder dmg -fs HFS+ -format UDZO -ov "out/Familiar-$VERSION.dmg"
+          COPYFILE_DISABLE=1 tar -czf "out/Familiar-$VERSION-macos.tar.gz" -C stage Familiar.app
+          (cd out && shasum -a 256 *.dmg *.tar.gz > SHA256SUMS-macos.txt)
+          cat out/SHA256SUMS-macos.txt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos-app
+          path: out/
+          if-no-files-found: error
+
   publish:
-    needs: build-windows
+    needs: [build-windows, build-macos]
+    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      # Only the release notes' install steps (no credentials kept).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          sparse-checkout: apps/native/dist/release-notes.md
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: windows-installer
           path: out
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: macos-app
+          path: out-macos
+
+      - name: One checksum list
+        run: |
+          mv out-macos/*.dmg out-macos/*.tar.gz out/
+          cat out-macos/SHA256SUMS-macos.txt >> out/SHA256SUMS.txt
+          cat out/SHA256SUMS.txt
 
       - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: v${{ needs.build-windows.outputs.version }}
           name: Familiar ${{ needs.build-windows.outputs.version }}
           prerelease: true
+          body_path: apps/native/dist/release-notes.md
           generate_release_notes: true
           files: |
             out/*.exe
+            out/*.dmg
+            out/*.tar.gz
             out/SHA256SUMS.txt

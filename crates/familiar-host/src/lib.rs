@@ -10,6 +10,7 @@
 mod cli;
 mod embedded_db;
 mod instance;
+pub mod login_path;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -23,7 +24,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{broadcast, watch};
 use tokio_util::sync::CancellationToken;
 
-pub use cli::{CliStatus, claude_status, codex_status, open_cli_terminal, open_folder};
+pub use cli::{CLAUDE_MISSING, CliStatus, claude_found, claude_status, codex_status, open_cli_terminal, open_folder};
 pub use familiar_core::Signal;
 /// Where desktop control stands on this PC (Windows-MCP installed, being installed, uv missing...).
 pub use familiar_core::tools::{Desktop, desktop_status};
@@ -109,6 +110,7 @@ impl Host {
     pub fn start(rt: Handle) -> Host {
         // The desktop app runs for one owner on their own computer: a CRM on it may receive webhooks.
         familiar_core::crm::webhooks::set_allow_loopback(true);
+        login_path::log_outcome();
         let host = Host {
             inner: Arc::new(Inner {
                 rt,

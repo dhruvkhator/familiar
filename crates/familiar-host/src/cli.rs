@@ -52,6 +52,37 @@ pub async fn claude_status() -> CliStatus {
     }
 }
 
+/// Can this computer find Claude Code at all (the configured `claude_bin`, on the PATH as the app sees it)? A quick
+/// file check, answered once per start: the app's PATH is only read at start, so installing it means a restart.
+pub fn claude_found() -> bool {
+    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let bin = Config::load().map(|c| c.claude_bin).unwrap_or_else(|_| "claude".into());
+        program_found(&bin, std::env::var_os("PATH").as_deref())
+    })
+}
+
+/// `bin` as a path (when it names a folder) or on `path`; on Windows also with the extensions npm's shims use.
+fn program_found(bin: &str, path: Option<&std::ffi::OsStr>) -> bool {
+    let p = Path::new(bin);
+    let exts: &[&str] = if cfg!(windows) { &["", "exe", "cmd", "bat"] } else { &[""] };
+    let with = |p: &Path, ext: &str| if ext.is_empty() { p.is_file() } else { p.with_extension(ext).is_file() };
+    if p.components().count() > 1 {
+        return exts.iter().any(|e| with(p, e));
+    }
+    let dirs = path.map(|p| std::env::split_paths(p).collect::<Vec<_>>()).unwrap_or_default();
+    dirs.iter().filter(|d| d.is_absolute()).any(|d| exts.iter().any(|e| with(&d.join(bin), e)))
+}
+
+/// What to do when Claude Code can't be found, in plain words (for the first-run screen and Today).
+pub const CLAUDE_MISSING: &str = if cfg!(target_os = "macos") {
+    "Your teammates run on Claude Code. Install it (in Terminal: npm install -g @anthropic-ai/claude-code, or \
+     brew install --cask claude-code), sign in with `claude`, then quit and reopen Familiar."
+} else {
+    "Your teammates run on Claude Code. Install it (npm install -g @anthropic-ai/claude-code), sign in with `claude`, \
+     then quit and reopen Familiar."
+};
+
 /// Is the OpenAI Codex CLI installed and signed in? Bots on the `codex` engine run on that login.
 pub async fn codex_status() -> CliStatus {
     let bin = Config::load().map(|c| c.codex_bin).unwrap_or_else(|_| "codex".into());
@@ -137,5 +168,20 @@ mod tests {
         // unparseable output never blocks the user
         assert!(!codex_too_old(""));
         assert!(!codex_too_old("codex-cli dev"));
+    }
+
+    #[test]
+    fn programs_are_found_on_the_path_or_by_path() {
+        let dir = std::env::temp_dir().join(format!("familiar-cli-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = if cfg!(windows) { "claude.cmd" } else { "claude" };
+        std::fs::write(dir.join(file), b"").unwrap();
+        let path = std::env::join_paths([std::path::PathBuf::from("relative"), dir.clone()]).unwrap();
+        assert!(super::program_found("claude", Some(&path)));
+        assert!(!super::program_found("codex", Some(&path)));
+        assert!(!super::program_found("claude", None));
+        assert!(super::program_found(&dir.join("claude").display().to_string(), None));
+        assert!(!super::program_found(&dir.join("nope").display().to_string(), None));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
