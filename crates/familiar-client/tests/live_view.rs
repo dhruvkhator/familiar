@@ -59,7 +59,7 @@ async fn live_view_end_to_end() {
     u.set_path(&format!("/{db}"));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let cfg = Config { database_url: u.to_string(), host: [127, 0, 0, 1], port: 0, secret_key: None, public_url: None, web_origins: vec![], bots_dir: None };
+    let cfg = Config { database_url: u.to_string(), host: [127, 0, 0, 1], port: 0, secret_key: None, public_url: None, web_origins: vec![], bots_dir: None, google: Default::default() };
     tokio::spawn(async move { serve_listener(listener, cfg, std::future::pending()).await });
     let client = Client::new(&base, None);
     tokio::time::timeout(Duration::from_secs(60), async {
