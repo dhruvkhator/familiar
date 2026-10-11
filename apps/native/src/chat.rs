@@ -635,11 +635,12 @@ impl BotPage {
         }
     }
 
-    /// The Set up checklist's "Log in to …": show the computer on that page, with you in control.
+    /// The Set up checklist's "Log in to …": open that page in a real Chrome window with the teammate's browser profile
+    /// (the computer shows "Signing in…" until you close it).
     pub fn open_login(&mut self, url: String, window: &mut Window, cx: &mut Context<Self>) {
         self.computer_dismissed = false;
         self.set_computer(true, cx);
-        self.computer.update(cx, |c, cx| c.take_over_at(url, window, cx));
+        self.computer.update(cx, |c, cx| c.sign_in_at(Some(url), window, cx));
     }
 
     pub fn set_tab(&mut self, tab: usize, window: &mut Window, cx: &mut Context<Self>) {

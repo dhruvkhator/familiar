@@ -1,5 +1,5 @@
-//! The "Set up" checklist on the chat of a teammate hired from a template: sign in to the sites it needs (in its own
-//! browser, through the computer panel's take-over), tick each one off, choose the folder it works on (templates that
+//! The "Set up" checklist on the chat of a teammate hired from a template: sign in to the sites it needs (its own
+//! browser profile, opened as a real Chrome window on this computer), tick each one off, choose the folder it works on (templates that
 //! work on your files), and turn its schedules on. It goes away once everything is done, or when you hide it.
 
 use familiar_client::{BotPatch, Folder, Schedule, SchedulePatch, SetupPatch};
@@ -19,7 +19,7 @@ use crate::bot_settings::checkbox;
 use crate::data::{AppData, DataEvent, swr};
 use crate::templates::describe_cron;
 
-/// "Log in to …": open this page in the teammate's browser and hand the owner the controls.
+/// "Log in to …": open this page in a Chrome window with the teammate's browser profile.
 pub struct OpenLogin(pub String);
 
 pub struct SetupCard {
@@ -212,7 +212,7 @@ impl Render for SetupCard {
                 Button::new(SharedString::from(format!("setup-login-{}", l.site)), "Log in")
                     .size(ButtonSize::Small)
                     .icon(icons::MONITOR)
-                    .tooltip("Opens it in the teammate's browser and hands you the controls")
+                    .tooltip("Opens it in a Chrome window with its browser profile. Sign in there, then close the window.")
                     .on_click(move |_, _, cx| this.update(cx, |_, cx| cx.emit(OpenLogin(url.clone()))))
                     .into_any_element()
             });
@@ -231,7 +231,11 @@ impl Render for SetupCard {
                 l.done,
                 tick,
                 format!("Log in to {}", l.site),
-                if l.done { "Done. Its browser keeps you signed in.".to_owned() } else { format!("{host} · tick it off once you're in") },
+                if l.done {
+                    "Done. Its browser keeps you signed in.".to_owned()
+                } else {
+                    format!("{host} · sign in in the window, close it, then tick this off")
+                },
                 action,
                 &theme,
             ));
