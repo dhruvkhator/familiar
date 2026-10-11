@@ -1431,6 +1431,7 @@ dependencies = [
  "hmac",
  "hostname",
  "http",
+ "libc",
  "png 0.18.1",
  "reqwest",
  "rmcp",

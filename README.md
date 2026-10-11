@@ -83,11 +83,11 @@ file with `SHA256SUMS.txt` if you like.
 **Windows:** run `Familiar-<version>-setup.exe` (no admin rights needed) and open Familiar. The installer isn't
 code-signed yet, so SmartScreen may warn: choose *More info → Run anyway*.
 
-**macOS** (Apple Silicon and Intel, macOS 11+): open `Familiar-<version>.dmg` and drag Familiar into Applications.
+**macOS** (Apple Silicon and Intel, macOS 14 or later): open `Familiar-<version>.dmg` and drag Familiar into Applications.
 Familiar isn't notarized by Apple yet, so the first launch takes a few extra clicks:
 1. Open Familiar from Applications. macOS says it can't verify the app: click **Done** (not *Move to Trash*).
 2. Open **System Settings → Privacy & Security**, scroll to *Security*, and next to "Familiar was blocked" click
-   **Open Anyway**; confirm, then **Open**. (macOS 14 or earlier: Control-click Familiar → **Open** → **Open** also
+   **Open Anyway**; confirm, then **Open**. (macOS 14: Control-click Familiar → **Open** → **Open** also
    works. macOS 15 removed that shortcut.)
 3. If macOS says Familiar "is damaged and can't be opened": run
    `xattr -dr com.apple.quarantine /Applications/Familiar.app` in Terminal and open it again.

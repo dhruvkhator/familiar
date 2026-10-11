@@ -79,6 +79,10 @@ jobs:
             . -> target
       - run: cargo test --workspace
         working-directory: apps/native
+      # fish, so the login-shell PATH command is tried in it too (login_path.rs).
+      - run: brew install fish || true
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
       # The core's macOS paths (protected folders, the login-shell PATH); the root workspace's own toolchain.
       - run: cargo test -p familiar-core -p familiar-host --lib
       - run: cargo build

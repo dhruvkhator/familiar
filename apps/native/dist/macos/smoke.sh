@@ -96,6 +96,43 @@ if pgrep -f "$HOME/.familiar/pgdata" >/dev/null; then
   fail "the built-in database kept running after quit"
   pgrep -fl "$HOME/.familiar/pgdata"
 fi
+
+echo "== macOS ends the app (a quit Apple Event, as the Dock's Quit or logging out sends)"
+# AppKit exits right after applicationWillTerminate: the bounded stop must still take the database down.
+open "${envs[@]}" --stdout "$out/app2.log" --stderr "$out/app2.log" "$app" || fail "open (second start)"
+pid2=""
+for _ in $(seq 1 30); do
+  pid2=$(pgrep -f "$exe" | head -n 1)
+  [ -n "$pid2" ] && break
+  sleep 1
+done
+for _ in $(seq 1 120); do
+  pgrep -f "$HOME/.familiar/pgdata" >/dev/null && break
+  sleep 1
+done
+sleep 8
+if [ -z "$pid2" ]; then
+  fail "the app did not start again"
+else
+  osascript -e 'tell application id "dev.familiar.desktop" to quit' >"$out/osascript.log" 2>&1 &
+  osa=$!
+  if wait_exit "$osa" 30 && wait "$osa"; then
+    wait_exit "$pid2" 40 || { fail "the app did not end on a quit Apple Event"; kill -9 "$pid2"; }
+    sleep 2
+    if pgrep -f "$HOME/.familiar/pgdata" >/dev/null; then
+      fail "the built-in database outlived the app (quit Apple Event)"
+      pgrep -fl "$HOME/.familiar/pgdata"
+    else
+      echo "quit Apple Event: app and database stopped"
+    fi
+  else
+    # The runner may refuse Apple Events (Automation permission): note it and stop the app the usual way.
+    kill -9 "$osa" 2>/dev/null
+    echo "SMOKE NOTE: could not send a quit Apple Event (see osascript.log); skipped"
+    "$exe" --quit >/dev/null 2>&1
+    wait_exit "$pid2" 90 || kill -9 "$pid2"
+  fi
+fi
 cp "$HOME/.familiar/logs/"*.log "$out/" 2>/dev/null || true
 # Opened by launchd with its bare PATH: the login shell's PATH must have been taken (see login_path.rs).
 grep "PATH from" "$out/app.log" || fail "the app did not read the login shell's PATH"

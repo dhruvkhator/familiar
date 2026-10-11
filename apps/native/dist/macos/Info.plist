@@ -28,7 +28,7 @@
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>11.0</string>
+	<string>14.0</string>
 	<!-- A normal app: in the Dock and the app switcher, with the menu bar item beside it. -->
 	<key>LSUIElement</key>
 	<false/>

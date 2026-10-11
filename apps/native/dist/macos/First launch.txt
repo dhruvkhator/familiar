@@ -1,6 +1,8 @@
 Installing Familiar on a Mac
 ============================
 
+Familiar needs macOS 14 (Sonoma) or later, on Apple Silicon or Intel.
+
 1. Drag Familiar into the Applications folder (in this window).
 
 2. Open Familiar from Applications. It isn't notarized by Apple yet, so macOS says it
@@ -8,7 +10,7 @@ Installing Familiar on a Mac
 
 3. Open System Settings > Privacy & Security, scroll down to Security, and next to
    "Familiar was blocked" click Open Anyway. Confirm with your password or Touch ID,
-   then click Open. (On macOS 14 or earlier, Control-click Familiar in Applications,
+   then click Open. (On macOS 14, Control-click Familiar in Applications,
    choose Open, then Open again.)
 
 4. If macOS says Familiar "is damaged and can't be opened", open Terminal and run:

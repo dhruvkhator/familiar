@@ -304,9 +304,13 @@ fn launch_agent() -> Option<std::path::PathBuf> {
     Some(home.join("Library").join("LaunchAgents").join("dev.familiar.desktop.plist"))
 }
 
+/// On only while the LaunchAgent exists and still names an app that is there (not one moved or deleted since).
 #[cfg(target_os = "macos")]
 pub fn autostart_enabled() -> bool {
-    launch_agent().is_some_and(|p| p.is_file())
+    launch_agent()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|plist| agent_program(&plist))
+        .is_some_and(|exe| std::path::Path::new(&exe).is_file())
 }
 
 #[cfg(target_os = "macos")]
@@ -320,10 +324,31 @@ pub fn set_autostart(on: bool) -> Result<(), String> {
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_str().ok_or("the app's path is not valid text")?;
+    if !permanent_place(exe) {
+        return Err("Move Familiar to Applications first, then turn this on: right now it runs from the disk image or a                     temporary copy macOS made."
+            .into());
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     std::fs::write(&path, launch_agent_plist(exe)).map_err(|e| e.to_string())
+}
+
+/// Is the app somewhere it will still be at the next login? Not on a disk image (`/Volumes/...`) and not in the
+/// temporary copy macOS runs a downloaded app from until it is moved (App Translocation).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn permanent_place(exe: &str) -> bool {
+    !exe.starts_with("/Volumes/") && !exe.contains("/AppTranslocation/")
+}
+
+/// The program a LaunchAgent written by [`launch_agent_plist`] runs (the first `ProgramArguments` string).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn agent_program(plist: &str) -> Option<String> {
+    let rest = &plist[plist.find("<key>ProgramArguments</key>")?..];
+    let start = rest.find("<string>")? + "<string>".len();
+    let end = start + rest[start..].find("</string>")?;
+    let s = &rest[start..end];
+    Some(s.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&"))
 }
 
 /// The LaunchAgent for `exe`: run it with `--hidden` at login.
@@ -435,21 +460,25 @@ mod mac {
         drain_on_terminate(cx);
     }
 
-    /// When macOS ends the app itself (the Dock's Quit, logging out, a restart), AppKit exits inside `terminate:`:
-    /// `run` never returns to `main`, which drains the engine on other systems. Drain it here, bounded (the system
-    /// waits). The app's own Quit drains before quitting, so then there is nothing left to do.
+    /// When macOS ends the app itself (the Dock's Quit, logging out, a restart), AppKit exits right after
+    /// `applicationWillTerminate:`: `run` never returns to `main`, which drains the engine on other systems. Stop it
+    /// here, bounded: runs get a few seconds, then the API and the built-in database are always stopped (an orphaned
+    /// Postgres would block the next start). The app's own Quit drains fully before quitting; if that drain is still
+    /// going, this cuts it short the same way.
     fn drain_on_terminate(cx: &mut App) {
+        const RUN_GRACE: Duration = Duration::from_secs(6);
         let rt = gpui_tokio::Tokio::handle(cx);
         cx.on_app_quit(move |_| {
             if let Some(host) = crate::engine::HOSTED.lock().unwrap().take() {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let rt = rt.clone();
                 let drained = std::thread::Builder::new().name("familiar-drain".into()).spawn(move || {
-                    rt.block_on(host.shutdown());
+                    rt.block_on(host.shutdown_within(RUN_GRACE));
                     let _ = tx.send(());
                 });
-                if drained.is_ok() && rx.recv_timeout(Duration::from_secs(20)).is_err() {
-                    tracing::warn!("quit: the engine did not stop within 20 s");
+                // shutdown_within takes at most RUN_GRACE + ~12 s (pool 2 s, database 10 s).
+                if drained.is_ok() && rx.recv_timeout(RUN_GRACE + Duration::from_secs(14)).is_err() {
+                    tracing::warn!("quit: the engine did not stop in time");
                 }
             }
             async {}
@@ -476,5 +505,17 @@ mod tests {
         let plist = launch_agent_plist("/Applications/A & B <x>.app/Contents/MacOS/familiar-native");
         assert!(plist.contains("<string>/Applications/A &amp; B &lt;x&gt;.app/Contents/MacOS/familiar-native</string>"), "{plist}");
         assert!(plist.contains("<string>--hidden</string>"));
+        assert_eq!(agent_program(&plist).as_deref(), Some("/Applications/A & B <x>.app/Contents/MacOS/familiar-native"));
+        assert_eq!(agent_program("<plist></plist>"), None);
+    }
+
+    #[test]
+    fn start_at_login_wants_a_permanent_place() {
+        assert!(permanent_place("/Applications/Familiar.app/Contents/MacOS/familiar-native"));
+        assert!(permanent_place("/Users/me/Applications/Familiar.app/Contents/MacOS/familiar-native"));
+        assert!(!permanent_place("/Volumes/Familiar 1.0/Familiar.app/Contents/MacOS/familiar-native"));
+        assert!(!permanent_place(
+            "/private/var/folders/x/T/AppTranslocation/0A1B/d/Familiar.app/Contents/MacOS/familiar-native"
+        ));
     }
 }

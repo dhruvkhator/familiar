@@ -83,8 +83,7 @@ fn login_shell() -> PathBuf {
 fn shell_path(shell: &Path) -> Option<String> {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
-    // `printf` with the PATH as an argument works the same in sh, bash, zsh and fish.
-    let script = format!("printf '%s%s%s' {MARK} \"$PATH\" {MARK}");
+    let script = script();
     let mut child = Command::new(shell)
         .args(["-i", "-l", "-c", &script])
         .stdin(Stdio::null())
@@ -112,6 +111,13 @@ fn shell_path(shell: &Path) -> Option<String> {
     }
     let _ = child.wait();
     parse(&String::from_utf8_lossy(&out.ok()?))
+}
+
+/// What the login shell runs: `/bin/sh` prints the PATH it inherited, so the owner's shell only has to read its startup
+/// files and export PATH. Shell-neutral: single quotes are literal in sh, bash, zsh, fish and csh alike, and fish's own
+/// `"$PATH"` would join the entries with spaces.
+fn script() -> String {
+    format!("/bin/sh -c 'printf \"%s%s%s\" {MARK} \"$PATH\" {MARK}'")
 }
 
 /// The PATH between the marks, if the output has one.
@@ -175,6 +181,28 @@ mod tests {
         assert_eq!(parse("no marks here"), None);
         assert_eq!(parse(&format!("{MARK}{MARK}")), None);
         assert_eq!(parse(&format!("{MARK}/usr/bin")), None);
+        // fish: a greeting first, then what /bin/sh printed (colons, also for fish's list-valued PATH).
+        let fish = format!("Welcome to fish, the friendly interactive shell\n{MARK}/opt/homebrew/bin:/Users/me/.local/bin:/usr/bin{MARK}");
+        assert_eq!(parse(&fish).as_deref(), Some("/opt/homebrew/bin:/Users/me/.local/bin:/usr/bin"));
+    }
+
+    #[test]
+    fn the_script_is_shell_neutral() {
+        assert_eq!(script(), format!("/bin/sh -c 'printf \"%s%s%s\" {MARK} \"$PATH\" {MARK}'"));
+        assert_eq!(script().matches('\'').count(), 2, "one single-quoted argument for /bin/sh");
+    }
+
+    /// The command really works in sh (and bash/zsh where installed), the way a login shell would run it.
+    #[cfg(unix)]
+    #[test]
+    fn the_script_prints_the_path_in_every_shell() {
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh", "/opt/homebrew/bin/fish", "/usr/bin/fish"] {
+            if !Path::new(shell).exists() {
+                continue;
+            }
+            let out = std::process::Command::new(shell).args(["-c", &script()]).env("PATH", "/usr/bin:/bin").output().unwrap();
+            assert_eq!(parse(&String::from_utf8_lossy(&out.stdout)).as_deref(), Some("/usr/bin:/bin"), "{shell}");
+        }
     }
 
     #[cfg(unix)]

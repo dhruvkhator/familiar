@@ -372,6 +372,18 @@ impl Host {
     /// Quit: stop the daemon and give in-flight runs up to 35 s to record their status, stop the API, shut the
     /// built-in database down cleanly (up to 10 s), release the instance lock. Idempotent; the host cannot be restarted.
     pub async fn shutdown(&self) {
+        self.stop(Duration::from_secs(35), false).await;
+    }
+
+    /// [`Host::shutdown`] when the process is about to end regardless (macOS ending the app): in-flight runs get only
+    /// `runs`, then the API and the built-in database are always stopped, so no orphaned Postgres keeps
+    /// `postmaster.pid` for the next start. At most `runs` + ~12 s.
+    pub async fn shutdown_within(&self, runs: Duration) {
+        self.stop(runs, true).await;
+    }
+
+    /// `bounded`: closing the database pool may take 2 s at most.
+    async fn stop(&self, runs: Duration, bounded: bool) {
         self.inner.stopping.cancel();
         let (token, task) = {
             let mut d = self.inner.daemon.lock().unwrap();
@@ -381,11 +393,15 @@ impl Host {
             t.cancel();
         }
         if let Some(task) = task {
-            let _ = tokio::time::timeout(Duration::from_secs(35), task).await;
+            let _ = tokio::time::timeout(runs, task).await;
         }
         self.inner.api_stop.cancel();
         if let Some(pool) = self.inner.pool.get() {
-            pool.close().await;
+            if bounded {
+                let _ = tokio::time::timeout(Duration::from_secs(2), pool.close()).await;
+            } else {
+                pool.close().await;
+            }
         }
         if let Some(pg) = self.inner.pg.lock().await.take() {
             let _ = tokio::time::timeout(Duration::from_secs(10), pg.stop()).await;

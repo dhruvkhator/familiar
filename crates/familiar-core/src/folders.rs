@@ -112,6 +112,9 @@ pub fn check(raw: &str, env: &Env) -> Result<PathBuf, String> {
         return Err("That's a file; pick a folder.".into());
     }
     let real = simplify(&real).ok_or("Network folders can't be shared; pick a folder on this PC.")?;
+    if network_mount(&real) {
+        return Err("Network folders can't be shared; pick a folder on this PC.".into());
+    }
     match refusal(&real, env) {
         Some(why) => Err(format!("Familiar won't share this folder: {why}.")),
         None => Ok(real),
@@ -141,7 +144,9 @@ fn refusal(c: &Path, env: &Env) -> Option<String> {
         // C:\Users\<someone else>: only when the home folder's parent isn't a drive root (`/root` on Linux).
         let home_path = real(&env.home);
         if let Some(users) = home_path.parent().filter(|p| p.parent().is_some()) {
-            if within(&k, &key(users)) && !within(&k, &home) {
+            // macOS's /Users/Shared is for every user of the Mac, not someone else's.
+            let shared = cfg!(target_os = "macos") && within(&k, &key(&users.join("Shared")));
+            if within(&k, &key(users)) && !within(&k, &home) && !shared {
                 return Some("it's another user's folder".into());
             }
         }
@@ -299,6 +304,28 @@ fn resolve(p: &Path) -> Option<PathBuf> {
     }
 }
 
+/// macOS: is `p` on a network share (SMB, AFP, NFS, WebDAV...)? They mount under `/Volumes` like any disk, so the
+/// file system says: not local (`MNT_LOCAL` unset) or a network type. A path it can't read is not refused here (the
+/// folder was just resolved, so that doesn't happen in practice).
+#[cfg(target_os = "macos")]
+fn network_mount(p: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else { return true };
+    // SAFETY: `c` is a NUL-terminated path and `fs` a zeroed struct statfs that the call fills in.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
+        return false;
+    }
+    // SAFETY: the kernel NUL-terminates f_fstypename within its 16 bytes.
+    let kind = unsafe { std::ffi::CStr::from_ptr(fs.f_fstypename.as_ptr()) }.to_string_lossy().to_lowercase();
+    fs.f_flags & (libc::MNT_LOCAL as u32) == 0 || matches!(kind.as_str(), "smbfs" | "afpfs" | "nfs" | "webdav" | "cifs" | "ftp")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn network_mount(_p: &Path) -> bool {
+    false
+}
+
 /// macOS mounts every other disk (and `/Volumes` itself holds them all) under `/Volumes`: sharing one is sharing a
 /// whole drive.
 fn is_volume(c: &Path) -> bool {
@@ -309,7 +336,9 @@ fn is_volume(c: &Path) -> bool {
 }
 
 /// The comparable form of a path: separators unified, no trailing separator, lowercase where file names ignore case
-/// (Windows, and macOS's default disks: `~/library` is `~/Library` there).
+/// (Windows, and macOS's default disks: `~/library` is `~/Library` there). Plain `to_lowercase` is enough: both
+/// sides are canonicalised first (so the same folder spells the same way, in the same Unicode form), and the protected
+/// names are ASCII; on a case-sensitive disk it only makes the check stricter.
 fn key(p: &Path) -> String {
     let s = p.to_string_lossy();
     let s = s.strip_prefix(r"\\?\").unwrap_or(&s);
@@ -439,6 +468,11 @@ mod tests {
             assert!(e.contains(why), "{rel}: {e}");
         }
         assert!(check("/Volumes", &f.env).unwrap_err().contains("whole drive"));
+        // Local disks are not network shares; /Users/Shared belongs to every user.
+        assert!(!network_mount(&f.root) && !network_mount(Path::new("/")));
+        std::fs::create_dir_all(f.root.join("Users/Shared/Projects")).unwrap();
+        assert!(f.check("Users/Shared/Projects").is_ok());
+        assert!(f.check("Users/other/Documents").unwrap_err().contains("another user's folder"));
         let real = Env::current(&f.env.bots_dir);
         for p in ["/System/Library", "/Applications", "/private/etc", "/tmp", "/usr/local"] {
             assert!(check(p, &real).is_err(), "{p}");

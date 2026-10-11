@@ -145,9 +145,13 @@ fn main() {
     if let Some(code) = updates::apply::run_if_helper() {
         std::process::exit(code);
     }
-    // macOS: an app opened from Finder or the Dock gets the login shell's PATH (claude, node...). Before any thread.
-    familiar_host::login_path::adopt();
+    // `--version` prints and exits inside parse_args.
     let args = parse_args();
+    // macOS: an app opened from Finder or the Dock gets the login shell's PATH (claude, node...). Before any thread;
+    // `--quit` only nudges the running copy and needs none.
+    if !args.quit {
+        familiar_host::login_path::adopt();
+    }
     // One copy per user: a second launch shows the running window and exits. The gallery and the bench run beside it.
     let nudge = if args.quit { desktop::Nudge::Quit } else { desktop::Nudge::Show };
     let nudges = match (!args.gallery && !args.bench).then(|| desktop::single_instance(nudge)) {
