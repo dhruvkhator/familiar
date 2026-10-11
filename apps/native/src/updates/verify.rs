@@ -293,6 +293,26 @@ mod tests {
         assert!(verify_artifact(GOOD_EXE, GOOD_EXE_SIG, &key, "Familiar-9.9.9-setup.exe", &v("9.9.9"), e).is_err());
     }
 
+    /// `FAMILIAR_VERIFY_DIR=<a downloaded release's files> cargo test verify_release_dir -- --ignored --nocapture`:
+    /// check a real release with the compiled-in key, as the app does.
+    #[test]
+    #[ignore = "checks the release in FAMILIAR_VERIFY_DIR"]
+    fn verify_release_dir() {
+        let dir = std::path::PathBuf::from(std::env::var_os("FAMILIAR_VERIFY_DIR").expect("set FAMILIAR_VERIFY_DIR"));
+        let bytes = std::fs::read(dir.join(MANIFEST)).unwrap();
+        let sig = std::fs::read(dir.join(format!("{MANIFEST}{SIG_EXT}"))).unwrap();
+        let claimed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let version = parse_version(claimed["version"].as_str().unwrap()).unwrap();
+        let m = verify_manifest(&bytes, &sig, &release_key(), &version).unwrap();
+        println!("manifest {version} ok; notes:\n{}", plain_notes(&m.notes));
+        for (name, entry) in &m.files {
+            let file = std::fs::File::open(dir.join(name)).unwrap();
+            let sig = std::fs::read(dir.join(format!("{name}{SIG_EXT}"))).unwrap();
+            verify_artifact(std::io::BufReader::new(file), &sig, &release_key(), name, &version, entry).unwrap();
+            println!("{name} ok");
+        }
+    }
+
     #[test]
     fn a_signed_manifest_parses() {
         let m = good();

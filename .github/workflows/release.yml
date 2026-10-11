@@ -149,10 +149,10 @@ jobs:
 
   # Signs every artifact for in-app updates (scripts/sign-release.mjs, the key in the FAMILIAR_UPDATE_KEY secret; the
   # app only installs files signed by it), writes the signed manifest (familiar-update.json: version, what's new, each
-  # file's size and SHA-256) and the checksum list, and publishes. Every build job's artifacts are picked up.
+  # file's size and SHA-256) and the checksum list, and publishes. Every build job's artifacts are picked up. A dry run
+  # signs too (so the key and the script are checked) and keeps the signed files in the run instead of publishing.
   publish:
     needs: [build-windows, build-macos]
-    if: ${{ !inputs.dry_run }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -204,7 +204,15 @@ jobs:
           node scripts/sign-release.mjs --version "$VERSION" --dir release --pubkey apps/native/dist/familiar-update.pub --notes whats-new.md
           cat release/SHA256SUMS.txt
 
-      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+      - if: ${{ inputs.dry_run }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-release
+          path: release/
+          if-no-files-found: error
+
+      - if: ${{ !inputs.dry_run }}
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: v${{ needs.build-windows.outputs.version }}
           name: Familiar ${{ needs.build-windows.outputs.version }}

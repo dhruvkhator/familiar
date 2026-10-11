@@ -453,6 +453,16 @@ mod tests {
         assert_eq!(retry_after(&h), Duration::from_secs(60));
     }
 
+    /// `cargo test live_release_list -- --ignored`: the real list, through the real client (TLS, redirects, parsing).
+    #[tokio::test]
+    #[ignore = "network: GitHub's real release list"]
+    async fn live_release_list_parses() {
+        let s = Source::github();
+        let http = s.client().unwrap();
+        let Ok(releases) = list(&http, &s, &Mutex::default()).await else { panic!("couldn't list releases") };
+        assert!(releases.iter().any(|r| verify::tag_version(&r.tag_name).is_some()));
+    }
+
     #[test]
     fn the_github_client_refuses_plain_http() {
         let s = Source::github();
