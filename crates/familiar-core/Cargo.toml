@@ -36,6 +36,14 @@ hmac = "0.13.0"
 sha2 = "0.11.0"
 hex = "0.4.3"
 familiar-crypto = { version = "0.1.0", path = "../familiar-crypto" }
+# Connected accounts (src/google): Gmail with an app password over IMAP (async-imap) and SMTP (lettre), implicit TLS
+# with rustls (ring) and the platform verifier on Windows and macOS; mail-parser reads untrusted mail.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false }
+rustls-platform-verifier = "0.7"
+async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "rustls-platform-verifier"] }
+mail-parser = "0.11"
 # The approval card's small picture of the screen around a desktop step's target.
 png = "0.18.1"
 

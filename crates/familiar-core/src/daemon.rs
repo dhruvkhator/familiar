@@ -70,6 +70,8 @@ pub struct Ctx {
     /// Desktop control is offered only when the daemon runs inside the app ([`run_with_signals`]), which shows who is
     /// using the desktop and can stop it from the tray.
     pub desktop_ui: bool,
+    /// The owner's connected Gmail / Calendar: settings, access tokens (memory only), per-run limits.
+    pub google: Arc<crate::google::State>,
 }
 
 impl Ctx {
@@ -122,6 +124,7 @@ async fn serve(cfg: Config, shutdown: CancellationToken, signals: broadcast::Sen
         None => None,
     };
     let (mcp_listener, mcp_url) = mcp::bind().await?;
+    let google = Arc::new(crate::google::State::new(crate::google::Settings::from_config(&cfg)));
     let ctx = Ctx {
         db: Db { pool: pool.clone(), owner },
         cfg: Arc::new(cfg),
@@ -134,6 +137,7 @@ async fn serve(cfg: Config, shutdown: CancellationToken, signals: broadcast::Sen
         secrets,
         desktop: Arc::default(),
         desktop_ui,
+        google,
     };
     mcp::serve(mcp_listener, ctx.clone(), shutdown.clone());
     tokio::spawn(crate::tools::ensure_playwright());

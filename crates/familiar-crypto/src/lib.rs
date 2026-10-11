@@ -23,6 +23,11 @@ impl SecretBox {
         STANDARD.encode(rand::random::<[u8; 32]>())
     }
 
+    /// 32 bytes from a cryptographically secure generator (OAuth state and PKCE verifiers).
+    pub fn random_32() -> [u8; 32] {
+        rand::random::<[u8; 32]>()
+    }
+
     pub fn encrypt(&self, plain: &str) -> Result<String> {
         let nonce: [u8; 12] = rand::random();
         let ct = self.0.encrypt(&Nonce::from(nonce), plain.as_bytes()).map_err(|e| anyhow!("encrypt: {e}"))?;

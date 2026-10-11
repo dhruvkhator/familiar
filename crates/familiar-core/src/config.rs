@@ -52,6 +52,47 @@ pub struct Config {
     /// it off so they never read the screen).
     #[serde(default = "default_true")]
     pub desktop_previews: bool,
+    /// Connected accounts (Integrations → Accounts): Familiar's Google OAuth client and the Gmail servers. Release
+    /// builds carry the client (`FAMILIAR_GOOGLE_CLIENT_ID` / `_SECRET` at build time); `[google]` overrides it for
+    /// self-builders. See docs/google-oauth-setup.md.
+    #[serde(default)]
+    pub google: Option<GoogleConfig>,
+}
+
+/// `[google]` in config.toml. Everything is optional; the endpoints are for tests (they must be https, or http on
+/// this computer).
+#[derive(Clone, Default, Deserialize)]
+pub struct GoogleConfig {
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// A desktop app's client secret is not confidential (Google says so); it is still never logged.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub auth_url: Option<String>,
+    #[serde(default)]
+    pub token_url: Option<String>,
+    #[serde(default)]
+    pub revoke_url: Option<String>,
+    #[serde(default)]
+    pub gmail_url: Option<String>,
+    #[serde(default)]
+    pub calendar_url: Option<String>,
+    /// `host:port` of the IMAP server (implicit TLS), default `imap.gmail.com:993`.
+    #[serde(default)]
+    pub imap: Option<String>,
+    /// `host:port` of the SMTP server (implicit TLS), default `smtp.gmail.com:465`.
+    #[serde(default)]
+    pub smtp: Option<String>,
+    /// A PEM file with one more certificate authority to trust for IMAP/SMTP (tests' own CA).
+    #[serde(default)]
+    pub tls_root_pem: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for GoogleConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleConfig").field("client_id", &self.client_id).field("client_secret", &"…").finish_non_exhaustive()
+    }
 }
 
 fn default_true() -> bool {

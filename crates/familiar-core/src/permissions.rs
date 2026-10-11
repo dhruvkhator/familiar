@@ -76,6 +76,8 @@ pub fn editable_field(tool: &str, input: &Value) -> Option<&'static str> {
         "Bash" => "command",
         "Write" => "content",
         "mcp__browser__browser_type" => "text",
+        // Familiar's Gmail tools: the text only (who it goes to is approved as shown).
+        "mcp__familiar__gmail_send" | "mcp__familiar__gmail_draft" => "body",
         // Desktop steps are approved exactly as shown.
         t if t.starts_with("mcp__desktop__") => return None,
         t if t.starts_with("mcp__") && !t.starts_with("mcp__browser__") && !t.starts_with("mcp__familiar__") => {
@@ -105,6 +107,10 @@ const WRITE_WORDS: &[&str] = &[
 pub fn always_allow_rule(tool: &str, input: &Value) -> Option<String> {
     if always_human(tool, input).is_some() || !tool.is_ascii() || tool.contains(['(', ')', '*', ' ']) {
         return None;
+    }
+    // A Gmail draft stays in the owner's own Drafts until they send it themselves (do-not-contact is checked first).
+    if tool == "mcp__familiar__gmail_draft" {
+        return Some(tool.to_owned());
     }
     let server_tool = tool.strip_prefix("mcp__")?;
     let (server, action) = server_tool.split_once("__")?;
@@ -154,6 +160,35 @@ const FAMILIAR_ALLOWED: &[&str] = &[
     "mcp__browser__browser_resize",
     "mcp__browser__browser_close",
 ];
+
+/// How Familiar's own Gmail and Calendar tools ([`crate::google::tools`]) are allowed. The whole `mcp__familiar`
+/// server is pre-allowed for the engines (above), so these classes are enforced inside the tools themselves, which
+/// works the same for Claude and Codex: every one first checks that the owner linked this teammate to the account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoogleAccess {
+    /// Only reads: allowed for a linked teammate, but not in research-only runs (they fetch any page without asking,
+    /// which could carry mail out). What it returns is fenced as untrusted.
+    Read,
+    /// Acts as the owner (drafts in their mailbox, sends, invitations): asks through [`crate::runner::decide_tool`]
+    /// like any send (owner deny rules, an approved draft's one exact send, allow rules, auto-review, the owner), after
+    /// the do-not-contact check; research-only runs are refused.
+    Ask,
+}
+
+pub const GOOGLE_READ_TOOLS: &[&str] = &["gmail_search", "gmail_read", "calendar_list"];
+pub const GOOGLE_ASK_TOOLS: &[&str] = &["gmail_draft", "gmail_send", "calendar_create"];
+
+/// The class of one of Familiar's Google tools (`mcp__familiar__gmail_send` or `gmail_send`), else None.
+pub fn google_access(tool: &str) -> Option<GoogleAccess> {
+    let name = tool.strip_prefix("mcp__familiar__").unwrap_or(tool);
+    if GOOGLE_READ_TOOLS.contains(&name) {
+        Some(GoogleAccess::Read)
+    } else if GOOGLE_ASK_TOOLS.contains(&name) {
+        Some(GoogleAccess::Ask)
+    } else {
+        None
+    }
+}
 
 /// Browser navigation to a public http(s) page is allowed without asking; anything else (file://, loopback,
 /// private networks, odd schemes) goes to the owner. Async because a public-looking name can still resolve to a
@@ -501,6 +536,28 @@ mod tests {
                   "mcp__x__update_get", "mcp__familiar__propose_draft", "mcp__familiar__remember", "mcp__familiar__get_x",
                   "propose_draft", "ask_user", "Bash(ls)", "mcp__github__getIssue(x)", "mcp____get_x", "mcp__github"] {
             assert_eq!(always_allow_rule(t, &json!({ "command": "ls", "file_path": ".claude/settings.json" })), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn google_tools_are_classified() {
+        for t in ["gmail_search", "mcp__familiar__gmail_read", "mcp__familiar__calendar_list"] {
+            assert_eq!(google_access(t), Some(GoogleAccess::Read), "{t}");
+        }
+        for t in ["mcp__familiar__gmail_send", "gmail_draft", "mcp__familiar__calendar_create"] {
+            assert_eq!(google_access(t), Some(GoogleAccess::Ask), "{t}");
+        }
+        for t in ["mcp__google__gmail_send", "mcp__familiar__remember", "gmail_delete", "Bash"] {
+            assert_eq!(google_access(t), None, "{t}");
+        }
+        // the owner may edit only the text of an email; an event is approved as shown
+        assert_eq!(editable_field("mcp__familiar__gmail_send", &json!({ "to": "a@b.io", "body": "hi" })), Some("body"));
+        assert_eq!(editable_field("mcp__familiar__gmail_draft", &json!({ "to": "a@b.io", "body": "hi" })), Some("body"));
+        assert_eq!(editable_field("mcp__familiar__calendar_create", &json!({ "summary": "x" })), None);
+        // "Always allow" only for drafts (the owner sends those themselves), never for a send or an invitation
+        assert_eq!(always_allow_rule("mcp__familiar__gmail_draft", &json!({})).as_deref(), Some("mcp__familiar__gmail_draft"));
+        for t in ["mcp__familiar__gmail_send", "mcp__familiar__calendar_create", "mcp__familiar__gmail_search"] {
+            assert_eq!(always_allow_rule(t, &json!({})), None, "{t}");
         }
     }
 

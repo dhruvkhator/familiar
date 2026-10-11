@@ -131,6 +131,8 @@ async fn execute_inner(ctx: &Ctx, run: &Run, bot: &Bot, cancel: &CancellationTok
         send(events, "status", json!({ "state": "folder_skipped", "path": path, "reason": why }));
     }
     notes.extend(folders::note(&shared, &skipped));
+    // The owner's Gmail, when they let this teammate use it (Familiar's gmail_* / calendar_* tools).
+    notes.extend(crate::google::tools::note(ctx, bot.id).await);
     // This PC's desktop: only for a teammate the owner allowed, in the app, on Windows, never in research-only runs.
     let desktop_exe = match desktop_ready(ctx, bot, run) {
         Some(Ok(exe)) => {

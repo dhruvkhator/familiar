@@ -90,8 +90,8 @@ pub fn decision_message(
             );
             out.push_str(match (grantable(final_), final_["kind"] == "email") {
                 (true, true) => {
-                    " Your owner won't be asked again for one send of exactly this: an email through your email \
-                     connector to exactly these recipients with this subject (no cc, bcc or attachments), or typing \
+                    " Your owner won't be asked again for one send of exactly this: an email through Familiar's \
+                     gmail_send or your email connector to exactly these recipients with this subject (no cc, bcc or attachments), or typing \
                      exactly this text into the browser (the click that sends it still asks them). Anything different \
                      asks.\n\n"
                 }
@@ -253,8 +253,8 @@ pub struct EmailTool {
     pub action: &'static str,
     /// Must be absent or empty (null, false, "", []): more recipients, attachments, an HTML version of the text.
     pub empty: &'static [&'static str],
-    /// (field, its one allowed value): the text goes out as plain text.
-    pub plain: (&'static str, &'static str),
+    /// (field, its one allowed value): the text goes out as plain text (None: the tool only sends plain text).
+    pub plain: Option<(&'static str, &'static str)>,
     /// Strings that change neither who gets the email nor what it says: the sending account (one the owner connected)
     /// and threading headers.
     pub free: &'static [&'static str],
@@ -266,19 +266,26 @@ pub const EMAIL_TOOLS: &[EmailTool] = &[
     EmailTool {
         action: "send_gmail_message",
         empty: &["cc", "bcc", "attachments"],
-        plain: ("body_format", "plain"),
+        plain: Some(("body_format", "plain")),
         free: &["user_google_email", "thread_id", "in_reply_to", "references"],
     },
     // The Gmail MCP server (`@gongrzhe/server-gmail-autoauth-mcp`): `to`, `cc`, `bcc` are lists.
     EmailTool {
         action: "send_email",
         empty: &["cc", "bcc", "attachments", "htmlBody"],
-        plain: ("mimeType", "text/plain"),
+        plain: Some(("mimeType", "text/plain")),
         free: &["threadId", "inReplyTo"],
     },
 ];
 
+/// Familiar's own Gmail send ([`crate::google::tools`]): plain text always, `reply_to_id` only threads it.
+pub const FAMILIAR_GMAIL_SEND: &str = "mcp__familiar__gmail_send";
+const FAMILIAR_GMAIL: EmailTool = EmailTool { action: "gmail_send", empty: &["cc", "bcc"], plain: None, free: &["reply_to_id"] };
+
 fn email_tool(tool: &str) -> Option<&'static EmailTool> {
+    if tool == FAMILIAR_GMAIL_SEND {
+        return Some(&FAMILIAR_GMAIL);
+    }
     let (server, action) = tool.strip_prefix("mcp__")?.split_once("__")?;
     if server.is_empty() || matches!(server, "browser" | "familiar" | crate::desktop::SERVER) {
         return None;
@@ -403,8 +410,8 @@ pub fn send_matches(draft: &Value, tool: &str, input: &Value) -> Result<Via, &'s
             "body" => return Err("the text differs from the approved one"),
             k if spec.empty.contains(&k) && blank(v) => {}
             k if spec.empty.contains(&k) => return Err("it adds recipients, attachments or an HTML version"),
-            k if k == spec.plain.0 && (v.is_null() || v.as_str() == Some(spec.plain.1)) => {}
-            k if k == spec.plain.0 => return Err("it isn't sent as plain text"),
+            k if spec.plain.is_some_and(|p| p.0 == k) && (v.is_null() || v.as_str() == spec.plain.map(|p| p.1)) => {}
+            k if spec.plain.is_some_and(|p| p.0 == k) => return Err("it isn't sent as plain text"),
             k if spec.free.contains(&k) && (v.is_null() || v.as_str().is_some_and(header_safe)) => {}
             k if spec.free.contains(&k) => return Err("a header field has line breaks or other control characters"),
             _ => return Err("this call has fields Familiar doesn't check"),
@@ -679,6 +686,31 @@ mod tests {
     }
 
     #[test]
+    fn familiars_own_gmail_send_matches_only_exactly() {
+        const T: &str = FAMILIAR_GMAIL_SEND;
+        let own = |f: &dyn Fn(&mut Value)| {
+            let mut g = json!({ "to": "sam@acme.com, Sam Lee <kim@acme.com>", "subject": "Quick question", "body": email()["body"] });
+            g["to"] = json!("kim@acme.com, Sam Lee <sam@acme.com>");
+            f(&mut g);
+            send_matches(&email(), T, &g)
+        };
+        assert_eq!(own(&|_| {}), Ok(Via::Email));
+        // threading is free (it is checked as an id by the tool), an empty cc/bcc is nothing
+        assert_eq!(own(&|g| { g["reply_to_id"] = json!("18c2f0a1b2c3d4e5"); g["cc"] = json!(""); }), Ok(Via::Email));
+        assert_eq!(own(&|g| g["bcc"] = json!("eve@evil.io")), Err("it adds recipients, attachments or an HTML version"));
+        assert_eq!(own(&|g| g["cc"] = json!("eve@evil.io")), Err("it adds recipients, attachments or an HTML version"));
+        assert_eq!(own(&|g| g["to"] = json!("sam@acme.com")), Err("the recipients differ from the approved ones"));
+        assert_eq!(own(&|g| g["subject"] = json!("Quick question?")), Err("the subject differs from the approved one"));
+        assert_eq!(own(&|g| g["body"] = json!("Hi")), Err("the text differs from the approved one"));
+        assert_eq!(own(&|g| g["reply_to_id"] = json!("x\r\nBcc: eve@evil.io")), Err("a header field has line breaks or other control characters"));
+        assert_eq!(own(&|g| g["body_format"] = json!("html")), Err("this call has fields Familiar doesn't check"));
+        // only this one Familiar tool counts
+        let g = json!({ "to": "sam@acme.com, kim@acme.com", "subject": "Quick question", "body": email()["body"] });
+        assert!(send_matches(&email(), "mcp__familiar__gmail_draft", &g).is_err());
+        assert!(send_matches(&email(), "mcp__familiar__send_email", &g).is_err());
+    }
+
+    #[test]
     fn typing_the_approved_text_in_the_browser() {
         let post = json!({ "kind": "post", "channel": "X", "body": "Drafts ship today." });
         let typed = |v: Value| send_matches(&post, BROWSER_TYPE, &v);
@@ -718,7 +750,7 @@ mod tests {
         assert!(m.contains("won't be asked again for typing exactly this text into the browser, once") && m.contains("the click that posts or sends it still asks"), "{m}");
         assert!(!m.contains("email connector"), "{m}");
         let m = decision_message(id(), "approved", None, &email(), None, None).unwrap();
-        assert!(m.contains("won't be asked again for one send of exactly this: an email through your email connector"), "{m}");
+        assert!(m.contains("won't be asked again for one send of exactly this: an email through Familiar's gmail_send or your email connector"), "{m}");
         let mut with_media = proposed.clone();
         with_media["media"] = json!(["media/a.png"]);
         let m = decision_message(id(), "approved", None, &with_media, None, None).unwrap();

@@ -73,6 +73,11 @@ impl Fence {
         json!(format!("<{t}>{s}</{t}>", t = self.tag))
     }
 
+    /// One fenced string (for answers built field by field, such as mail).
+    pub fn text(&self, s: &str) -> Value {
+        self.wrap(s)
+    }
+
     /// Fence every free-text value in `v` (records, lists of records, nested answers).
     pub fn apply(&self, v: &Value) -> Value {
         self.value(None, v)
@@ -344,6 +349,12 @@ fn profile_key(s: &str) -> Option<String> {
 pub fn dnc_hit<'a>(text: &str, list: &'a [DncContact]) -> Option<&'a DncContact> {
     let mut keys: BTreeSet<String> = BTreeSet::new();
     keys.extend(handle_key(text));
+    // Whole addresses first, before the finer split below cuts one at a `'` (o'brien@…) or a quote.
+    for part in text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';')) {
+        if let Some(e) = email_key(part.trim_matches(['<', '>', '"', '(', ')', '[', ']'])) {
+            keys.insert(format!("e:{e}"));
+        }
+    }
     let tokens = text.split(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '<' | '>' | '(' | ')' | '"' | '\'' | '[' | ']'));
     for token in tokens {
         let t = token.trim_end_matches(['.', ',', ':', ';', '!', '?']);
@@ -1005,6 +1016,9 @@ mod tests {
             dnc(GIL, Some("Gil.Bert+news@GoogleMail.com."), None, Some("https://www.linkedin.com/in/j%C3%BCrgen")),
         ];
         let hit = |to: &str| dnc_hit(to, &list).map(|c| c.id);
+        // an address with a quote in it is matched whole
+        let obrien = vec![dnc(SAM, Some("o'brien@acme.com"), None, None)];
+        assert_eq!(dnc_hit("O'Brien <o'brien@acme.com>, kim@acme.com", &obrien).map(|c| c.id), Some(SAM));
         for to in [
             "sam@acme.com", " SAM@ACME.COM ", "Sam Lee <sam@acme.com>", "a@b.com, sam@acme.com", "mailto:sam@acme.com",
             "mailto:sam@acme.com?subject=hi", "sam+sales@acme.com", "sam@acme.com.", "s\u{200B}am@acme.com", "sam@acme.com\u{2060}",

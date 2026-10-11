@@ -10,6 +10,7 @@ pub mod db;
 pub mod desktop;
 pub mod drafts;
 pub mod folders;
+pub mod google;
 pub mod mcp;
 pub mod models;
 pub mod permissions;
