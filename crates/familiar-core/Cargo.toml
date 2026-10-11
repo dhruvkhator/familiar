@@ -44,6 +44,8 @@ rustls-platform-verifier = "0.7"
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "ring", "rustls-platform-verifier"] }
 mail-parser = "0.11"
+# Opened secrets (refresh tokens, app passwords, access tokens) are wiped from memory when dropped.
+zeroize = "1"
 # The approval card's small picture of the screen around a desktop step's target.
 png = "0.18.1"
 

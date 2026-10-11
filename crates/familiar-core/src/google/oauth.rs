@@ -48,8 +48,12 @@ pub fn pkce() -> Pkce {
 
 /// Google's sign-in page for this client: offline access (a refresh token), the consent screen every time (so a
 /// refresh token always comes back), PKCE and `state`.
-pub fn auth_url(client: &OAuthClient, redirect_uri: &str, state: &str, challenge: &str) -> String {
+/// `login_hint`: the address already connected, when the owner connects again.
+pub fn auth_url(client: &OAuthClient, redirect_uri: &str, state: &str, challenge: &str, login_hint: Option<&str>) -> String {
     let mut u = url::Url::parse(&client.auth_url).expect("checked endpoint");
+    if let Some(hint) = login_hint {
+        u.query_pairs_mut().append_pair("login_hint", hint);
+    }
     u.query_pairs_mut()
         .append_pair("client_id", &client.client_id)
         .append_pair("redirect_uri", redirect_uri)
@@ -365,7 +369,7 @@ mod tests {
 
     #[test]
     fn the_sign_in_url_asks_for_exactly_what_is_needed() {
-        let u = url::Url::parse(&auth_url(&client(), "http://127.0.0.1:5555/", "st", "ch")).unwrap();
+        let u = url::Url::parse(&auth_url(&client(), "http://127.0.0.1:5555/", "st", "ch", None)).unwrap();
         let q: std::collections::HashMap<_, _> = u.query_pairs().into_owned().collect();
         assert_eq!(u.host_str(), Some("accounts.google.com"));
         assert_eq!(q["redirect_uri"], "http://127.0.0.1:5555/");

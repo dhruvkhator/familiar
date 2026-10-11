@@ -92,7 +92,12 @@ pub async fn connect(State(st): State<S>, a: Auth) -> R<(StatusCode, Json<Value>
     let pkce = oauth::pkce();
     let state = google::random_token();
     let redirect = loopback.redirect_uri.clone();
-    let auth_url = oauth::auth_url(&client, &redirect, &state, &pkce.challenge);
+    // Connecting again: Google preselects the account already connected.
+    let hint: Option<String> = sqlx::query_scalar("select email from accounts where owner_id = $1 and kind = 'google'")
+        .bind(a.user)
+        .fetch_optional(&st.pool)
+        .await?;
+    let auth_url = oauth::auth_url(&client, &redirect, &state, &pkce.challenge, hint.as_deref());
     let id = Uuid::new_v4();
     let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
     {

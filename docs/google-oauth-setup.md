@@ -17,11 +17,10 @@ Calendar). See [the end of this page](#gmail-with-an-app-password-no-google-clou
 1. **APIs & Services → OAuth consent screen** → **Get started**.
 2. App name `Familiar`, user support email: yours → **Next**.
 3. Audience: **External** → **Next**. Contact email: yours → **Next** → agree → **Create**.
-4. **Data Access** → **Add or remove scopes** → paste these four into "Manually add scopes" → **Add to table** →
+4. **Data Access** → **Add or remove scopes** → paste these three into "Manually add scopes" → **Add to table** →
    **Update** → **Save**:
    ```
    https://www.googleapis.com/auth/gmail.readonly
-   https://www.googleapis.com/auth/gmail.send
    https://www.googleapis.com/auth/gmail.compose
    https://www.googleapis.com/auth/calendar.events
    ```

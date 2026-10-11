@@ -8,6 +8,9 @@ use crate::db::Rule;
 /// because read-only tools never reach the permission prompt.
 pub const RESEARCH_TOOLS: &[&str] = &["Read", "Glob", "Grep", "WebSearch", "WebFetch"];
 
+/// The nightly dream: it reviews conversations (which may hold mail), so no web at all.
+pub const DREAM_TOOLS: &[&str] = &["Read", "Glob", "Grep"];
+
 /// Built-in tools for normal runs. Anything that writes or executes still needs approval.
 pub const FULL_TOOLS: &[&str] = &["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch", "TodoWrite", "Skill"];
 
@@ -15,7 +18,8 @@ pub const FULL_TOOLS: &[&str] = &["Bash", "Read", "Write", "Edit", "Glob", "Grep
 /// Owner `allow` rules are *not* forwarded: every such call reaches the daemon, which re-reads the rules on each
 /// decision (a rule the owner adds or removes counts at once, even in a running session), checks deny rules and
 /// [`always_human`] first, and only then applies the owner's allow rules ([`owner_allows`]). `review` rules go in as
-/// `ask` so they reach us too. Research-only runs may fetch any page (every prompt in them is denied anyway).
+/// `ask` so they reach us too. `research`: a research-only run may fetch any page (every prompt in it is denied
+/// anyway); the caller passes false when its conversation read the owner's mail.
 pub fn settings(rules: &[Rule], research: bool) -> Value {
     let mut allow: Vec<&str> = FAMILIAR_ALLOWED.to_vec();
     let mut deny: Vec<&str> = vec![];
@@ -149,7 +153,8 @@ fn read_only_action(action: &str) -> bool {
 /// [`safe_navigation`] so the browser can't be pointed at local files or services.
 const FAMILIAR_ALLOWED: &[&str] = &[
     "mcp__familiar",
-    "WebSearch",
+    // Not WebSearch: it reaches the callback so a conversation that read mail can ask (`runner::decide_tool` allows it
+    // otherwise).
     "mcp__browser__browser_navigate_back",
     "mcp__browser__browser_snapshot",
     "mcp__browser__browser_find",
@@ -187,6 +192,30 @@ pub fn google_access(tool: &str) -> Option<GoogleAccess> {
         Some(GoogleAccess::Ask)
     } else {
         None
+    }
+}
+
+/// Tools that can carry data to the internet: web search and fetch, the browser's navigating and typing (a form can
+/// post), shell commands, and any connector's tools. In a conversation that read the owner's mail
+/// ([`crate::db::Db::mail_read`]) they always ask the owner, since an email may have planted instructions to carry
+/// the mail out.
+pub fn reaches_network(tool: &str) -> bool {
+    if matches!(
+        tool,
+        "WebSearch"
+            | "WebFetch"
+            | "Bash"
+            | "mcp__browser__browser_navigate"
+            | "mcp__browser__browser_type"
+            | "mcp__browser__browser_fill_form"
+            | "mcp__browser__browser_press_key"
+            | "mcp__browser__browser_evaluate"
+    ) {
+        return true;
+    }
+    match tool.strip_prefix("mcp__").and_then(|r| r.split_once("__")) {
+        Some((server, _)) => !matches!(server, "familiar" | "browser" | crate::desktop::SERVER),
+        None => false,
     }
 }
 

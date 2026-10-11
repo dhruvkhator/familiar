@@ -32,17 +32,18 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::db::Db;
 
-/// What Familiar asks Google for, least first: read mail, send mail, write drafts, and calendar events.
-pub const SCOPES: [&str; 4] = [
+/// What Familiar asks Google for, least first: read mail, drafts and sending (`gmail.compose` covers both), and
+/// calendar events.
+pub const SCOPES: [&str; 3] = [
     "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/calendar.events",
 ];
 pub const SCOPE_READ: &str = SCOPES[0];
-pub const SCOPE_SEND: &str = SCOPES[1];
-pub const SCOPE_COMPOSE: &str = SCOPES[2];
-pub const SCOPE_CALENDAR: &str = SCOPES[3];
+pub const SCOPE_COMPOSE: &str = SCOPES[1];
+pub const SCOPE_CALENDAR: &str = SCOPES[2];
+/// Sending only (not asked for any more: compose covers it); an account that has it may still send.
+pub const SCOPE_SEND: &str = "https://www.googleapis.com/auth/gmail.send";
 
 /// The one-time Google Cloud setup, for builds without Familiar's OAuth client.
 pub const SETUP_DOC: &str = "https://github.com/dhruvkhator/familiar/blob/main/docs/google-oauth-setup.md";
@@ -181,7 +182,7 @@ impl std::fmt::Debug for Account {
 
 impl Account {
     pub fn has_scope(&self, scope: &str) -> bool {
-        self.kind == KIND_APP_PASSWORD || self.scopes.iter().any(|s| s == scope)
+        self.kind == KIND_APP_PASSWORD || self.scopes.iter().any(|s| s == scope || (scope == SCOPE_SEND && s == SCOPE_COMPOSE))
     }
 }
 
@@ -285,7 +286,7 @@ impl TokenError {
 struct Slot {
     /// Which sealed refresh token this access token came from (a reconnect changes it).
     from: [u8; 32],
-    access: Option<(String, Instant)>,
+    access: Option<(zeroize::Zeroizing<String>, Instant)>,
     failures: u32,
     retry_at: Option<Instant>,
 }
@@ -330,17 +331,17 @@ impl Tokens {
         if let Some((token, until)) = &s.access
             && Instant::now() + Duration::from_secs(60) < *until
         {
-            return Ok(token.clone());
+            return Ok(token.to_string());
         }
         if let Some(at) = s.retry_at
             && Instant::now() < at
         {
             return Err(TokenError::Later(format!("retrying in {} s", (at - Instant::now()).as_secs().max(1))));
         }
-        let refresh = secrets.decrypt(&account.secret_enc).map_err(|_| TokenError::Later("its stored secret can't be opened with this key".into()))?;
+        let refresh = secrets.decrypt(&account.secret_enc).map(zeroize::Zeroizing::new).map_err(|_| TokenError::Later("its stored secret can't be opened with this key".into()))?;
         match oauth::refresh(http, client, &refresh).await {
             Ok((token, expires_in)) => {
-                s.access = Some((token.clone(), Instant::now() + Duration::from_secs(expires_in.clamp(60, 3600))));
+                s.access = Some((zeroize::Zeroizing::new(token.clone()), Instant::now() + Duration::from_secs(expires_in.clamp(60, 3600))));
                 s.failures = 0;
                 s.retry_at = None;
                 Ok(token)
@@ -380,6 +381,11 @@ pub const MAX_ACTIONS_PER_RUN: u32 = 30;
 impl State {
     pub fn new(settings: Settings) -> Self {
         State { settings, http: http(), tokens: Tokens::default(), calls: Mutex::default() }
+    }
+
+    /// The run ended: forget its counts.
+    pub fn finished(&self, run: Uuid) {
+        self.calls.lock().unwrap().remove(&run);
     }
 
     /// Count one call of a run; false once it is over the limit.

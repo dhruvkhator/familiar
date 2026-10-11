@@ -291,3 +291,62 @@ async fn gmail_with_an_app_password() {
     assert_eq!(status, "reconnect");
     h.finish().await;
 }
+
+/// A conversation that read mail asks before anything reaches the internet (a web search, the browser opening a page),
+/// with no "Always allow"; a handoff from it carries that on; a conversation that didn't read mail still searches the
+/// web without asking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reading_mail_makes_the_conversation_ask_before_reaching_out() {
+    let Some(mut h) = setup("reading_mail_makes_the_conversation_ask_before_reaching_out").await else { return };
+    let fake = FakeGoogle::start();
+    h.scenario(json!([
+        [{ "init": {} }, tool("WebSearch", json!({ "query": "acme pricing" })), { "result": "searched" }],
+        [{ "init": {} },
+         mcp("gmail_read", json!({ "id": fg::MSG_ID })),
+         tool("WebSearch", json!({ "query": "acme pricing" })),
+         tool("mcp__browser__browser_navigate", json!({ "url": "https://example.com/?q=secret" })),
+         mcp("handoff", json!({ "bot_slug": "helper", "task": "look into Sam's mail" })),
+         { "result": "done" }],
+        [{ "init": {} }, tool("mcp__browser__browser_navigate", json!({ "url": "https://example.com/" })), { "result": "ok" }],
+    ]));
+    start_google(&mut h, fake.config());
+    let bot = h.bot("mailer").await;
+    let helper = h.bot("helper").await;
+    connect(&h, bot, "google", fg::REFRESH).await;
+
+    let clean = h.thread(bot).await;
+    let run = h.say(clean, "search the web").await;
+    assert_eq!(h.finished_long(run).await.0, "succeeded");
+    assert_eq!(h.invocation(0).decisions()[0]["behavior"], "allow", "no mail read: a web search doesn't ask");
+    assert!(h.approvals(run).await.is_empty());
+
+    let thread = h.thread(bot).await;
+    let run = h.say(thread, "read Sam's email, then look around").await;
+    let (search, tool_name, _, reason) = h.pending_approval(run).await;
+    assert_eq!(tool_name, "WebSearch");
+    assert_eq!(reason.as_deref(), Some(familiar_core::runner::MAIL_READ));
+    assert_eq!(h.offer(search).await.1, None, "no Always allow after reading mail");
+    h.decide(search, "denied", None).await;
+    let (nav, tool_name) = next_approval(&h, run, search).await;
+    assert_eq!(tool_name, "mcp__browser__browser_navigate", "even a public page asks");
+    h.decide(nav, "denied", None).await;
+    assert_eq!(h.finished_long(run).await.0, "succeeded");
+
+    let child: (Uuid, Uuid) = wait_for("the handoff run", || async {
+        Ok(sqlx::query_as::<_, (Uuid, Uuid)>("select id, thread_id from runs where kind = 'handoff' and bot_id = $1")
+            .bind(helper)
+            .fetch_optional(&h.pool)
+            .await?)
+    })
+    .await;
+    let marked: bool = sqlx::query_scalar("select read_mail_at is not null from threads where id = $1").bind(child.1).fetch_one(&h.pool).await.unwrap();
+    assert!(marked, "the handoff carries the mark");
+    let (nav, tool_name, _, reason) = h.pending_approval(child.0).await;
+    assert_eq!(tool_name, "mcp__browser__browser_navigate");
+    assert_eq!(reason.as_deref(), Some(familiar_core::runner::MAIL_READ));
+    h.decide(nav, "denied", None).await;
+    assert_eq!(h.finished_long(child.0).await.0, "succeeded");
+    let clean_marked: bool = sqlx::query_scalar("select read_mail_at is not null from threads where id = $1").bind(clean).fetch_one(&h.pool).await.unwrap();
+    assert!(!clean_marked);
+    h.finish().await;
+}

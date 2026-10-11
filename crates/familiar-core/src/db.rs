@@ -736,8 +736,40 @@ impl Db {
         .bind(parent)
         .fetch_one(&mut *tx)
         .await?;
+        // A conversation that read the owner's mail hands that on: the task may carry what it read.
+        sqlx::query(
+            "update threads set read_mail_at = (select t.read_mail_at from runs r join threads t on t.id = r.thread_id
+                                                 where r.id = $2 and r.owner_id = $3)
+             where id = $1",
+        )
+        .bind(thread)
+        .bind(parent)
+        .bind(self.owner)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(run)
+    }
+
+    /// Mark a conversation as having read the owner's mail or calendar (see [`Db::mail_read`]).
+    pub async fn mark_mail_read(&self, thread: Uuid) -> Result<()> {
+        sqlx::query("update threads set read_mail_at = now() where id = $1 and owner_id = $2 and read_mail_at is null")
+            .bind(thread)
+            .bind(self.owner)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Whether this conversation read the owner's mail or calendar: then anything reaching the internet asks.
+    pub async fn mail_read(&self, thread: Uuid) -> Result<bool> {
+        Ok(sqlx::query_scalar::<_, Option<chrono::DateTime<Utc>>>("select read_mail_at from threads where id = $1 and owner_id = $2")
+            .bind(thread)
+            .bind(self.owner)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten()
+            .is_some())
     }
 
     /// (status, error, final assistant message) of a run.

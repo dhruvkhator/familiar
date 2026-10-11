@@ -99,7 +99,7 @@ pub struct EventArgs {
 pub enum Backend {
     OAuth(Account, OAuthClient),
     /// The app-password account and its password (opened for this call only).
-    AppPassword(Account, String),
+    AppPassword(Account, zeroize::Zeroizing<String>),
 }
 
 impl Backend {
@@ -147,7 +147,7 @@ async fn backend(ctx: &Ctx, s: &Scope, scope: &str, calendar: bool) -> Result<Ba
                 }
             },
             KIND_APP_PASSWORD if !calendar => {
-                let pw = secrets.decrypt(&a.secret_enc).map_err(|_| "The stored app password can't be opened with this key.".to_owned())?;
+                let pw = secrets.decrypt(&a.secret_enc).map(zeroize::Zeroizing::new).map_err(|_| "The stored app password can't be opened with this key.".to_owned())?;
                 return Ok(Backend::AppPassword(a, pw));
             }
             _ => {
@@ -249,6 +249,7 @@ pub async fn search(ctx: &Ctx, s: &Scope, a: SearchArgs) -> Res {
             Err(e) => return Err(mail_err(ctx, acct, e).await),
         },
     };
+    taint(ctx, s).await?;
     let n = list.len();
     Ok(answer(&f, &b.account().email, json!({ "via": b.via(), "count": n, "messages": list, "next": "Read one with gmail_read {id} (or {thread_id} for the conversation)." })))
 }
@@ -273,6 +274,7 @@ pub async fn read(ctx: &Ctx, s: &Scope, a: ReadArgs) -> Res {
     if rows.is_empty() {
         return Err("Not found (check the id: it comes from gmail_search).".into());
     }
+    taint(ctx, s).await?;
     let f = Fence::new();
     let list: Vec<Value> = rows.iter().map(|(id, t, m)| fenced_mail(&f, id, t, m, true, None)).collect();
     Ok(answer(&f, &b.account().email, json!({ "via": b.via(), "messages": list, "next": "To answer, use gmail_send with reply_to_id = the message's id (it asks your owner)." })))
@@ -299,6 +301,12 @@ async fn fetch(ctx: &Ctx, b: &Backend, id: &str, thread: bool) -> Result<Vec<(St
 
 /// Research-only runs may open any web page without asking, so they could carry mail out in a URL: no Google reads there.
 const RESEARCH_READ: &str = "Research-only runs can't read your owner's mail or calendar (they open web pages without asking, which could carry it out). Do it in a normal run.";
+
+/// This conversation has now read the owner's mail or calendar: from here on anything that reaches the internet
+/// asks the owner ([`crate::runner::decide_tool`]). Fails closed: nothing is returned unless the mark is stored.
+async fn taint(ctx: &Ctx, s: &Scope) -> Result<(), String> {
+    ctx.db.mark_mail_read(s.run.thread_id).await.map_err(|_| "Familiar couldn't record this read, so nothing is shown. Try again.".to_owned())
+}
 
 fn limit() -> String {
     "This run reached its limit of Gmail and Calendar calls. Summarise what you have; a later run can carry on.".into()
@@ -522,6 +530,7 @@ pub async fn calendar_list(ctx: &Ctx, s: &Scope, a: CalendarListArgs) -> Res {
             })
         })
         .collect();
+    taint(ctx, s).await?;
     Ok(answer(&f, &acct.email, json!({ "events": list })))
 }
 
@@ -565,7 +574,9 @@ pub async fn calendar_create(ctx: &Ctx, s: &Scope, a: EventArgs) -> Res {
     if !guests.is_empty() {
         event["attendees"] = json!(guests.iter().map(|g| json!({ "email": g })).collect::<Vec<_>>());
     }
-    dnc(ctx, &guests.iter().map(String::as_str).collect::<Vec<_>>(), &summary, &description).await?;
+    // the location can name someone too ("Call with Eve, eve@acme.com")
+    let text = format!("{description}\n{}", event["location"].as_str().unwrap_or_default());
+    dnc(ctx, &guests.iter().map(String::as_str).collect::<Vec<_>>(), &summary, &text).await?;
     if !ctx.google.count(s.run.id, true) {
         return Err(limit());
     }

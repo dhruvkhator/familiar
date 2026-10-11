@@ -2623,7 +2623,7 @@ async fn accounts_connect_google_link_and_disconnect() {
     assert_eq!(s, 200);
     assert_eq!(v["google"]["configured"], true);
     assert_eq!(len(&v["accounts"]), 0);
-    assert_eq!(len(&v["google"]["scopes"]), 4);
+    assert_eq!(len(&v["google"]["scopes"]), 3);
 
     // Connect Google: PKCE S256, state, loopback redirect, the least scopes
     let start = app.ok_post(&a.tok, "/api/accounts/google/connect", json!({}), 201).await;
@@ -2651,7 +2651,7 @@ async fn accounts_connect_google_link_and_disconnect() {
     let (_, v) = app.get(&a.tok, "/api/accounts").await;
     let acct = &v["accounts"][0];
     assert_eq!((acct["kind"].as_str(), acct["email"].as_str(), acct["status"].as_str()), (Some("google"), Some(fg::EMAIL), Some("ok")));
-    assert_eq!(len(&acct["scopes"]), 4);
+    assert_eq!(len(&acct["scopes"]), 3);
     let text = v.to_string();
     assert!(!text.contains(fg::REFRESH) && !text.contains("secret_enc") && !text.contains("at-1"), "never a token: {text}");
     let sealed: String = sqlx::query_scalar("select secret_enc from accounts").fetch_one(&app.pool).await.unwrap();

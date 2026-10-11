@@ -553,8 +553,9 @@ teammates get Familiar's own tools, so no third-party MCP code ever holds the to
   token sealed with `SecretBox` into `accounts.secret_enc`, owner-scoped, one per kind; the API never returns it.
   Reconnecting the same address keeps who may use it; another address replaces the account, drops its links and revokes
   the old one's grant. Only the desktop app's API offers it (the loopback must be the owner's computer).
-- **Scopes, least first:** `gmail.readonly`, `gmail.send`, `gmail.compose`, `calendar.events`. Each tool checks the
-  scope it needs; Google's granular consent may grant fewer.
+- **Scopes, least first:** `gmail.readonly`, `gmail.compose` (drafts and sending), `calendar.events`. Each tool checks
+  the scope it needs; Google's granular consent may grant fewer. "Connect again" passes the connected address as
+  `login_hint`.
 - **Access tokens** live in the daemon's memory only (`google::Tokens`), refreshed a minute before expiry, one refresh
   at a time per account, exponential backoff after failures (2 s … 5 min); `invalid_grant` marks the account
   `reconnect` (the card says "Connect again"). Disconnect (`DELETE /api/accounts/{id}`) revokes the refresh token at
@@ -577,6 +578,14 @@ teammates get Familiar's own tools, so no third-party MCP code ever holds the to
   `lettre`'s builder (From = the account; Bcc only in the envelope over SMTP); replies carry `In-Reply-To` /
   `References` from the original and stay in its thread. Everything a read returns from mail or calendars is fenced
   (`<data-NONCE>`, as the CRM tools). Per run at most 300 reads and 30 actions.
+- **Mail stays in (taint).** A successful mail or calendar read marks the conversation (`threads.read_mail_at`,
+  migration `20261011000001_mail_taint.sql`; kept across resumes, passed on by `handoff`). In a marked conversation
+  anything that can reach the internet (`permissions::reaches_network`: WebSearch, WebFetch, Bash, the browser's
+  navigate, type, fill, key and evaluate, every connector tool) asks the owner, before safe navigation, owner allow
+  rules and auto-review, with no "Always allow": an email may have planted instructions to carry the mail out.
+  WebSearch is therefore no longer pre-allowed for the engines; `decide_tool` allows it in an unmarked conversation
+  (research runs included). A research run in a marked conversation gets no free WebFetch; the nightly dream gets no
+  web tools at all (Read, Glob, Grep). Codex's own web search is not routed through approvals (open).
 - **Instructions.** A linked teammate's instructions say which account it may use and that mail text is data; the GTM
   templates (`accounts: ["google"]`, linked at hire when connected) use these tools when connected, else the Google
   Workspace connector.

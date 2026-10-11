@@ -106,6 +106,7 @@ pub async fn execute(ctx: Ctx, run: Run, cancel: CancellationToken) {
         }
     }
     info!(run = %run.id, status, "run finished");
+    ctx.google.finished(run.id);
     if let Ok(bot) = bot {
         if let Err(e) = skills::mirror(&ctx, &bot).await {
             warn!(bot = %bot.slug, "skills mirror failed: {e:#}");
@@ -196,6 +197,7 @@ async fn execute_inner(ctx: &Ctx, run: &Run, bot: &Bot, cancel: &CancellationTok
         &mcp.to_string(),
     )?;
     let add_dirs: Vec<PathBuf> = shared.iter().map(|f| f.path.clone()).collect();
+    let mail_read = ctx.db.mail_read(run.thread_id).await.unwrap_or(true);
     let mut session = match thread.claude_session_id {
         // Each dream starts fresh: yesterday's dream is no context for today's.
         Some(id) if run.kind != "dream" => Session::Resume(id),
@@ -207,8 +209,14 @@ async fn execute_inner(ctx: &Ctx, run: &Run, bot: &Bot, cancel: &CancellationTok
             cwd: &cwd,
             model: &bot.model,
             session,
-            permissions: permissions::settings(&rules, run.research()),
-            tools: if run.research() { permissions::RESEARCH_TOOLS } else { permissions::FULL_TOOLS },
+            // A research run fetches any page without asking, unless its conversation read the owner's mail.
+            permissions: permissions::settings(&rules, run.research() && !mail_read),
+            tools: match run.kind.as_str() {
+                // The nightly dream reads the day's conversations (maybe mail): it has nothing to look up on the web.
+                "dream" => permissions::DREAM_TOOLS,
+                _ if run.research() => permissions::RESEARCH_TOOLS,
+                _ => permissions::FULL_TOOLS,
+            },
             system_prompt: &system_prompt,
             mcp_config: Some(&mcp_file.0),
             add_dirs: &add_dirs,
@@ -695,14 +703,21 @@ pub async fn decide_tool(
         }
     };
     let rules = rules.as_slice();
+    // A conversation that read the owner's mail or calendar: anything that reaches the internet asks the owner (an email
+    // may have planted instructions to carry the mail out). If the database can't say, it counts as read.
+    let tainted = permissions::reaches_network(tool) && ctx.db.mail_read(run.thread_id).await.unwrap_or(true);
     let owner = |reason: String| async move {
-        human(ctx, run, tool_use_id, tool, input, &reason, rules, can_edit, events, cancel).await
+        human(ctx, run, tool_use_id, tool, input, &reason, rules, can_edit, !tainted, events, cancel).await
     };
     // A draft this call relates to (draft follow-ups only): sent as approved, or a line for the owner's card.
     let mut sent: Option<(Uuid, Uuid)> = None;
     let mut draft_note: Option<String> = None;
     let (status, by, message, edited) = if run.research() {
-        ("denied".to_owned(), "rule", "This is a research-only run: it can look things up but cannot act.".to_owned(), None)
+        if tool == "WebSearch" && !tainted && permissions::owner_denies(rules, tool, input).is_none() {
+            ("approved".to_owned(), "rule", String::new(), None)
+        } else {
+            ("denied".to_owned(), "rule", "This is a research-only run: it can look things up but cannot act.".to_owned(), None)
+        }
     } else if let Some(rule) = permissions::owner_denies(rules, tool, input) {
         // Deny rules win over everything, allow rules included.
         ("denied".to_owned(), "rule", format!("Blocked by the owner's rule `{}`.", rule.pattern), None)
@@ -737,6 +752,11 @@ pub async fn decide_tool(
     } {
         sent = Some((draft, approval));
         ("approved".to_owned(), "rule", reason, None)
+    } else if tainted {
+        owner(MAIL_READ.to_owned()).await
+    } else if tool == "WebSearch" {
+        // A web search is allowed without asking in a conversation that hasn't read mail.
+        ("approved".to_owned(), "rule", String::new(), None)
     } else if permissions::safe_navigation(tool, input).await {
         ("approved".to_owned(), "rule", String::new(), None)
     } else if let Some(rule) = permissions::owner_allows(rules, tool, input) {
@@ -767,6 +787,10 @@ pub async fn decide_tool(
     send(events, "approval", event);
     Verdict { allow, message: if allow { String::new() } else { message }, input: edited.filter(|_| allow) }
 }
+
+/// The owner's card for anything reaching the internet in a conversation that read their mail.
+pub const MAIL_READ: &str = "This conversation has read your mail or calendar, so anything that reaches the internet asks you: an email may \
+                              have planted instructions to carry your mail out.";
 
 /// Why a file change must not happen (see [`folders::write_refusal`]): the bot's shared folders are read again and
 /// re-checked for every such decision, so a folder made read only (or removed) counts at once.
@@ -826,12 +850,14 @@ async fn human(
     reason: &str,
     rules: &[Rule],
     can_edit: bool,
+    offer_rule: bool,
     events: &Events,
     cancel: &CancellationToken,
 ) -> (String, &'static str, String, Option<Value>) {
     let offer = Offer {
         editable: permissions::editable_field(tool, input).filter(|_| can_edit).map(|f| vec![f.to_owned()]).unwrap_or_default(),
-        allow_rule: permissions::always_allow_rule(tool, input),
+        // no "Always allow" for a call that could carry the owner's mail out
+        allow_rule: permissions::always_allow_rule(tool, input).filter(|_| offer_rule),
     };
     let ask = Ask {
         tool_use_id,
